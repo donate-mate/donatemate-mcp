@@ -1,0 +1,46 @@
+{
+  "name": "@donatemate/mcp-server",
+  "version": "0.1.0",
+  "description": "DonateMate MCP Server - Design tokens, Figma, and documentation tools",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "bin": {
+    "donatemate-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src/resources"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "start:stdio": "MCP_MODE=stdio node dist/index.js",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "donatemate",
+    "design-tokens",
+    "figma"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/donate-mate/donatemate-mcp.git",
+    "directory": "packages/mcp-server"
+  }
+}

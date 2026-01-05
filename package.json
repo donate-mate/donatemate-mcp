@@ -1,0 +1,25 @@
+{
+  "name": "donatemate-mcp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "DonateMate Universal MCP Server - AI assistant access to design tokens, Figma, docs, and more",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "mcp:local": "node packages/mcp-server/dist/index.js"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0",
+    "typescript": "^5.3.3"
+  },
+  "packageManager": "npm@10.8.2",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
