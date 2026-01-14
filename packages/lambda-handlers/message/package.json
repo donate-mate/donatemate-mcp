@@ -1,0 +1,20 @@
+{
+  "name": "@donatemate/mcp-message-handler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "type-check": "tsc --noEmit",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.700.0",
+    "@aws-sdk/client-dynamodb": "^3.700.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.3"
+  }
+}

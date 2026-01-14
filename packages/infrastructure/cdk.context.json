@@ -1,0 +1,96 @@
+{
+  "vpc-provider:account=690788838096:filter.isDefault=true:region=us-east-2:returnAsymmetricSubnets=true": {
+    "vpcId": "vpc-05a775932e97b83a5",
+    "vpcCidrBlock": "172.31.0.0/16",
+    "ownerAccountId": "690788838096",
+    "availabilityZones": [],
+    "subnetGroups": [
+      {
+        "name": "Public",
+        "type": "Public",
+        "subnets": [
+          {
+            "subnetId": "subnet-0004a17198a64aadc",
+            "cidr": "172.31.0.0/20",
+            "availabilityZone": "us-east-2a",
+            "routeTableId": "rtb-0d0a1e21620f25501"
+          },
+          {
+            "subnetId": "subnet-036e3eac83ce62e34",
+            "cidr": "172.31.16.0/20",
+            "availabilityZone": "us-east-2b",
+            "routeTableId": "rtb-0d0a1e21620f25501"
+          },
+          {
+            "subnetId": "subnet-05c3ec8336f6147f8",
+            "cidr": "172.31.32.0/20",
+            "availabilityZone": "us-east-2c",
+            "routeTableId": "rtb-0d0a1e21620f25501"
+          }
+        ]
+      }
+    ]
+  },
+  "vpc-provider:account=690788838096:filter.tag:Name=donatemate-staging-vpc:region=us-east-2:returnAsymmetricSubnets=true": {
+    "vpcId": "vpc-0a78d3cedce352016",
+    "vpcCidrBlock": "10.0.0.0/16",
+    "ownerAccountId": "690788838096",
+    "availabilityZones": [],
+    "subnetGroups": [
+      {
+        "name": "Isolated",
+        "type": "Isolated",
+        "subnets": [
+          {
+            "subnetId": "subnet-0974f7cd03c78996d",
+            "cidr": "10.0.4.0/24",
+            "availabilityZone": "us-east-2a",
+            "routeTableId": "rtb-0ebf4e905cd2b7181"
+          },
+          {
+            "subnetId": "subnet-088e080f2b2f2d4e4",
+            "cidr": "10.0.5.0/24",
+            "availabilityZone": "us-east-2b",
+            "routeTableId": "rtb-083cc0930ca0abd1d"
+          }
+        ]
+      },
+      {
+        "name": "Private",
+        "type": "Private",
+        "subnets": [
+          {
+            "subnetId": "subnet-010c4eba6c4de41a6",
+            "cidr": "10.0.2.0/24",
+            "availabilityZone": "us-east-2a",
+            "routeTableId": "rtb-01fb7373d9dad5305"
+          },
+          {
+            "subnetId": "subnet-06911a5de3fca9f42",
+            "cidr": "10.0.3.0/24",
+            "availabilityZone": "us-east-2b",
+            "routeTableId": "rtb-0f9d1d52a6a21a577"
+          }
+        ]
+      },
+      {
+        "name": "Public",
+        "type": "Public",
+        "subnets": [
+          {
+            "subnetId": "subnet-0f04b0cbffd0b162d",
+            "cidr": "10.0.0.0/24",
+            "availabilityZone": "us-east-2a",
+            "routeTableId": "rtb-083a4bf821894c0d5"
+          },
+          {
+            "subnetId": "subnet-0662abd4f8f152609",
+            "cidr": "10.0.1.0/24",
+            "availabilityZone": "us-east-2b",
+            "routeTableId": "rtb-043e7e1c17ee3dc90"
+          }
+        ]
+      }
+    ]
+  }
+}

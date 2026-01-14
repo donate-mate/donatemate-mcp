@@ -1,0 +1,29 @@
+{
+  "name": "@donatemate/mcp-infrastructure",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DonateMate MCP Infrastructure - AWS CDK Stack for WebSocket API",
+  "scripts": {
+    "build": "tsc",
+    "type-check": "tsc --noEmit",
+    "watch": "tsc -w",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "diff": "cdk diff",
+    "destroy": "cdk destroy"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.170.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "aws-cdk": "^2.170.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
