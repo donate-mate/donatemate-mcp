@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 12px;
+      color: #333;
+      padding: 16px;
+      background: #fff;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .logo {
+      width: 24px;
+      height: 24px;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      border-radius: 6px;
+    }
+
+    h1 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #1a1a2e;
+    }
+
+    .status-section {
+      background: #f8f9fa;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 16px;
+    }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .status-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .status-label {
+      color: #666;
+      font-size: 11px;
+    }
+
+    .status-value {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    .status-dot.connected {
+      background: #22c55e;
+    }
+
+    .status-dot.disconnected {
+      background: #ef4444;
+    }
+
+    .status-dot.connecting {
+      background: #f59e0b;
+      animation: pulse 1s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .connection-settings {
+      margin-bottom: 16px;
+    }
+
+    .form-group {
+      margin-bottom: 12px;
+    }
+
+    label {
+      display: block;
+      font-size: 11px;
+      font-weight: 500;
+      color: #666;
+      margin-bottom: 4px;
+    }
+
+    input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #e0e0e0;
+      border-radius: 6px;
+      font-size: 12px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input:focus {
+      border-color: #6366f1;
+    }
+
+    button {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+    }
+
+    button:active {
+      transform: scale(0.98);
+    }
+
+    .btn-primary {
+      background: #6366f1;
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: #4f46e5;
+    }
+
+    .btn-primary:disabled {
+      background: #c7d2fe;
+      cursor: not-allowed;
+    }
+
+    .btn-secondary {
+      background: #f3f4f6;
+      color: #374151;
+      margin-top: 8px;
+    }
+
+    .btn-secondary:hover {
+      background: #e5e7eb;
+    }
+
+    .btn-danger {
+      background: #fee2e2;
+      color: #dc2626;
+      margin-top: 8px;
+    }
+
+    .btn-danger:hover {
+      background: #fecaca;
+    }
+
+    .log-section {
+      margin-top: 16px;
+    }
+
+    .log-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .log-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .log-clear {
+      font-size: 10px;
+      color: #6366f1;
+      cursor: pointer;
+    }
+
+    .log-container {
+      background: #1a1a2e;
+      border-radius: 6px;
+      padding: 10px;
+      height: 150px;
+      overflow-y: auto;
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 10px;
+    }
+
+    .log-entry {
+      color: #a0a0a0;
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+
+    .log-entry.info {
+      color: #60a5fa;
+    }
+
+    .log-entry.success {
+      color: #34d399;
+    }
+
+    .log-entry.error {
+      color: #f87171;
+    }
+
+    .log-entry.message {
+      color: #c084fc;
+    }
+
+    .divider {
+      height: 1px;
+      background: #e0e0e0;
+      margin: 16px 0;
+    }
+
+    .info-text {
+      font-size: 10px;
+      color: #999;
+      text-align: center;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo"></div>
+    <h1>DonateMate Design Bridge</h1>
+  </div>
+
+  <div class="status-section">
+    <div class="status-row">
+      <span class="status-label">Bridge Status</span>
+      <span class="status-value">
+        <span id="statusDot" class="status-dot disconnected"></span>
+        <span id="statusText">Disconnected</span>
+      </span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Messages Received</span>
+      <span class="status-value" id="messageCount">0</span>
+    </div>
+  </div>
+
+  <div class="connection-settings">
+    <div class="form-group">
+      <label>Bridge Server URL</label>
+      <input type="text" id="serverUrl" value="ws://localhost:3055" placeholder="ws://localhost:3055">
+    </div>
+
+    <button id="connectBtn" class="btn-primary">Connect to Bridge</button>
+    <button id="disconnectBtn" class="btn-danger" style="display: none;">Disconnect</button>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="log-section">
+    <div class="log-header">
+      <span class="log-title">Activity Log</span>
+      <span class="log-clear" id="clearLog">Clear</span>
+    </div>
+    <div class="log-container" id="logContainer"></div>
+  </div>
+
+  <p class="info-text">Connect to the MCP bridge server to enable Claude integration</p>
+
+  <script>
+    let ws = null;
+    let messageCount = 0;
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 5;
+    const reconnectDelay = 2000;
+
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const messageCountEl = document.getElementById('messageCount');
+    const serverUrlInput = document.getElementById('serverUrl');
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const logContainer = document.getElementById('logContainer');
+    const clearLogBtn = document.getElementById('clearLog');
+
+    function log(message, type = 'info') {
+      const entry = document.createElement('div');
+      entry.className = `log-entry ${type}`;
+      const time = new Date().toLocaleTimeString();
+      entry.textContent = `[${time}] ${message}`;
+      logContainer.appendChild(entry);
+      logContainer.scrollTop = logContainer.scrollHeight;
+    }
+
+    function setStatus(status) {
+      statusDot.className = `status-dot ${status}`;
+      statusText.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+
+      if (status === 'connected') {
+        connectBtn.style.display = 'none';
+        disconnectBtn.style.display = 'block';
+        serverUrlInput.disabled = true;
+      } else {
+        connectBtn.style.display = 'block';
+        disconnectBtn.style.display = 'none';
+        serverUrlInput.disabled = false;
+        connectBtn.disabled = status === 'connecting';
+      }
+    }
+
+    function connect() {
+      const url = serverUrlInput.value.trim();
+      if (!url) {
+        log('Please enter a valid server URL', 'error');
+        return;
+      }
+
+      setStatus('connecting');
+      log(`Connecting to ${url}...`);
+
+      try {
+        ws = new WebSocket(url);
+
+        ws.onopen = () => {
+          setStatus('connected');
+          log('Connected to bridge server', 'success');
+          reconnectAttempts = 0;
+
+          // Send initial handshake
+          ws.send(JSON.stringify({
+            type: 'PLUGIN_READY',
+            pluginId: 'donatemate-design-bridge',
+            capabilities: ['create', 'read', 'update', 'tokens']
+          }));
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            messageCount++;
+            messageCountEl.textContent = messageCount;
+            log(`Received: ${data.type}`, 'message');
+
+            // Forward message to plugin code
+            parent.postMessage({ pluginMessage: data }, '*');
+          } catch (e) {
+            log(`Invalid message: ${event.data}`, 'error');
+          }
+        };
+
+        ws.onclose = () => {
+          setStatus('disconnected');
+          log('Disconnected from bridge server');
+
+          // Attempt reconnection
+          if (reconnectAttempts < maxReconnectAttempts) {
+            reconnectAttempts++;
+            log(`Reconnecting in ${reconnectDelay/1000}s (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`);
+            setTimeout(connect, reconnectDelay);
+          }
+        };
+
+        ws.onerror = (error) => {
+          log('Connection error', 'error');
+        };
+
+      } catch (e) {
+        setStatus('disconnected');
+        log(`Failed to connect: ${e.message}`, 'error');
+      }
+    }
+
+    function disconnect() {
+      reconnectAttempts = maxReconnectAttempts; // Prevent auto-reconnect
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+      setStatus('disconnected');
+      log('Manually disconnected');
+    }
+
+    // Listen for messages from plugin code
+    window.onmessage = (event) => {
+      const msg = event.data.pluginMessage;
+      if (msg && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(msg));
+        log(`Sent: ${msg.type}`, 'success');
+      }
+    };
+
+    connectBtn.addEventListener('click', connect);
+    disconnectBtn.addEventListener('click', disconnect);
+    clearLogBtn.addEventListener('click', () => {
+      logContainer.innerHTML = '';
+    });
+
+    // Auto-connect on load
+    log('Plugin UI loaded');
+    setTimeout(connect, 500);
+  </script>
+</body>
+</html>
