@@ -14,12 +14,13 @@ import {
 
 import { tokenTools, handleTokenTool } from './tokens/index.js';
 import { figmaTools, handleFigmaTool } from './figma/index.js';
+import { knowledgeTools, handleKnowledgeTool } from './knowledge/index.js';
 
 // Combine all tools
-const allTools = [...tokenTools, ...figmaTools];
+const allTools = [...tokenTools, ...figmaTools, ...knowledgeTools];
 
 // Tool handlers in order of priority
-const handlers = [handleTokenTool, handleFigmaTool];
+const handlers = [handleTokenTool, handleFigmaTool, handleKnowledgeTool];
 
 export function registerAllTools(server: Server): void {
   // Register list tools handler

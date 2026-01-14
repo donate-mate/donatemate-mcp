@@ -31,3 +31,15 @@ yarn-error.log*
 
 # Test coverage
 coverage/
+
+# Serverless Framework
+.serverless/
+
+# CDK
+cdk.out/
+cdk.out.*/
+*.js.map
+
+# Environment
+.env
+*.zip

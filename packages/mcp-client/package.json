@@ -1,0 +1,11 @@
+{
+  "name": "@donatemate/mcp-client",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "donatemate-mcp": "./mcp-websocket-bridge.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  }
+}
