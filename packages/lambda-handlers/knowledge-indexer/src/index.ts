@@ -67,6 +67,13 @@ interface ContentChunk {
   metadata: Record<string, unknown>;
 }
 
+interface GitHubContentResponse {
+  type?: string;
+  size?: number;
+  content?: string;
+  sha?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Secret Management
 // ---------------------------------------------------------------------------
@@ -141,7 +148,6 @@ async function getRedis(): Promise<any | null> {
       host,
       port,
       maxRetriesPerRequest: 3,
-      retryDelayOnFailover: 100,
       lazyConnect: true,
     });
     await redisClient.connect();
@@ -243,14 +249,23 @@ async function fetchGitHubFileContent(
       return null;
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as GitHubContentResponse;
 
     // Skip if too large or not a file
-    if (data.type !== 'file' || data.size > MAX_FILE_SIZE) {
+    if (data.type !== 'file' || data.size === undefined || data.size > MAX_FILE_SIZE) {
       console.warn('File skipped - too large or not a file', {
         path: filePath,
         size: data.size,
         type: data.type,
+      });
+      return null;
+    }
+
+    if (!data.content || !data.sha) {
+      console.warn('GitHub file fetch response missing content or sha', {
+        path: filePath,
+        hasContent: Boolean(data.content),
+        hasSha: Boolean(data.sha),
       });
       return null;
     }
@@ -500,12 +515,18 @@ async function upsertChunk(chunk: ContentChunk, embedding: number[]): Promise<vo
       ${chunk.createdAt}, ${chunk.updatedAt},
       ${JSON.stringify(chunk.metadata)}, ${db.unsafe(`'${embeddingStr}'::vector`)}
     )
-    ON CONFLICT (id) DO UPDATE SET
+    ON CONFLICT (external_id, source_type) DO UPDATE SET
+      source_url = EXCLUDED.source_url,
       title = EXCLUDED.title,
       content = EXCLUDED.content,
+      content_type = EXCLUDED.content_type,
       content_hash = EXCLUDED.content_hash,
-      created_at = EXCLUDED.created_at,
       updated_at = EXCLUDED.updated_at,
+      indexed_at = NOW(),
+      chunk_type = EXCLUDED.chunk_type,
+      project_key = EXCLUDED.project_key,
+      author_email = EXCLUDED.author_email,
+      author_name = EXCLUDED.author_name,
       metadata = EXCLUDED.metadata,
       embedding = EXCLUDED.embedding
   `;
