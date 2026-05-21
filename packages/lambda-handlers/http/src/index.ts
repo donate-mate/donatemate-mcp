@@ -27,6 +27,7 @@ import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import Anthropic from '@anthropic-ai/sdk';
+import { marked } from 'marked';
 import { createHash, createVerify, createSign } from 'crypto';
 import type {
   APIGatewayProxyEventV2,
@@ -184,6 +185,195 @@ function toAdf(input: unknown): unknown {
       }),
   }));
   return { version: 1, type: 'doc', content: paragraphs };
+}
+
+// ----------------------------------------------------------------------------
+// Markdown -> ADF (Atlassian Document Format)
+// Claude returns markdown (headings, bullet/ordered lists, task checkboxes,
+// bold/italic/code, links, code blocks). Jira descriptions are ADF JSON, so we
+// tokenize with `marked` and map the tokens to ADF nodes — otherwise the raw
+// markdown shows up as literal text in Jira.
+// ----------------------------------------------------------------------------
+
+let adfLocalIdSeq = 0;
+function nextLocalId(): string {
+  adfLocalIdSeq += 1;
+  return `dm-${Date.now().toString(36)}-${adfLocalIdSeq}`;
+}
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'");
+}
+
+function applyMark(nodes: any[], mark: any): any[] {
+  return nodes.map((n) =>
+    n.type === 'text' ? { ...n, marks: [...(n.marks || []), mark] } : n
+  );
+}
+
+// marked inline tokens -> ADF inline nodes (text with marks, hardBreak)
+function inlineToAdf(tokens: any[]): any[] {
+  const out: any[] = [];
+  for (const t of tokens || []) {
+    switch (t.type) {
+      case 'text':
+        if (t.tokens?.length) out.push(...inlineToAdf(t.tokens));
+        else {
+          const text = decodeEntities(t.text ?? '');
+          if (text) out.push({ type: 'text', text });
+        }
+        break;
+      case 'escape': {
+        const text = decodeEntities(t.text ?? '');
+        if (text) out.push({ type: 'text', text });
+        break;
+      }
+      case 'strong':
+        out.push(...applyMark(inlineToAdf(t.tokens), { type: 'strong' }));
+        break;
+      case 'em':
+        out.push(...applyMark(inlineToAdf(t.tokens), { type: 'em' }));
+        break;
+      case 'del':
+        out.push(...applyMark(inlineToAdf(t.tokens), { type: 'strike' }));
+        break;
+      case 'codespan': {
+        const text = decodeEntities(t.text ?? '');
+        if (text) out.push({ type: 'text', text, marks: [{ type: 'code' }] });
+        break;
+      }
+      case 'link':
+        out.push(...applyMark(inlineToAdf(t.tokens), { type: 'link', attrs: { href: t.href } }));
+        break;
+      case 'br':
+        out.push({ type: 'hardBreak' });
+        break;
+      default: {
+        const text = decodeEntities(t.text ?? '');
+        if (text) out.push({ type: 'text', text });
+      }
+    }
+  }
+  return out;
+}
+
+// inline content of a single list/task item (flattened)
+function itemInline(item: any): any[] {
+  const inline: any[] = [];
+  for (const child of item.tokens || []) {
+    if (child.type === 'text') {
+      inline.push(...inlineToAdf(child.tokens || (child.text ? [{ type: 'text', text: child.text }] : [])));
+    } else if (child.type === 'paragraph') {
+      inline.push(...inlineToAdf(child.tokens));
+    }
+  }
+  return inline;
+}
+
+// block content of a list item (paragraphs + nested lists)
+function listItemContent(item: any): any[] {
+  const out: any[] = [];
+  let buffer: any[] = [];
+  const flush = () => {
+    if (buffer.length) { out.push({ type: 'paragraph', content: buffer }); buffer = []; }
+  };
+  for (const child of item.tokens || []) {
+    if (child.type === 'list') {
+      flush();
+      out.push(listToAdf(child));
+    } else if (child.type === 'text') {
+      buffer.push(...inlineToAdf(child.tokens || (child.text ? [{ type: 'text', text: child.text }] : [])));
+    } else if (child.type === 'paragraph') {
+      flush();
+      out.push({ type: 'paragraph', content: inlineToAdf(child.tokens) });
+    } else {
+      flush();
+      out.push(...blockToAdf([child]));
+    }
+  }
+  flush();
+  if (out.length === 0) out.push({ type: 'paragraph', content: [] });
+  return out;
+}
+
+function listToAdf(list: any): any {
+  const items: any[] = list.items || [];
+  const isTaskList = items.length > 0 && items.every((it) => it.task === true);
+
+  if (isTaskList) {
+    return {
+      type: 'taskList',
+      attrs: { localId: nextLocalId() },
+      content: items.map((it) => {
+        const inline = itemInline(it);
+        return {
+          type: 'taskItem',
+          attrs: { localId: nextLocalId(), state: it.checked ? 'DONE' : 'TODO' },
+          content: inline.length ? inline : [{ type: 'text', text: ' ' }],
+        };
+      }),
+    };
+  }
+
+  const node: any = {
+    type: list.ordered ? 'orderedList' : 'bulletList',
+    content: items.map((it) => ({ type: 'listItem', content: listItemContent(it) })),
+  };
+  if (list.ordered && typeof list.start === 'number' && list.start !== 1) {
+    node.attrs = { order: list.start };
+  }
+  return node;
+}
+
+function blockToAdf(tokens: any[]): any[] {
+  const content: any[] = [];
+  for (const t of tokens || []) {
+    switch (t.type) {
+      case 'heading':
+        content.push({ type: 'heading', attrs: { level: Math.min(Math.max(t.depth || 1, 1), 6) }, content: inlineToAdf(t.tokens) });
+        break;
+      case 'paragraph':
+        content.push({ type: 'paragraph', content: inlineToAdf(t.tokens) });
+        break;
+      case 'list':
+        content.push(listToAdf(t));
+        break;
+      case 'code':
+        content.push({
+          type: 'codeBlock',
+          ...(t.lang ? { attrs: { language: String(t.lang).split(/\s+/)[0] } } : {}),
+          content: t.text ? [{ type: 'text', text: t.text }] : [],
+        });
+        break;
+      case 'blockquote':
+        content.push({ type: 'blockquote', content: blockToAdf(t.tokens) });
+        break;
+      case 'hr':
+        content.push({ type: 'rule' });
+        break;
+      case 'space':
+        break;
+      default: {
+        const inline = t.tokens ? inlineToAdf(t.tokens) : (t.text ? [{ type: 'text', text: decodeEntities(t.text) }] : []);
+        if (inline.length) content.push({ type: 'paragraph', content: inline });
+      }
+    }
+  }
+  return content;
+}
+
+// Convert a markdown string to an ADF document for Jira descriptions/comments.
+function markdownToAdf(md: string): unknown {
+  const tokens = marked.lexer(md || '');
+  let content = blockToAdf(tokens as any[]);
+  if (content.length === 0) content = [{ type: 'paragraph', content: [] }];
+  return { version: 1, type: 'doc', content };
 }
 
 // Pull readable text out of an ADF document so we can return a short preview.
@@ -2847,11 +3037,13 @@ async function handleToolsCall(params: Record<string, unknown>): Promise<unknown
       const message = await stream.finalMessage();
       const enhanced = claudeText(message);
 
-      // 3. Optionally write the enhanced text back as the description
+      // 3. Optionally write the enhanced text back as the description.
+      //    Convert markdown -> ADF so headings, lists, checkboxes, and inline
+      //    formatting render natively in Jira instead of as literal markdown.
       let applied = false;
       if (apply && enhanced) {
         await jiraRequest<void>('PUT', `/issue/${encodeURIComponent(issueKey)}`, {
-          fields: { description: toAdf(enhanced) },
+          fields: { description: markdownToAdf(enhanced) },
         });
         applied = true;
       }
