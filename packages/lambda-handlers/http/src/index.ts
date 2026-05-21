@@ -171,20 +171,13 @@ async function jiraAgileRequest<T>(
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
-// Convert plain text to a minimal ADF document, or pass through if already ADF.
+// Convert a description/comment body to ADF for Jira. A string is treated as
+// markdown so headings, lists, checkboxes, and inline formatting render
+// natively (not as literal markdown); an object is assumed to already be ADF
+// and is passed through unchanged. Used by every Jira write tool.
 function toAdf(input: unknown): unknown {
   if (typeof input !== 'string') return input;
-  const paragraphs = input.split(/\n\n+/).map((para) => ({
-    type: 'paragraph',
-    content: para
-      .split(/\n/)
-      .flatMap((line, i, arr) => {
-        const nodes: unknown[] = [{ type: 'text', text: line }];
-        if (i < arr.length - 1) nodes.push({ type: 'hardBreak' });
-        return nodes;
-      }),
-  }));
-  return { version: 1, type: 'doc', content: paragraphs };
+  return markdownToAdf(input);
 }
 
 // ----------------------------------------------------------------------------
@@ -369,8 +362,11 @@ function blockToAdf(tokens: any[]): any[] {
 }
 
 // Convert a markdown string to an ADF document for Jira descriptions/comments.
+// `breaks: true` keeps single newlines in plain text as line breaks (matching
+// how callers expect multi-line plain text to render); `gfm` enables task
+// lists and strikethrough.
 function markdownToAdf(md: string): unknown {
-  const tokens = marked.lexer(md || '');
+  const tokens = marked.lexer(md || '', { gfm: true, breaks: true });
   let content = blockToAdf(tokens as any[]);
   if (content.length === 0) content = [{ type: 'paragraph', content: [] }];
   return { version: 1, type: 'doc', content };
