@@ -21,8 +21,15 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import { HttpApi, HttpMethod, CorsHttpMethod, DomainName } from 'aws-cdk-lib/aws-apigatewayv2';
+
+// Helper to resolve paths correctly whether running from source (lib/) or dist (dist/lib/)
+const isRunningFromDist = __dirname.includes('/dist/');
+const lambdaHandlersPath = isRunningFromDist
+  ? path.join(__dirname, '..', '..', '..', 'lambda-handlers')
+  : path.join(__dirname, '..', '..', 'lambda-handlers');
 
 export type Environment = 'staging' | 'production';
 
@@ -142,7 +149,7 @@ export class McpStack extends cdk.Stack {
       functionName: `donatemate-${environment}-mcp-oauth-token`,
       runtime: lambda.Runtime.NODEJS_20_X,
       architecture: lambda.Architecture.ARM_64,
-      entry: path.join(__dirname, '..', '..', 'lambda-handlers', 'oauth-token-customizer', 'src', 'index.ts'),
+      entry: path.join(lambdaHandlersPath, 'oauth-token-customizer', 'src', 'index.ts'),
       handler: 'handler',
       timeout: cdk.Duration.seconds(5),
       memorySize: 128,
@@ -278,7 +285,7 @@ export class McpStack extends cdk.Stack {
     // Lambda Handlers for WebSocket Routes
     // ========================================================================
 
-    const handlersPath = path.join(__dirname, '..', '..', 'lambda-handlers');
+    const handlersPath = lambdaHandlersPath;
 
     // Common Lambda configuration
     const lambdaDefaults: Partial<lambdaNodejs.NodejsFunctionProps> = {
@@ -467,6 +474,21 @@ export class McpStack extends cdk.Stack {
       })
     );
 
+    // Grant permission to read secrets from Secrets Manager (Google Analytics, Confluence, Jira, Anthropic)
+    httpHandler.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:/donatemate/${environment}/google/*`,
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:/donatemate/${environment}/knowledge/confluence*`,
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:/donatemate/${environment}/knowledge/jira*`,
+          // Note: no leading slash — this secret is named donatemate/<env>/anthropic-api-key
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:donatemate/${environment}/anthropic-api-key*`,
+        ],
+      })
+    );
+
     // Create HTTP API with rate limiting
     this.httpApi = new HttpApi(this, 'HttpApi', {
       apiName: `donatemate-${environment}-mcp-http`,
@@ -480,12 +502,43 @@ export class McpStack extends cdk.Stack {
       },
     });
 
-    // Add throttling to the default stage
+    // Add throttling to the default stage - optimized for Claude.ai burst patterns
     const httpStage = this.httpApi.defaultStage?.node.defaultChild as apigatewayv2.CfnStage;
     if (httpStage) {
       httpStage.defaultRouteSettings = {
-        throttlingBurstLimit: 50,  // Max concurrent requests
-        throttlingRateLimit: 20,   // Requests per second
+        throttlingBurstLimit: 200,  // Max concurrent requests (was 50)
+        throttlingRateLimit: 100,   // Requests per second (was 20)
+      };
+    }
+
+    // Access logging for debugging 4xx/5xx errors
+    const accessLogGroup = new logs.LogGroup(this, 'HttpApiAccessLogs', {
+      logGroupName: `/aws/apigateway/donatemate-${environment}-mcp-http-access`,
+      retention: environment === 'production'
+        ? logs.RetentionDays.ONE_MONTH
+        : logs.RetentionDays.ONE_WEEK,
+      removalPolicy: environment === 'production'
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Configure access logging on the stage
+    if (httpStage) {
+      httpStage.accessLogSettings = {
+        destinationArn: accessLogGroup.logGroupArn,
+        format: JSON.stringify({
+          requestId: '$context.requestId',
+          ip: '$context.identity.sourceIp',
+          requestTime: '$context.requestTime',
+          httpMethod: '$context.httpMethod',
+          path: '$context.path',
+          status: '$context.status',
+          responseLength: '$context.responseLength',
+          latency: '$context.responseLatency',
+          integrationLatency: '$context.integrationLatency',
+          errorMessage: '$context.error.message',
+          errorType: '$context.error.responseType',
+        }),
       };
     }
 
@@ -665,6 +718,7 @@ export class McpStack extends cdk.Stack {
     authFailureAlarm.addAlarmAction(new cloudwatchActions.SnsAction(alertsTopic));
 
     // Alarm for HTTP API 4xx errors (client errors including auth)
+    // Threshold increased to match higher rate limits
     const http4xxAlarm = new cloudwatch.Alarm(this, 'Http4xxAlarm', {
       alarmName: `donatemate-${environment}-mcp-http-4xx`,
       alarmDescription: 'High rate of HTTP 4xx errors',
@@ -677,7 +731,7 @@ export class McpStack extends cdk.Stack {
         statistic: 'Sum',
         period: cdk.Duration.minutes(5),
       }),
-      threshold: 50,
+      threshold: 100,  // Increased from 50 to match higher rate limits
       evaluationPeriods: 1,
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
