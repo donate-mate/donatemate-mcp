@@ -132,7 +132,7 @@ async function handleSlackEvent(body: Record<string, unknown>): Promise<void> {
   const issueKey = findIssueKey(history.map((h) => h.content).join('\n'));
   const jiraContext = issueKey ? (await fetchIssueContext(issueKey)) ?? undefined : undefined;
 
-  const reply = await converse(history, jiraContext);
+  const reply = await converse(history, { jiraContext });
   await appendMessage(channel, threadTs, { role: 'assistant', content: reply });
   await postSlackMessage(channel, reply, threadTs);
 }
@@ -204,6 +204,7 @@ app.post('/jira/webhook', async (req, reply) => {
     issueKey?: string;
     phase?: string;
     author?: string;
+    text?: string;
   };
 
   // Legacy direct-prompt path.
@@ -219,9 +220,17 @@ app.post('/jira/webhook', async (req, reply) => {
 
   // Ack fast (Jira Automation has its own timeout); plan/queue asynchronously.
   reply.send({ ok: true });
-  const work = phase === 'confirm' ? handleJiraConfirm(issueKey, body.author) : handleJiraAssigned(issueKey);
+  const work =
+    phase === 'confirm'
+      ? handleJiraConfirm(issueKey, body.author)
+      : phase === 'comment'
+        ? handleJiraComment(issueKey, body.text, body.author)
+        : handleJiraAssigned(issueKey);
   work.catch((err) => app.log.error({ err, issueKey, phase }, 'jira webhook handler failed'));
 });
+
+// Conversation thread key for a Jira ticket (mirrors Slack's convo store, channel "jira").
+const JIRA_CHANNEL = 'jira';
 
 // Ticket assigned to Hermes → derive a plan, store it, and comment for confirmation. Does NOT
 // run the agent yet. Idempotent: a re-assignment while running is a no-op.
@@ -251,10 +260,35 @@ async function handleJiraAssigned(issueKey: string): Promise<void> {
   const taskPrompt = `Implement Jira issue ${issueKey}: ${issue.summary}\n\nPlanned approach:\n${plan}`;
   await setFlow(issueKey, { status: 'awaiting_confirm', taskPrompt, repo, type, plan });
 
+  // Seed the per-ticket conversation so follow-up comments refine this plan (Slack-thread parity).
+  await appendMessage(JIRA_CHANNEL, issueKey, { role: 'user', content: `Ticket ${issueKey}: ${issue.summary}\n\n${issue.context}` });
+  await appendMessage(JIRA_CHANNEL, issueKey, { role: 'assistant', content: plan });
+
   await commentOnIssue(
     issueKey,
-    `🤖 **Hermes here.** I'll work this against \`${repo}\` (${type.toUpperCase()}).\n\n**Plan**\n\n${plan}\n\n---\n\nReply **\`/go\`** to start, or refine the description and re-assign me to re-plan.`
+    `🤖 **Hermes here.** I'll work this against \`${repo}\` (${type.toUpperCase()}).\n\n**Plan**\n\n${plan}\n\n---\n\nReply \`/go\` to start, comment to refine the plan, or re-assign me to re-plan from scratch.`
   );
+}
+
+// A non-/go comment on an assigned ticket → conversationally refine the plan (same engine as the
+// Slack chat). Ignores Hermes's own comments and only refines while awaiting confirmation.
+async function handleJiraComment(issueKey: string, text?: string, author?: string): Promise<void> {
+  if (author) {
+    const botId = await getBotAccountId();
+    if (botId && author === botId) return; // never react to our own comments
+  }
+  const clean = (text ?? '').trim();
+  if (!clean) return;
+
+  const flow = await getFlow(issueKey);
+  if (!flow || flow.status !== 'awaiting_confirm') return; // only refine before the job is queued
+
+  await appendMessage(JIRA_CHANNEL, issueKey, { role: 'user', content: clean });
+  const history = await getConversation(JIRA_CHANNEL, issueKey);
+  const issue = await fetchIssue(issueKey);
+  const reply = await converse(history, { jiraContext: issue?.context, startCommand: '/go' });
+  await appendMessage(JIRA_CHANNEL, issueKey, { role: 'assistant', content: reply });
+  await commentOnIssue(issueKey, reply);
 }
 
 // `/go` confirmation → queue the job and advance the board. Guarded against Hermes's own plan
@@ -275,10 +309,19 @@ async function handleJiraConfirm(issueKey: string, author?: string): Promise<voi
     return;
   }
 
+  // If the plan was refined via comments, condense the whole conversation into the task so the
+  // clarifications are baked in; otherwise fall back to the original plan-derived prompt.
+  let prompt = flow.taskPrompt;
+  const msgs = await getConversation(JIRA_CHANNEL, issueKey);
+  if (msgs.length > 2) {
+    const transcript = msgs.map((m) => `${m.role === 'assistant' ? 'Hermes' : 'User'}: ${m.content}`).join('\n');
+    prompt = `Implement Jira issue ${issueKey}.\n\n${await conversationToTask(transcript)}`;
+  }
+
   const job = await createJob({
     type: flow.type,
     repo: flow.repo,
-    prompt: flow.taskPrompt,
+    prompt,
     source: `jira:${issueKey}`,
   });
   await setFlow(issueKey, { ...flow, status: 'running', jobId: job.jobId });

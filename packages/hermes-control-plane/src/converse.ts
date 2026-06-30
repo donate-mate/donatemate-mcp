@@ -23,14 +23,17 @@ export interface ChatMsg {
   content: string;
 }
 
-const CHAT_SYSTEM = `You are Hermes, DonateMate's self-hosted coding agent, chatting with a developer in Slack to scope a coding task BEFORE any code is written.
+// `startCommand` differs by surface: `/start` in Slack, `/go` in Jira comments.
+function chatSystem(startCommand: string): string {
+  return `You are Hermes, DonateMate's self-hosted coding agent, scoping a coding task with a developer BEFORE any code is written.
 
 Your job here is to understand the task: ask brief, specific clarifying questions, confirm which repo (frontend "donatemate-app" vs backend "donatemate"), the concrete change, and acceptance criteria. Reference any Jira issue keys (DM-###) the user mentions.
 
 Rules:
-- Keep replies short and Slack-friendly (a few lines, no walls of text).
+- Keep replies short and to the point (a few lines, no walls of text).
 - Do NOT write code or open a PR here — you are only gathering requirements.
-- When you have enough to implement it, say so and tell the user to run \`/start\` to queue the coding job.`;
+- When you have enough to implement it, say so and tell the user to reply \`${startCommand}\` to queue the coding job.`;
+}
 
 function textOf(message: Anthropic.Message): string {
   return message.content
@@ -40,20 +43,28 @@ function textOf(message: Anthropic.Message): string {
     .trim();
 }
 
+export interface ConverseOpts {
+  jiraContext?: string;
+  /** The confirm keyword to tell the user about (`/start` for Slack, `/go` for Jira). */
+  startCommand?: string;
+}
+
 /** Generate Hermes's next conversational reply. If a referenced Jira issue's context is
  * supplied, it's injected so Hermes can discuss the actual ticket. */
-export async function converse(history: ChatMsg[], jiraContext?: string): Promise<string> {
+export async function converse(history: ChatMsg[], opts: ConverseOpts = {}): Promise<string> {
+  const startCommand = opts.startCommand ?? '/start';
   const c = await getClient();
-  const system = jiraContext
-    ? `${CHAT_SYSTEM}\n\nThe user referenced a Jira issue — here is its current content. Use it to discuss the task knowledgeably (you DO have its details below; don't claim you can't access Jira):\n\n${jiraContext}`
-    : CHAT_SYSTEM;
+  const base = chatSystem(startCommand);
+  const system = opts.jiraContext
+    ? `${base}\n\nThe user referenced a Jira issue — here is its current content. Use it to discuss the task knowledgeably (you DO have its details below; don't claim you can't access Jira):\n\n${opts.jiraContext}`
+    : base;
   const message = await c.messages.create({
     model: MODEL,
     max_tokens: 1024,
     system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
     messages: history.length ? history : [{ role: 'user', content: 'Hi' }],
   });
-  return textOf(message) || "Got it — tell me a bit more and run `/start` when you're ready.";
+  return textOf(message) || `Got it — tell me a bit more and reply \`${startCommand}\` when you're ready.`;
 }
 
 const TASK_SYSTEM = `Convert the following Slack conversation between a developer and Hermes (a coding agent) into a single, self-contained task instruction for an autonomous coding agent that will implement it. The agent runs in a harness that handles git and opens the PR automatically, so describe the CODE CHANGE only — do NOT instruct it to commit, push, or open a pull request.
