@@ -173,7 +173,9 @@ export class HermesStack extends cdk.Stack {
         certificates: [elbv2.ListenerCertificate.fromArn(certArn)],
         defaultTargetGroups: [controlPlaneTg],
       });
-      alb.addListener('HttpRedirect', {
+      // Same construct id as the no-cert path so CFN modifies the port-80 listener in place
+      // (forward → redirect) instead of creating a second listener on port 80.
+      alb.addListener('HttpListener', {
         port: 80,
         defaultAction: elbv2.ListenerAction.redirect({ protocol: 'HTTPS', port: '443', permanent: true }),
       });
