@@ -20,6 +20,7 @@ import {
 import { getSecretJson } from './secrets.js';
 import { converse, conversationToTask, type ChatMsg } from './converse.js';
 import { setActiveThread, getActiveThread } from './convo.js';
+import { findIssueKey, fetchIssueContext } from './jira.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -118,7 +119,11 @@ async function handleSlackEvent(body: Record<string, unknown>): Promise<void> {
   while (history.length && history[history.length - 1].role === 'assistant') history.pop();
   if (!history.length) return;
 
-  const reply = await converse(history);
+  // If the user referenced a Jira issue, pull its context so Hermes can discuss it.
+  const issueKey = findIssueKey(history.map((h) => h.content).join('\n'));
+  const jiraContext = issueKey ? (await fetchIssueContext(issueKey)) ?? undefined : undefined;
+
+  const reply = await converse(history, jiraContext);
   await postSlackMessage(channel, reply, threadTs);
 }
 

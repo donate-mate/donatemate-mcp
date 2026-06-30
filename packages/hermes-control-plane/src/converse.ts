@@ -40,13 +40,17 @@ function textOf(message: Anthropic.Message): string {
     .trim();
 }
 
-/** Generate Hermes's next conversational reply given the thread so far. */
-export async function converse(history: ChatMsg[]): Promise<string> {
+/** Generate Hermes's next conversational reply. If a referenced Jira issue's context is
+ * supplied, it's injected so Hermes can discuss the actual ticket. */
+export async function converse(history: ChatMsg[], jiraContext?: string): Promise<string> {
   const c = await getClient();
+  const system = jiraContext
+    ? `${CHAT_SYSTEM}\n\nThe user referenced a Jira issue — here is its current content. Use it to discuss the task knowledgeably (you DO have its details below; don't claim you can't access Jira):\n\n${jiraContext}`
+    : CHAT_SYSTEM;
   const message = await c.messages.create({
     model: MODEL,
     max_tokens: 1024,
-    system: [{ type: 'text', text: CHAT_SYSTEM, cache_control: { type: 'ephemeral' } }],
+    system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
     messages: history.length ? history : [{ role: 'user', content: 'Hi' }],
   });
   return textOf(message) || "Got it — tell me a bit more and run `/start` when you're ready.";

@@ -139,6 +139,7 @@ export class HermesStack extends cdk.Stack {
         SECRET_JIRA_WEBHOOK: secJiraHook.secretName,
         SECRET_GITHUB_APP: secGithub.secretName,
         SECRET_ANTHROPIC: secAnthropic.secretName, // conversational layer (Slack chat + /start)
+        SECRET_JIRA: secJira.secretName, // read referenced Jira issues during conversation
         MCP_ENDPOINT: props.mcpEndpoint ?? 'https://mcp.donate-mate.com/mcp',
       },
     });
@@ -195,6 +196,7 @@ export class HermesStack extends cdk.Stack {
     secJiraHook.grantRead(cpTaskDef.taskRole);
     secGithub.grantRead(cpTaskDef.taskRole);
     secAnthropic.grantRead(cpTaskDef.taskRole);
+    secJira.grantRead(cpTaskDef.taskRole);
 
     // ========================================================================
     // FE worker (Fargate service, no inbound; pulls jobs from SQS)
