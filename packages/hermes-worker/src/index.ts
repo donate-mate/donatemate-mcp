@@ -41,7 +41,7 @@ async function processJob(jobId: string): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), `hermes-${jobId}-`));
   try {
     const branch = `hermes/${jobId.slice(0, 8)}`;
-    const { token, octokit } = await getInstallationAuth();
+    const { token, octokit } = await getInstallationAuth(job.repo);
     await cloneRepo(token, job.repo, job.baseBranch, dir);
     await createBranch(dir, branch);
 

@@ -35,12 +35,18 @@ export async function updateJob(
   status: JobStatus,
   extra: Record<string, string> = {}
 ): Promise<void> {
-  const sets: string[] = ['#s = :s', 'updatedAt = :u'];
-  const names: Record<string, string> = { '#s': 'status' };
+  const sets: string[] = ['#s = :s', '#u = :u'];
+  // Alias every attribute name to avoid DynamoDB reserved keywords (e.g. `status`, `error`).
+  const names: Record<string, string> = { '#s': 'status', '#u': 'updatedAt' };
   const values: Record<string, string> = { ':s': status, ':u': new Date().toISOString() };
+  let i = 0;
   for (const [k, v] of Object.entries(extra)) {
-    sets.push(`${k} = :${k}`);
-    values[`:${k}`] = v;
+    const nk = `#k${i}`;
+    const vk = `:v${i}`;
+    names[nk] = k;
+    values[vk] = v;
+    sets.push(`${nk} = ${vk}`);
+    i++;
   }
   await ddb.send(
     new UpdateCommand({

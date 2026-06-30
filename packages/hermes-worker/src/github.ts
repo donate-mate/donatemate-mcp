@@ -16,14 +16,31 @@ export interface GitHubAuth {
   octokit: Octokit;
 }
 
-/** Create an installation-scoped token + Octokit client (token lifetime ~1h). */
-export async function getInstallationAuth(): Promise<GitHubAuth> {
+/**
+ * Create an installation token + Octokit client, scoped down to ONLY the permissions this
+ * worker needs and restricted to the single target repo. Even if the GitHub App is configured
+ * with broader permissions, the per-job token is least-privilege (defense in depth). Token
+ * lifetime ~1h.
+ */
+export async function getInstallationAuth(repoFullName: string): Promise<GitHubAuth> {
   const { appId, installationId, privateKey } = await getSecretJson(SECRET_GITHUB_APP);
   if (!appId || !installationId || !privateKey) {
     throw new Error('GitHub App credentials not configured in Secrets Manager');
   }
+  const repoName = repoFullName.split('/')[1];
   const auth = createAppAuth({ appId, installationId, privateKey });
-  const { token } = await auth({ type: 'installation' });
+  const { token } = await auth({
+    type: 'installation',
+    repositoryNames: repoName ? [repoName] : undefined,
+    permissions: {
+      contents: 'write',
+      pull_requests: 'write',
+      issues: 'write',
+      checks: 'read',
+      actions: 'write',
+      metadata: 'read',
+    },
+  });
   return { token, octokit: new Octokit({ auth: token }) };
 }
 
