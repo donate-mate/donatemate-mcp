@@ -39,6 +39,16 @@ export async function appendMessage(channel: string, threadTs: string, msg: Stor
   );
 }
 
+/** Reset a thread's conversation to empty (used when re-planning a Jira ticket from scratch). */
+export async function resetConversation(channel: string, threadTs: string): Promise<void> {
+  await ddb.send(
+    new PutCommand({
+      TableName: TABLE,
+      Item: { jobId: convoKey(channel, threadTs), status: 'convo', messages: [], updatedAt: new Date().toISOString(), expiresAt: ttl() },
+    })
+  );
+}
+
 export async function getConversation(channel: string, threadTs: string): Promise<StoredMsg[]> {
   const r = await ddb.send(new GetCommand({ TableName: TABLE, Key: { jobId: convoKey(channel, threadTs) } }));
   return (r.Item?.messages as StoredMsg[]) ?? [];

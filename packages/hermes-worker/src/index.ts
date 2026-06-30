@@ -23,7 +23,7 @@ import {
   openPullRequest,
 } from './github.js';
 import { runAgent } from './agent.js';
-import { getJob, updateJob, storeTranscript } from './jobs.js';
+import { getJob, updateJob, storeTranscript, markFlowDone } from './jobs.js';
 import { notify } from './notify.js';
 import { setScaleInProtection } from './taskprotection.js';
 import { findIssueKey, fetchIssueContext } from './jira.js';
@@ -76,6 +76,7 @@ async function processJob(jobId: string): Promise<void> {
           `⚠️ I ran but produced no code changes${why}. Transcript: \`${transcriptUri}\`\n\nMoving back to **To Do** — add detail or narrow the scope and re-assign me.`
         );
         await transitionIssue(ticket, COLUMN.toDo);
+        await markFlowDone(ticket, { flowError: 'no changes' });
       }
       return;
     }
@@ -100,6 +101,7 @@ async function processJob(jobId: string): Promise<void> {
     if (ticket) {
       await commentOnIssue(ticket, `✅ PR opened: ${prUrl}\n\nMoving to **Code Review**.`);
       await transitionIssue(ticket, COLUMN.codeReview);
+      await markFlowDone(ticket, { prUrl });
     }
     console.log(`[${jobId}] done → ${prUrl}`);
   } catch (err) {
@@ -110,6 +112,7 @@ async function processJob(jobId: string): Promise<void> {
     if (ticket) {
       await commentOnIssue(ticket, `❌ I hit a blocker and couldn't finish: ${msg}\n\nMoving back to **To Do**.`);
       await transitionIssue(ticket, COLUMN.toDo);
+      await markFlowDone(ticket, { flowError: msg.slice(0, 200) });
     }
     throw err; // do not delete the SQS message → redelivery, then DLQ
   } finally {

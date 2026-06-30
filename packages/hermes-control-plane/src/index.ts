@@ -13,7 +13,7 @@ import { createJob, getJob, type WorkerType } from './jobs.js';
 import { verifySlackSignature, postSlackMessage, stripMention } from './slack.js';
 import { getSecretJson } from './secrets.js';
 import { converse, conversationToTask, planIssue } from './converse.js';
-import { appendMessage, getConversation, setActivePointer, getActivePointer } from './convo.js';
+import { appendMessage, getConversation, resetConversation, setActivePointer, getActivePointer } from './convo.js';
 import { findIssueKey, fetchIssueContext, fetchIssue } from './jira.js';
 import { getFlow, setFlow } from './jiraflow.js';
 import { commentOnIssue, transitionIssue, getBotAccountId, COLUMN } from './jiraBot.js';
@@ -260,7 +260,9 @@ async function handleJiraAssigned(issueKey: string): Promise<void> {
   const taskPrompt = `Implement Jira issue ${issueKey}: ${issue.summary}\n\nPlanned approach:\n${plan}`;
   await setFlow(issueKey, { status: 'awaiting_confirm', taskPrompt, repo, type, plan });
 
-  // Seed the per-ticket conversation so follow-up comments refine this plan (Slack-thread parity).
+  // Seed a FRESH per-ticket conversation so follow-up comments refine this plan (Slack-thread
+  // parity). Reset first so a re-assignment re-plans from scratch, not on top of an old run.
+  await resetConversation(JIRA_CHANNEL, issueKey);
   await appendMessage(JIRA_CHANNEL, issueKey, { role: 'user', content: `Ticket ${issueKey}: ${issue.summary}\n\n${issue.context}` });
   await appendMessage(JIRA_CHANNEL, issueKey, { role: 'assistant', content: plan });
 
@@ -306,6 +308,10 @@ async function handleJiraConfirm(issueKey: string, author?: string): Promise<voi
   }
   if (flow.status === 'running') {
     await commentOnIssue(issueKey, `🤖 Already on it — job \`${flow.jobId}\`.`);
+    return;
+  }
+  if (flow.status === 'done') {
+    await commentOnIssue(issueKey, 'ℹ️ My last run for this ticket already finished. Re-assign me to start a fresh run.');
     return;
   }
 
