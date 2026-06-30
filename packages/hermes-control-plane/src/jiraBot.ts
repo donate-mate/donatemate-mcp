@@ -37,13 +37,17 @@ export async function commentOnIssue(issueKey: string, markdown: string): Promis
   const c = await creds();
   if (!c) return;
   try {
-    await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
+    const res = await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
       method: 'POST',
       headers: { Authorization: `Basic ${c.auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ body: markdownToAdf(markdown) }),
     });
-  } catch {
-    /* best-effort */
+    if (!res.ok) {
+      // Don't fail the job, but don't fail silently either — a rejected ADF was previously invisible.
+      console.warn(`[jira] comment on ${issueKey} failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+    }
+  } catch (err) {
+    console.warn(`[jira] comment on ${issueKey} errored: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 

@@ -142,10 +142,22 @@ function blockToAdf(tokens: any[]): any[] {
   return content;
 }
 
+// Jira ADF forbids combining the `code` mark with any other mark (e.g. **`/go`** → code+strong
+// is rejected with INVALID_INPUT). Make `code` exclusive wherever it appears.
+function sanitizeMarks(node: any): void {
+  if (!node || typeof node !== 'object') return;
+  if (node.type === 'text' && Array.isArray(node.marks) && node.marks.some((m: any) => m?.type === 'code')) {
+    node.marks = [{ type: 'code' }];
+  }
+  for (const child of node.content || []) sanitizeMarks(child);
+}
+
 /** Convert a markdown string into an ADF document for a Jira comment/description. */
 export function markdownToAdf(md: string): unknown {
   const tokens = marked.lexer(md || '', { gfm: true, breaks: true });
   let content = blockToAdf(tokens as any[]);
   if (content.length === 0) content = [{ type: 'paragraph', content: [] }];
-  return { version: 1, type: 'doc', content };
+  const doc = { version: 1, type: 'doc', content };
+  sanitizeMarks(doc);
+  return doc;
 }
