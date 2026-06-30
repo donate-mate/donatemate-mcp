@@ -403,6 +403,39 @@ function summarizeJiraIssue(issue: any, host: string) {
 }
 
 // ============================================================================
+// Hermes — dispatch agentic-coding jobs to the Hermes control plane
+// ============================================================================
+
+interface HermesConfig {
+  endpoint: string; // e.g. https://hermes.donate-mate.com
+  sharedSecret: string;
+}
+let hermesConfig: HermesConfig | null = null;
+
+async function getHermesConfig(): Promise<HermesConfig> {
+  if (hermesConfig) return hermesConfig;
+  const endpoint = process.env.HERMES_ENDPOINT || 'https://hermes.donate-mate.com';
+  const secretName = `donatemate/${process.env.ENVIRONMENT || 'staging'}/hermes/jira-webhook`;
+  const res = await secretsClient.send(new GetSecretValueCommand({ SecretId: secretName }));
+  const parsed = JSON.parse(res.SecretString || '{}') as { sharedSecret?: string };
+  hermesConfig = { endpoint, sharedSecret: parsed.sharedSecret || '' };
+  return hermesConfig;
+}
+
+async function hermesRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const cfg = await getHermesConfig();
+  const response = await fetch(`${cfg.endpoint}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'x-hermes-secret': cfg.sharedSecret },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!response.ok) {
+    throw new Error(`Hermes API ${response.status}: ${await response.text()}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+// ============================================================================
 // Anthropic (Claude) — powers AI enhancement tools (e.g. dm_jira_enhance)
 // ============================================================================
 
@@ -2215,6 +2248,33 @@ async function handleToolsList(): Promise<unknown> {
     },
   ];
 
+  // Hermes tools — dispatch agentic-coding jobs to the self-hosted Hermes platform
+  const hermesTools = [
+    {
+      name: 'dm_hermes_create_pr',
+      description: 'Ask the Hermes coding agent to implement a task and open a pull request. Hermes clones the repo, runs the change end to end, and opens a PR. Returns a jobId to track with dm_hermes_job_status. Asynchronous — the PR appears when the job completes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'What to implement, in plain language. Reference a Jira issue key (e.g. "implement DM-39") and Hermes will pull its context.' },
+          type: { type: 'string', enum: ['fe', 'be'], description: 'Worker type: "fe" (donatemate-app) or "be" (donatemate). Default "fe".' },
+          repo: { type: 'string', description: 'Override target repo (owner/name). Defaults to the repo for the worker type.' },
+          baseBranch: { type: 'string', description: 'Base branch to branch from (default "main").' },
+        },
+        required: ['prompt'],
+      },
+    },
+    {
+      name: 'dm_hermes_job_status',
+      description: 'Check the status of a Hermes job by id (queued | running | done | failed). When done, includes the PR URL.',
+      inputSchema: {
+        type: 'object',
+        properties: { jobId: { type: 'string', description: 'Job id returned by dm_hermes_create_pr' } },
+        required: ['jobId'],
+      },
+    },
+  ];
+
   // Google Analytics tools
   const gaTools = [
     {
@@ -2520,7 +2580,7 @@ async function handleToolsList(): Promise<unknown> {
     },
   ];
 
-  return { tools: [...tokenTools, ...figmaRestTools, ...figmaPluginTools, ...knowledgeTools, ...confluenceTools, ...jiraTools, ...gaTools, ...gaAdminTools, ...googleAdsTools] };
+  return { tools: [...tokenTools, ...figmaRestTools, ...figmaPluginTools, ...knowledgeTools, ...confluenceTools, ...jiraTools, ...hermesTools, ...gaTools, ...gaAdminTools, ...googleAdsTools] };
 }
 
 // Simple token storage
@@ -3096,6 +3156,38 @@ async function handleToolsCall(params: Record<string, unknown>): Promise<unknown
         sprintId,
         added: issueKeys,
         count: issueKeys.length,
+      }, null, 2) }] };
+      break;
+    }
+
+    // Hermes tools
+    case 'dm_hermes_create_pr': {
+      const prompt = args?.prompt as string;
+      if (!prompt) throw new Error('prompt is required');
+      const dispatch = await hermesRequest<{ ok: boolean; jobId: string }>('POST', '/dispatch', {
+        prompt,
+        type: (args?.type as string) || 'fe',
+        repo: args?.repo as string | undefined,
+        baseBranch: args?.baseBranch as string | undefined,
+      });
+      result = { content: [{ type: 'text', text: JSON.stringify({
+        jobId: dispatch.jobId,
+        status: 'queued',
+        note: 'Hermes is working on it. Poll dm_hermes_job_status with this jobId for the PR link.',
+      }, null, 2) }] };
+      break;
+    }
+
+    case 'dm_hermes_job_status': {
+      const jobId = args?.jobId as string;
+      if (!jobId) throw new Error('jobId is required');
+      const job = await hermesRequest<any>('GET', `/jobs/${encodeURIComponent(jobId)}`);
+      result = { content: [{ type: 'text', text: JSON.stringify({
+        jobId: job.jobId,
+        status: job.status,
+        repo: job.repo,
+        prUrl: job.prUrl,
+        error: job.error,
       }, null, 2) }] };
       break;
     }

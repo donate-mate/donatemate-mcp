@@ -25,6 +25,7 @@ import { runAgent } from './agent.js';
 import { getJob, updateJob, storeTranscript } from './jobs.js';
 import { notify } from './notify.js';
 import { setScaleInProtection } from './taskprotection.js';
+import { findIssueKey, fetchIssueContext } from './jira.js';
 
 const sqs = new SQSClient({});
 const QUEUE = process.env.JOBS_QUEUE_URL!;
@@ -47,7 +48,18 @@ async function processJob(jobId: string): Promise<void> {
     await cloneRepo(token, job.repo, job.baseBranch, dir);
     await createBranch(dir, branch);
 
-    const { transcript, exitCode } = await runAgent(dir, job.prompt);
+    // If the task references a Jira issue, pull its context so the agent builds the right thing.
+    let prompt = job.prompt;
+    const issueKey = findIssueKey(`${job.source} ${job.prompt}`);
+    if (issueKey) {
+      const ctx = await fetchIssueContext(issueKey);
+      if (ctx) {
+        console.log(`[${jobId}] enriched prompt with Jira ${issueKey}`);
+        prompt = `Context from ${ctx}\n\n---\n\nTask:\n${job.prompt}`;
+      }
+    }
+
+    const { transcript, exitCode } = await runAgent(dir, prompt);
     const transcriptUri = await storeTranscript(jobId, transcript);
 
     if (!(await hasChanges(dir))) {

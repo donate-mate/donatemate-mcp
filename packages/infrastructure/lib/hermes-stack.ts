@@ -98,6 +98,7 @@ export class HermesStack extends cdk.Stack {
     const secJiraHook = secretsmanager.Secret.fromSecretNameV2(this, 'SecJiraHook', `donatemate/${environment}/hermes/jira-webhook`);
     const secAnthropic = secretsmanager.Secret.fromSecretNameV2(this, 'SecAnthropic', `donatemate/${environment}/anthropic-api-key`);
     const secJira = secretsmanager.Secret.fromSecretNameV2(this, 'SecJira', `/donatemate/${environment}/knowledge/jira`);
+    const secDmMcp = secretsmanager.Secret.fromSecretNameV2(this, 'SecDmMcp', `donatemate/${environment}/hermes/dm-mcp-key`);
 
     const cpRepo = ecr.Repository.fromRepositoryName(this, 'CpRepo', 'donatemate-hermes-control-plane');
     const workerRepo = ecr.Repository.fromRepositoryName(this, 'WorkerRepo', 'donatemate-hermes-worker');
@@ -221,6 +222,8 @@ export class HermesStack extends cdk.Stack {
         SECRET_ANTHROPIC: secAnthropic.secretName,
         SECRET_JIRA: secJira.secretName,
         SECRET_SLACK: secSlack.secretName, // worker posts PR links back to the Slack thread
+        SECRET_DM_MCP: secDmMcp.secretName, // DonateMate MCP API key for the agent
+        MCP_ENDPOINT: 'https://mcp.donate-mate.com/mcp',
         // budget guardrails (Phase 1, not later)
         MAX_AGENT_TOKENS: '400000',
         MAX_AGENT_ITERATIONS: '40',
@@ -244,6 +247,7 @@ export class HermesStack extends cdk.Stack {
     secAnthropic.grantRead(workerTaskDef.taskRole);
     secJira.grantRead(workerTaskDef.taskRole);
     secSlack.grantRead(workerTaskDef.taskRole);
+    secDmMcp.grantRead(workerTaskDef.taskRole);
 
     // The worker protects its own task from scale-in while it's processing a job, so the
     // autoscaler can scale down after a burst without killing an active coding job.

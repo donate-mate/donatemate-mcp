@@ -485,6 +485,8 @@ export class McpStack extends cdk.Stack {
           `arn:aws:secretsmanager:${this.region}:${this.account}:secret:/donatemate/${environment}/knowledge/jira*`,
           // Note: no leading slash — this secret is named donatemate/<env>/anthropic-api-key
           `arn:aws:secretsmanager:${this.region}:${this.account}:secret:donatemate/${environment}/anthropic-api-key*`,
+          // Hermes dispatch shared secret (dm_hermes_create_pr → Hermes /dispatch)
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:donatemate/${environment}/hermes/jira-webhook*`,
         ],
       })
     );
