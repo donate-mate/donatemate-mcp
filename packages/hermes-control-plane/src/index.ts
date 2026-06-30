@@ -16,7 +16,7 @@ import { converse, conversationToTask, planIssue } from './converse.js';
 import { appendMessage, getConversation, setActivePointer, getActivePointer } from './convo.js';
 import { findIssueKey, fetchIssueContext, fetchIssue } from './jira.js';
 import { getFlow, setFlow } from './jiraflow.js';
-import { commentOnIssue, transitionIssue, COLUMN } from './jiraBot.js';
+import { commentOnIssue, transitionIssue, getBotAccountId, COLUMN } from './jiraBot.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -198,7 +198,13 @@ app.post('/jira/webhook', async (req, reply) => {
   if (!sharedSecret || provided !== sharedSecret) {
     return reply.code(401).send({ error: 'unauthorized' });
   }
-  const body = (req.body ?? {}) as { prompt?: string; type?: WorkerType; issueKey?: string; phase?: string };
+  const body = (req.body ?? {}) as {
+    prompt?: string;
+    type?: WorkerType;
+    issueKey?: string;
+    phase?: string;
+    author?: string;
+  };
 
   // Legacy direct-prompt path.
   if (body.prompt && !body.issueKey) {
@@ -213,7 +219,7 @@ app.post('/jira/webhook', async (req, reply) => {
 
   // Ack fast (Jira Automation has its own timeout); plan/queue asynchronously.
   reply.send({ ok: true });
-  const work = phase === 'confirm' ? handleJiraConfirm(issueKey) : handleJiraAssigned(issueKey);
+  const work = phase === 'confirm' ? handleJiraConfirm(issueKey, body.author) : handleJiraAssigned(issueKey);
   work.catch((err) => app.log.error({ err, issueKey, phase }, 'jira webhook handler failed'));
 });
 
@@ -222,13 +228,13 @@ app.post('/jira/webhook', async (req, reply) => {
 async function handleJiraAssigned(issueKey: string): Promise<void> {
   const existing = await getFlow(issueKey);
   if (existing?.status === 'running') {
-    await commentOnIssue(issueKey, `:robot_face: I'm already working on this (job \`${existing.jobId}\`).`);
+    await commentOnIssue(issueKey, `🤖 I'm already working on this (job \`${existing.jobId}\`).`);
     return;
   }
 
   const issue = await fetchIssue(issueKey);
   if (!issue) {
-    await commentOnIssue(issueKey, ":warning: I couldn't read this ticket's details — check my Jira access.");
+    await commentOnIssue(issueKey, "⚠️ I couldn't read this ticket's details — check my Jira access.");
     return;
   }
 
@@ -236,7 +242,7 @@ async function handleJiraAssigned(issueKey: string): Promise<void> {
   if (isDesign) {
     await commentOnIssue(
       issueKey,
-      ':information_source: This looks like a *design* ticket, not a coding task, so I won\'t pick it up. Unassign me if that was unintended, or reassign once there\'s a concrete code change to make.'
+      "ℹ️ This looks like a **design** ticket, not a coding task, so I won't pick it up. Unassign me if that was unintended, or reassign once there's a concrete code change to make."
     );
     return;
   }
@@ -247,19 +253,25 @@ async function handleJiraAssigned(issueKey: string): Promise<void> {
 
   await commentOnIssue(
     issueKey,
-    `:robot_face: *Hermes here.* I'll work this against \`${repo}\` (${type.toUpperCase()}).\n\n*Plan:*\n${plan}\n\nReply with \`/go\` to start, or refine the description and re-assign me to re-plan.`
+    `🤖 **Hermes here.** I'll work this against \`${repo}\` (${type.toUpperCase()}).\n\n**Plan**\n\n${plan}\n\n---\n\nReply **\`/go\`** to start, or refine the description and re-assign me to re-plan.`
   );
 }
 
-// `/go` confirmation → queue the job and advance the board.
-async function handleJiraConfirm(issueKey: string): Promise<void> {
+// `/go` confirmation → queue the job and advance the board. Guarded against Hermes's own plan
+// comment (which contains the literal "/go") self-triggering the confirm rule.
+async function handleJiraConfirm(issueKey: string, author?: string): Promise<void> {
+  if (author) {
+    const botId = await getBotAccountId();
+    if (botId && author === botId) return; // ignore Hermes's own comments — no feedback loop
+  }
+
   const flow = await getFlow(issueKey);
   if (!flow) {
-    await commentOnIssue(issueKey, ':information_source: Assign this ticket to me first, then reply `/go` to start.');
+    await commentOnIssue(issueKey, 'ℹ️ Assign this ticket to me first, then reply `/go` to start.');
     return;
   }
   if (flow.status === 'running') {
-    await commentOnIssue(issueKey, `:robot_face: Already on it — job \`${flow.jobId}\`.`);
+    await commentOnIssue(issueKey, `🤖 Already on it — job \`${flow.jobId}\`.`);
     return;
   }
 
@@ -273,7 +285,7 @@ async function handleJiraConfirm(issueKey: string): Promise<void> {
   await transitionIssue(issueKey, COLUMN.inProgress);
   await commentOnIssue(
     issueKey,
-    `:hammer_and_wrench: Starting implementation — job \`${job.jobId}\` against \`${flow.repo}\`. I'll comment with the PR when it's ready.`
+    `🛠️ Starting implementation — job \`${job.jobId}\` against \`${flow.repo}\`. I'll comment with the PR when it's ready.`
   );
 }
 

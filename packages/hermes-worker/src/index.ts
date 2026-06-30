@@ -17,6 +17,7 @@ import {
   getInstallationAuth,
   cloneRepo,
   createBranch,
+  getHeadSha,
   hasChanges,
   commitAndPush,
   openPullRequest,
@@ -49,6 +50,7 @@ async function processJob(jobId: string): Promise<void> {
     const { token, octokit } = await getInstallationAuth(job.repo);
     await cloneRepo(token, job.repo, job.baseBranch, dir);
     await createBranch(dir, branch);
+    const baseSha = await getHeadSha(dir); // baseline to detect agent commits, not just dirty tree
 
     // If the task references a Jira issue, pull its context so the agent builds the right thing.
     let prompt = job.prompt;
@@ -64,14 +66,14 @@ async function processJob(jobId: string): Promise<void> {
     const { transcript, exitCode, reason } = await runAgent(dir, prompt);
     const transcriptUri = await storeTranscript(jobId, transcript);
 
-    if (!(await hasChanges(dir))) {
+    if (!(await hasChanges(dir, baseSha))) {
       const why = reason ? ` (${reason})` : '';
       await updateJob(jobId, 'failed', { error: `agent produced no changes${why}`, transcriptUri });
       await notify(job, `:warning: Hermes job \`${jobId}\` finished but made no changes${why}.`);
       if (ticket) {
         await commentOnIssue(
           ticket,
-          `:warning: I ran but produced no code changes${why}. Transcript: ${transcriptUri}\nMoving back to *To Do* — add detail or narrow the scope and re-assign me.`
+          `⚠️ I ran but produced no code changes${why}. Transcript: \`${transcriptUri}\`\n\nMoving back to **To Do** — add detail or narrow the scope and re-assign me.`
         );
         await transitionIssue(ticket, COLUMN.toDo);
       }
@@ -96,7 +98,7 @@ async function processJob(jobId: string): Promise<void> {
     await updateJob(jobId, 'done', { prUrl, transcriptUri });
     await notify(job, `:white_check_mark: Hermes opened a PR for job \`${jobId}\`: ${prUrl}`);
     if (ticket) {
-      await commentOnIssue(ticket, `:white_check_mark: PR opened: ${prUrl}\nMoving to *Code Review*.`);
+      await commentOnIssue(ticket, `✅ PR opened: ${prUrl}\n\nMoving to **Code Review**.`);
       await transitionIssue(ticket, COLUMN.codeReview);
     }
     console.log(`[${jobId}] done → ${prUrl}`);
@@ -106,7 +108,7 @@ async function processJob(jobId: string): Promise<void> {
     await updateJob(jobId, 'failed', { error: msg });
     await notify(job, `:x: Hermes job \`${jobId}\` failed: ${msg}`);
     if (ticket) {
-      await commentOnIssue(ticket, `:x: I hit a blocker and couldn't finish: ${msg}\nMoving back to *To Do*.`);
+      await commentOnIssue(ticket, `❌ I hit a blocker and couldn't finish: ${msg}\n\nMoving back to **To Do**.`);
       await transitionIssue(ticket, COLUMN.toDo);
     }
     throw err; // do not delete the SQS message → redelivery, then DLQ

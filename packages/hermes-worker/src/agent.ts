@@ -47,9 +47,23 @@ function summarize(stdout: string): { reason?: string; numTurns?: number } {
   }
 }
 
-export async function runAgent(dir: string, prompt: string): Promise<AgentResult> {
+// Prepended to every task. The harness owns git: the agent edits files only, so change-detection
+// and PR creation stay deterministic and the agent can't open a malformed/duplicate PR.
+const HARNESS_PREAMBLE = `You are running inside an automated CI harness, on a fresh shallow clone of the repository, on a new branch that has already been created for you.
+
+Git is handled FOR you — do NOT manage it yourself:
+- Make the required code changes by EDITING FILES in the working directory only.
+- Do NOT run \`git commit\`, \`git push\`, \`git checkout\`, \`git branch\`, or any \`gh\` command, and do NOT open a pull request. The harness automatically commits your working-tree changes and opens the PR after you finish.
+- Leave your edits uncommitted in the working tree and end your turn when the change is complete.
+
+--- TASK ---
+
+`;
+
+export async function runAgent(dir: string, taskPrompt: string): Promise<AgentResult> {
   const apiKey = await getSecretString(SECRET_ANTHROPIC);
   if (!apiKey) throw new Error('Anthropic API key not configured in Secrets Manager');
+  const prompt = HARNESS_PREAMBLE + taskPrompt;
 
   // JSON output so we always capture the outcome (num_turns, error subtype, final result) even
   // when the run errors — text output yields nothing on a max-turns exit.

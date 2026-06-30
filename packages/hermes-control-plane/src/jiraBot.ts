@@ -6,6 +6,7 @@
  * Best-effort — every call tolerates missing credentials and never throws into the caller.
  */
 import { getSecretJson } from './secrets.js';
+import { markdownToAdf } from './markdownAdf.js';
 
 const SECRET = process.env.SECRET_JIRA_BOT || process.env.SECRET_JIRA;
 
@@ -20,23 +21,26 @@ async function creds(): Promise<{ host: string; auth: string } | null> {
   }
 }
 
-/** Render plain text (with newlines) into a minimal ADF document. */
-function adf(text: string): unknown {
-  const paragraphs = text.split('\n').map((line) => ({
-    type: 'paragraph',
-    content: line ? [{ type: 'text', text: line }] : [],
-  }));
-  return { version: 1, type: 'doc', content: paragraphs };
+/** The Hermes bot's own Atlassian accountId (used to ignore its own comments). */
+export async function getBotAccountId(): Promise<string | null> {
+  if (!SECRET) return null;
+  try {
+    const { accountId } = await getSecretJson(SECRET);
+    return accountId || null;
+  } catch {
+    return null;
+  }
 }
 
-export async function commentOnIssue(issueKey: string, text: string): Promise<void> {
+/** Comment text is markdown; convert to ADF so Jira renders it (not literal `##`/`**`). */
+export async function commentOnIssue(issueKey: string, markdown: string): Promise<void> {
   const c = await creds();
   if (!c) return;
   try {
     await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
       method: 'POST',
       headers: { Authorization: `Basic ${c.auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ body: adf(text) }),
+      body: JSON.stringify({ body: markdownToAdf(markdown) }),
     });
   } catch {
     /* best-effort */

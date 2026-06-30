@@ -56,7 +56,7 @@ export async function converse(history: ChatMsg[], jiraContext?: string): Promis
   return textOf(message) || "Got it — tell me a bit more and run `/start` when you're ready.";
 }
 
-const TASK_SYSTEM = `Convert the following Slack conversation between a developer and Hermes (a coding agent) into a single, self-contained task instruction for an autonomous coding agent that will implement it and open a pull request.
+const TASK_SYSTEM = `Convert the following Slack conversation between a developer and Hermes (a coding agent) into a single, self-contained task instruction for an autonomous coding agent that will implement it. The agent runs in a harness that handles git and opens the PR automatically, so describe the CODE CHANGE only — do NOT instruct it to commit, push, or open a pull request.
 
 Output ONLY the task instruction — no preamble, no questions. Include: the concrete change to make, the repo if stated, any acceptance criteria discussed, and any Jira issue keys (DM-###) referenced. Be specific and actionable.`;
 
