@@ -10,16 +10,10 @@
  */
 import Fastify, { type FastifyRequest } from 'fastify';
 import { createJob, getJob, type WorkerType } from './jobs.js';
-import {
-  verifySlackSignature,
-  postSlackMessage,
-  stripMention,
-  getThreadReplies,
-  getBotUserId,
-} from './slack.js';
+import { verifySlackSignature, postSlackMessage, stripMention } from './slack.js';
 import { getSecretJson } from './secrets.js';
-import { converse, conversationToTask, type ChatMsg } from './converse.js';
-import { setActiveThread, getActiveThread } from './convo.js';
+import { converse, conversationToTask } from './converse.js';
+import { appendMessage, getConversation, setActivePointer, getActivePointer } from './convo.js';
 import { findIssueKey, fetchIssueContext } from './jira.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -87,8 +81,8 @@ app.post('/slack/events', async (req, reply) => {
   handleSlackEvent(body).catch((err) => app.log.error({ err }, 'slack event handler failed'));
 });
 
-// Mention/DM → CONVERSE (gather requirements). No job is queued here — the user runs /start
-// to queue the coding task from the conversation.
+// Mention/DM → CONVERSE (gather requirements) and persist the dialog. No job is queued unless
+// the user says /start (slash command, or inline in a message).
 async function handleSlackEvent(body: Record<string, unknown>): Promise<void> {
   const event = body.event as
     | { type?: string; subtype?: string; text?: string; channel?: string; thread_ts?: string; ts?: string; user?: string; bot_id?: string }
@@ -101,30 +95,47 @@ async function handleSlackEvent(body: Record<string, unknown>): Promise<void> {
   const threadTs = event.thread_ts ?? event.ts;
   if (!threadTs) return;
 
-  // Remember this thread as the user's active conversation (so /start can find it).
-  await setActiveThread(channel, user, threadTs);
+  const text = stripMention(event.text ?? '').trim();
+  if (!text) return;
 
-  // Build the conversation from the thread; fall back to just this message.
-  const [botId, replies] = await Promise.all([getBotUserId(), getThreadReplies(channel, threadTs)]);
-  let history: ChatMsg[] = replies
-    .filter((m) => m.text)
-    .map((m) => ({
-      role: m.bot_id || (botId && m.user === botId) ? ('assistant' as const) : ('user' as const),
-      content: m.text,
-    }));
-  if (!history.length) {
-    const t = stripMention(event.text ?? '');
-    if (t) history = [{ role: 'user', content: t }];
+  await setActivePointer(channel, user, threadTs);
+
+  // Inline "/start" (or "start the job") → queue from the conversation so far.
+  if (/(^|\s)\/start\b/i.test(text) || /\bstart the (job|task|coding)\b/i.test(text)) {
+    const clean = text.replace(/\/start/gi, '').trim();
+    if (clean) await appendMessage(channel, threadTs, { role: 'user', content: clean });
+    await queueFromConversation(channel, user, threadTs);
+    return;
   }
-  while (history.length && history[history.length - 1].role === 'assistant') history.pop();
-  if (!history.length) return;
 
-  // If the user referenced a Jira issue, pull its context so Hermes can discuss it.
+  await appendMessage(channel, threadTs, { role: 'user', content: text });
+  const history = await getConversation(channel, threadTs);
+
+  // If the conversation references a Jira issue, pull its context so Hermes can discuss it.
   const issueKey = findIssueKey(history.map((h) => h.content).join('\n'));
   const jiraContext = issueKey ? (await fetchIssueContext(issueKey)) ?? undefined : undefined;
 
   const reply = await converse(history, jiraContext);
+  await appendMessage(channel, threadTs, { role: 'assistant', content: reply });
   await postSlackMessage(channel, reply, threadTs);
+}
+
+// Condense the stored conversation into a task and queue the coding job.
+async function queueFromConversation(channel: string, user: string, threadTs: string): Promise<void> {
+  const msgs = await getConversation(channel, threadTs);
+  const transcript = msgs.map((m) => `${m.role === 'assistant' ? 'Hermes' : 'User'}: ${m.content}`).join('\n');
+  if (!transcript) {
+    await postSlackMessage(channel, ':information_source: Tell me what to build first, then run `/start`.', threadTs);
+    return;
+  }
+  const taskPrompt = await conversationToTask(transcript);
+  const { type, repo } = routeIntent(`${transcript}\n${taskPrompt}`);
+  const job = await createJob({ type, repo, prompt: taskPrompt, source: 'slack', channel, threadTs, requestedBy: user });
+  await postSlackMessage(
+    channel,
+    `:robot_face: Queued job \`${job.jobId}\` against \`${repo}\` from our conversation. I'll post the PR here when it's ready.`,
+    threadTs
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -148,38 +159,12 @@ async function handleStartCommand(body: Record<string, string>): Promise<void> {
   const user = body.user_id;
   if (!channel || !user) return;
 
-  const threadTs = await getActiveThread(channel, user);
+  const threadTs = await getActivePointer(channel, user);
   if (!threadTs) {
     await postSlackMessage(channel, ':information_source: Mention me to discuss a task first, then run `/start`.');
     return;
   }
-
-  const replies = await getThreadReplies(channel, threadTs);
-  const transcript = replies
-    .filter((m) => m.text)
-    .map((m) => `${m.bot_id ? 'Hermes' : 'User'}: ${m.text}`)
-    .join('\n');
-  if (!transcript) {
-    await postSlackMessage(channel, ":information_source: I couldn't find our conversation — mention me again, then `/start`.", threadTs);
-    return;
-  }
-
-  const taskPrompt = await conversationToTask(transcript);
-  const { type, repo } = routeIntent(`${transcript}\n${taskPrompt}`);
-  const job = await createJob({
-    type,
-    repo,
-    prompt: taskPrompt,
-    source: 'slack',
-    channel,
-    threadTs,
-    requestedBy: user,
-  });
-  await postSlackMessage(
-    channel,
-    `:robot_face: Queued job \`${job.jobId}\` against \`${repo}\` from our conversation. I'll post the PR here when it's ready.`,
-    threadTs
-  );
+  await queueFromConversation(channel, user, threadTs);
 }
 
 // ---------------------------------------------------------------------------
