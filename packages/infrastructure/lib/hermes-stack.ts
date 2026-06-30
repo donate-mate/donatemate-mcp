@@ -25,6 +25,7 @@ import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as appscaling from 'aws-cdk-lib/aws-applicationautoscaling';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
 export type Environment = 'staging' | 'production';
@@ -41,9 +42,12 @@ export class HermesStack extends cdk.Stack {
     const { environment } = props;
     const isProd = environment === 'production';
 
-    // Services default to 0 so the topology deploys before container images exist.
-    const controlPlaneDesired = Number(this.node.tryGetContext('hermes-control-plane-count') ?? 0);
-    const workerDesired = Number(this.node.tryGetContext('hermes-worker-count') ?? 0);
+    // Optimal steady-state defaults: control plane HA (2, multi-AZ); worker warm floor 1
+    // (always-on, instant first job) autoscaling up to 4 on queue depth. Override via context
+    // (e.g. hermes-worker-count=0 for cost-optimal scale-to-zero).
+    const controlPlaneDesired = Number(this.node.tryGetContext('hermes-control-plane-count') ?? 2);
+    const workerDesired = Number(this.node.tryGetContext('hermes-worker-count') ?? 1);
+    const workerMax = Number(this.node.tryGetContext('hermes-worker-max') ?? 4);
 
     const vpc = ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true });
 
@@ -241,14 +245,25 @@ export class HermesStack extends cdk.Stack {
     secJira.grantRead(workerTaskDef.taskRole);
     secSlack.grantRead(workerTaskDef.taskRole);
 
-    // Autoscale FE worker on queue depth (min stays at the deployed desiredCount).
-    const scaling = feWorker.autoScaleTaskCount({ minCapacity: workerDesired, maxCapacity: 4 });
+    // The worker protects its own task from scale-in while it's processing a job, so the
+    // autoscaler can scale down after a burst without killing an active coding job.
+    workerTaskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['ecs:UpdateTaskProtection'],
+        resources: [`arn:aws:ecs:${this.region}:${this.account}:task/donatemate-${environment}-hermes/*`],
+      })
+    );
+
+    // Autoscale FE worker on queue depth: scale OUT on backlog, scale IN to the warm floor
+    // when the queue is empty (busy tasks are protected, so scale-in only removes idle ones).
+    const scaling = feWorker.autoScaleTaskCount({ minCapacity: workerDesired, maxCapacity: workerMax });
     scaling.scaleOnMetric('FeWorkerQueueScaling', {
       metric: jobsQueue.metricApproximateNumberOfMessagesVisible(),
       adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
       cooldown: cdk.Duration.seconds(120),
       scalingSteps: [
-        { upper: 0, change: 0 },
+        { upper: 0, change: -1 },
         { lower: 1, change: +1 },
         { lower: 5, change: +2 },
       ],

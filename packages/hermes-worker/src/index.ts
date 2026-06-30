@@ -24,6 +24,7 @@ import {
 import { runAgent } from './agent.js';
 import { getJob, updateJob, storeTranscript } from './jobs.js';
 import { notify } from './notify.js';
+import { setScaleInProtection } from './taskprotection.js';
 
 const sqs = new SQSClient({});
 const QUEUE = process.env.JOBS_QUEUE_URL!;
@@ -37,6 +38,7 @@ async function processJob(jobId: string): Promise<void> {
   }
   console.log(`[${jobId}] processing against ${job.repo}@${job.baseBranch}`);
   await updateJob(jobId, 'running');
+  await setScaleInProtection(true); // don't let the autoscaler kill us mid-job
 
   const dir = await mkdtemp(join(tmpdir(), `hermes-${jobId}-`));
   try {
@@ -80,6 +82,7 @@ async function processJob(jobId: string): Promise<void> {
     throw err; // do not delete the SQS message → redelivery, then DLQ
   } finally {
     await rm(dir, { recursive: true, force: true });
+    await setScaleInProtection(false); // idle again — allow scale-in
   }
 }
 
