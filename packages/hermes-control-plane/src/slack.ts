@@ -44,3 +44,35 @@ export async function postSlackMessage(channel: string, text: string, threadTs?:
 export function stripMention(text: string): string {
   return (text || '').replace(/<@[^>]+>\s*/g, '').trim();
 }
+
+let botUserId: string | null = null;
+export async function getBotUserId(): Promise<string | null> {
+  if (botUserId) return botUserId;
+  const { botToken } = await getSecretJson(SECRET_SLACK);
+  if (!botToken) return null;
+  const r = await fetch('https://slack.com/api/auth.test', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${botToken}` },
+  });
+  const j = (await r.json()) as { user_id?: string };
+  botUserId = j.user_id ?? null;
+  return botUserId;
+}
+
+export interface SlackThreadMsg {
+  user?: string;
+  bot_id?: string;
+  text: string;
+}
+
+/** Fetch a thread's messages (oldest→newest) via conversations.replies. */
+export async function getThreadReplies(channel: string, threadTs: string): Promise<SlackThreadMsg[]> {
+  const { botToken } = await getSecretJson(SECRET_SLACK);
+  if (!botToken) return [];
+  const r = await fetch(
+    `https://slack.com/api/conversations.replies?channel=${encodeURIComponent(channel)}&ts=${encodeURIComponent(threadTs)}&limit=50`,
+    { headers: { Authorization: `Bearer ${botToken}` } }
+  );
+  const j = (await r.json()) as { messages?: SlackThreadMsg[] };
+  return (j.messages ?? []).map((m) => ({ user: m.user, bot_id: m.bot_id, text: stripMention(m.text ?? '') }));
+}

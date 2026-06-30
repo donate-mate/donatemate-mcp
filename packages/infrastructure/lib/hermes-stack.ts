@@ -138,6 +138,7 @@ export class HermesStack extends cdk.Stack {
         SECRET_SLACK: secSlack.secretName,
         SECRET_JIRA_WEBHOOK: secJiraHook.secretName,
         SECRET_GITHUB_APP: secGithub.secretName,
+        SECRET_ANTHROPIC: secAnthropic.secretName, // conversational layer (Slack chat + /start)
         MCP_ENDPOINT: props.mcpEndpoint ?? 'https://mcp.donate-mate.com/mcp',
       },
     });
@@ -193,6 +194,7 @@ export class HermesStack extends cdk.Stack {
     secSlack.grantRead(cpTaskDef.taskRole);
     secJiraHook.grantRead(cpTaskDef.taskRole);
     secGithub.grantRead(cpTaskDef.taskRole);
+    secAnthropic.grantRead(cpTaskDef.taskRole);
 
     // ========================================================================
     // FE worker (Fargate service, no inbound; pulls jobs from SQS)

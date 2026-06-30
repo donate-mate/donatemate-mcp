@@ -10,8 +10,16 @@
  */
 import Fastify, { type FastifyRequest } from 'fastify';
 import { createJob, getJob, type WorkerType } from './jobs.js';
-import { verifySlackSignature, postSlackMessage, stripMention } from './slack.js';
+import {
+  verifySlackSignature,
+  postSlackMessage,
+  stripMention,
+  getThreadReplies,
+  getBotUserId,
+} from './slack.js';
 import { getSecretJson } from './secrets.js';
+import { converse, conversationToTask, type ChatMsg } from './converse.js';
+import { setActiveThread, getActiveThread } from './convo.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -22,6 +30,16 @@ const REPO_BY_TYPE: Record<WorkerType, string> = {
   qa: 'donate-mate/donatemate-app',
 };
 
+// Route a free-text Slack/Jira request to the right worker + repo. Backend signals
+// ("backend", "back-end", "server-side", or an explicit "be:" prefix) → the lambdas repo;
+// everything else defaults to the frontend app.
+function routeIntent(text: string): { type: WorkerType; repo: string } {
+  const t = (text || '').toLowerCase();
+  const backend = /\bback[\s-]?end\b/.test(t) || /\bserver[\s-]?side\b/.test(t) || t.trimStart().startsWith('be:');
+  const type: WorkerType = backend ? 'be' : 'fe';
+  return { type, repo: REPO_BY_TYPE[type] };
+}
+
 const app = Fastify({ logger: true, bodyLimit: 5 * 1024 * 1024 });
 
 // Capture the raw JSON body (needed for Slack HMAC signature verification) while still
@@ -30,6 +48,16 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, 
   (req as FastifyRequest & { rawBody?: string }).rawBody = body as string;
   try {
     done(null, body ? JSON.parse(body as string) : {});
+  } catch (err) {
+    done(err as Error, undefined);
+  }
+});
+
+// Slack slash commands arrive form-encoded; capture raw body for signature verification.
+app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (req, body, done) => {
+  (req as FastifyRequest & { rawBody?: string }).rawBody = body as string;
+  try {
+    done(null, Object.fromEntries(new URLSearchParams((body as string) || '')));
   } catch (err) {
     done(err as Error, undefined);
   }
@@ -58,36 +86,95 @@ app.post('/slack/events', async (req, reply) => {
   handleSlackEvent(body).catch((err) => app.log.error({ err }, 'slack event handler failed'));
 });
 
+// Mention/DM → CONVERSE (gather requirements). No job is queued here — the user runs /start
+// to queue the coding task from the conversation.
 async function handleSlackEvent(body: Record<string, unknown>): Promise<void> {
   const event = body.event as
-    | { type?: string; text?: string; channel?: string; thread_ts?: string; ts?: string; user?: string; bot_id?: string }
+    | { type?: string; subtype?: string; text?: string; channel?: string; thread_ts?: string; ts?: string; user?: string; bot_id?: string }
     | undefined;
-  if (!event || event.bot_id) return; // ignore our own / other bots
+  if (!event || event.bot_id || event.subtype) return; // ignore our own / edited / system messages
   if (event.type !== 'app_mention' && event.type !== 'message') return;
-
-  const prompt = stripMention(event.text ?? '');
-  if (!prompt) return;
+  const { channel, user } = event;
+  if (!channel || !user) return;
 
   const threadTs = event.thread_ts ?? event.ts;
-  // MVP routing: Slack tasks default to the FE app. Deeper intent/repo parsing + multi-turn
-  // thread→session continuation is a follow-up (threadTs is persisted on the job for that).
-  const job = await createJob({
-    type: 'fe',
-    repo: REPO_BY_TYPE.fe,
-    prompt,
-    source: 'slack',
-    channel: event.channel,
-    threadTs,
-    requestedBy: event.user,
-  });
+  if (!threadTs) return;
 
-  if (event.channel) {
-    await postSlackMessage(
-      event.channel,
-      `:robot_face: On it — queued job \`${job.jobId}\` against \`${job.repo}\`. I'll post the PR here when it's ready.`,
-      threadTs
-    );
+  // Remember this thread as the user's active conversation (so /start can find it).
+  await setActiveThread(channel, user, threadTs);
+
+  // Build the conversation from the thread; fall back to just this message.
+  const [botId, replies] = await Promise.all([getBotUserId(), getThreadReplies(channel, threadTs)]);
+  let history: ChatMsg[] = replies
+    .filter((m) => m.text)
+    .map((m) => ({
+      role: m.bot_id || (botId && m.user === botId) ? ('assistant' as const) : ('user' as const),
+      content: m.text,
+    }));
+  if (!history.length) {
+    const t = stripMention(event.text ?? '');
+    if (t) history = [{ role: 'user', content: t }];
   }
+  while (history.length && history[history.length - 1].role === 'assistant') history.pop();
+  if (!history.length) return;
+
+  const reply = await converse(history);
+  await postSlackMessage(channel, reply, threadTs);
+}
+
+// ---------------------------------------------------------------------------
+// Slack slash command: /start — queue a coding job from the active conversation
+// ---------------------------------------------------------------------------
+app.post('/slack/commands', async (req, reply) => {
+  const raw = (req as FastifyRequest & { rawBody?: string }).rawBody ?? '';
+  if (!(await verifySlackSignature(raw, req.headers))) {
+    return reply.code(401).send('invalid signature');
+  }
+  const body = (req.body ?? {}) as Record<string, string>;
+  // Ack within Slack's 3s window; summarize + queue asynchronously.
+  reply.send({ response_type: 'ephemeral', text: ':hourglass_flowing_sand: Starting from our conversation…' });
+  if ((body.command || '') === '/start') {
+    handleStartCommand(body).catch((err) => app.log.error({ err }, '/start handler failed'));
+  }
+});
+
+async function handleStartCommand(body: Record<string, string>): Promise<void> {
+  const channel = body.channel_id;
+  const user = body.user_id;
+  if (!channel || !user) return;
+
+  const threadTs = await getActiveThread(channel, user);
+  if (!threadTs) {
+    await postSlackMessage(channel, ':information_source: Mention me to discuss a task first, then run `/start`.');
+    return;
+  }
+
+  const replies = await getThreadReplies(channel, threadTs);
+  const transcript = replies
+    .filter((m) => m.text)
+    .map((m) => `${m.bot_id ? 'Hermes' : 'User'}: ${m.text}`)
+    .join('\n');
+  if (!transcript) {
+    await postSlackMessage(channel, ":information_source: I couldn't find our conversation — mention me again, then `/start`.", threadTs);
+    return;
+  }
+
+  const taskPrompt = await conversationToTask(transcript);
+  const { type, repo } = routeIntent(`${transcript}\n${taskPrompt}`);
+  const job = await createJob({
+    type,
+    repo,
+    prompt: taskPrompt,
+    source: 'slack',
+    channel,
+    threadTs,
+    requestedBy: user,
+  });
+  await postSlackMessage(
+    channel,
+    `:robot_face: Queued job \`${job.jobId}\` against \`${repo}\` from our conversation. I'll post the PR here when it's ready.`,
+    threadTs
+  );
 }
 
 // ---------------------------------------------------------------------------

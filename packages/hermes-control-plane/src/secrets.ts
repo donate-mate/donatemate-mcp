@@ -25,3 +25,9 @@ export function clearSecretCache(name?: string): void {
   if (name) cache.delete(name);
   else cache.clear();
 }
+
+/** Plain-string secret (e.g. the Anthropic API key, stored as a raw string not JSON). */
+export async function getSecretString(name: string): Promise<string> {
+  const res = await client.send(new GetSecretValueCommand({ SecretId: name }));
+  return (res.SecretString || '').trim();
+}
