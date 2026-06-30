@@ -71,3 +71,19 @@ export async function conversationToTask(transcript: string): Promise<string> {
   });
   return textOf(message);
 }
+
+const PLAN_SYSTEM = `You are Hermes, DonateMate's coding agent. You've been assigned a Jira ticket. Read its content and write a SHORT implementation plan for a human reviewer to approve before you start coding.
+
+Format: 3-6 concise bullet points covering your understanding of the defect/feature, where in the codebase you expect to make changes, and the approach. If anything is ambiguous or risky, call it out. Do NOT write code. Keep it tight — this is a Jira comment, not an essay.`;
+
+/** Produce a short, reviewer-facing implementation plan from a Jira issue's context. */
+export async function planIssue(issueContext: string): Promise<string> {
+  const c = await getClient();
+  const message = await c.messages.create({
+    model: MODEL,
+    max_tokens: 1024,
+    system: PLAN_SYSTEM,
+    messages: [{ role: 'user', content: issueContext }],
+  });
+  return textOf(message) || 'I will investigate the codebase and implement the change described in this ticket.';
+}

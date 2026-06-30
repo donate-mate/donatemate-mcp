@@ -16,19 +16,52 @@ const pexec = promisify(execFile);
 const SECRET_ANTHROPIC = process.env.SECRET_ANTHROPIC!;
 const SECRET_DM_MCP = process.env.SECRET_DM_MCP;
 const MCP_ENDPOINT = process.env.MCP_ENDPOINT || 'https://mcp.donate-mate.com/mcp';
-const MAX_ITERATIONS = Number(process.env.MAX_AGENT_ITERATIONS ?? 40);
+// Turns must cover EXPLORE (grep/read/MCP, one turn each) + EDIT. 40 starved exploration on a
+// large RN/Expo repo and the agent never reached the edit phase. The token budget and the hard
+// timeout are the real guardrails; keep turns high enough that they bind first.
+const MAX_ITERATIONS = Number(process.env.MAX_AGENT_ITERATIONS ?? 200);
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_SECONDS ?? 2400) * 1000;
 
 export interface AgentResult {
   transcript: string;
   exitCode: number;
+  /** Concise outcome for surfacing in Slack/Jira (e.g. "hit the 200-turn limit"). */
+  reason?: string;
+}
+
+// Parse `claude --output-format json` result envelope into a human-readable reason.
+function summarize(stdout: string): { reason?: string; numTurns?: number } {
+  try {
+    const j = JSON.parse(stdout) as {
+      subtype?: string;
+      is_error?: boolean;
+      num_turns?: number;
+      result?: string;
+    };
+    const numTurns = j.num_turns;
+    if (j.subtype === 'error_max_turns') return { reason: `hit the ${MAX_ITERATIONS}-turn limit before finishing`, numTurns };
+    if (j.is_error) return { reason: (j.result || j.subtype || 'agent reported an error').slice(0, 300), numTurns };
+    return { reason: j.result ? j.result.slice(0, 300) : undefined, numTurns };
+  } catch {
+    return {};
+  }
 }
 
 export async function runAgent(dir: string, prompt: string): Promise<AgentResult> {
   const apiKey = await getSecretString(SECRET_ANTHROPIC);
   if (!apiKey) throw new Error('Anthropic API key not configured in Secrets Manager');
 
-  const args = ['-p', prompt, '--dangerously-skip-permissions', '--max-turns', String(MAX_ITERATIONS)];
+  // JSON output so we always capture the outcome (num_turns, error subtype, final result) even
+  // when the run errors — text output yields nothing on a max-turns exit.
+  const args = [
+    '-p',
+    prompt,
+    '--output-format',
+    'json',
+    '--dangerously-skip-permissions',
+    '--max-turns',
+    String(MAX_ITERATIONS),
+  ];
 
   // Attach the DonateMate MCP. The config (with the API key) is written OUTSIDE the repo clone
   // so the credential can never be committed by the agent.
@@ -66,15 +99,20 @@ export async function runAgent(dir: string, prompt: string): Promise<AgentResult
         maxBuffer: 32 * 1024 * 1024,
         env: { ...process.env, ANTHROPIC_API_KEY: apiKey },
       });
-      return { transcript: `${stdout || ''}\n${stderr || ''}`.trim(), exitCode: 0 };
+      const { reason, numTurns } = summarize(stdout || '');
+      console.log(`[agent] completed in ${numTurns ?? '?'} turns`);
+      return { transcript: `${stdout || ''}\n${stderr || ''}`.trim(), exitCode: 0, reason };
     } catch (err) {
       const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
       if (e.code === 'ETIMEDOUT') throw new Error(`Agent timed out after ${JOB_TIMEOUT_MS / 1000}s`);
       // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides
       // based on whether the working tree changed.
+      const { reason, numTurns } = summarize(e.stdout || '');
+      console.log(`[agent] non-zero exit after ${numTurns ?? '?'} turns: ${reason ?? e.stderr ?? ''}`);
       return {
         transcript: `${e.stdout || ''}\n${e.stderr || ''}`.trim(),
         exitCode: typeof e.code === 'number' ? e.code : 1,
+        reason: reason ?? ((e.stderr || '').trim().slice(0, 300) || undefined),
       };
     }
   } finally {

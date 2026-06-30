@@ -21,7 +21,15 @@ function adfText(node: unknown): string {
   return (Array.isArray(n.content) ? n.content.map(adfText).join('') : '') + sep;
 }
 
-export async function fetchIssueContext(issueKey: string): Promise<string | null> {
+export interface JiraIssue {
+  summary: string;
+  labels: string[];
+  status: string;
+  context: string; // human-readable block (summary + type + description + recent comments)
+}
+
+/** Fetch an issue's structured fields plus a readable context block (used for routing + planning). */
+export async function fetchIssue(issueKey: string): Promise<JiraIssue | null> {
   if (!SECRET_JIRA) return null;
   try {
     const { host, email, token } = await getSecretJson(SECRET_JIRA);
@@ -34,20 +42,29 @@ export async function fetchIssueContext(issueKey: string): Promise<string | null
     if (!res.ok) return null;
     const d = (await res.json()) as any;
     const f = d.fields || {};
+    const summary = f.summary ?? '';
+    const labels: string[] = Array.isArray(f.labels) ? f.labels : [];
+    const status = f.status?.name ?? '?';
     const desc = f.description ? adfText(f.description).trim() : '';
     const comments = (f.comment?.comments || [])
       .slice(-5)
       .map((c: any) => `- ${c.author?.displayName ?? '?'}: ${adfText(c.body).trim()}`)
       .join('\n');
-    return [
-      `Jira ${issueKey}: ${f.summary ?? ''}`,
-      `Type: ${f.issuetype?.name ?? '?'} | Status: ${f.status?.name ?? '?'}${f.labels?.length ? ` | Labels: ${f.labels.join(', ')}` : ''}`,
+    const context = [
+      `Jira ${issueKey}: ${summary}`,
+      `Type: ${f.issuetype?.name ?? '?'} | Status: ${status}${labels.length ? ` | Labels: ${labels.join(', ')}` : ''}`,
       '',
       'Description:',
       desc || '(none)',
       ...(comments ? ['', 'Recent comments:', comments] : []),
     ].join('\n');
+    return { summary, labels, status, context };
   } catch {
     return null;
   }
+}
+
+export async function fetchIssueContext(issueKey: string): Promise<string | null> {
+  const issue = await fetchIssue(issueKey);
+  return issue ? issue.context : null;
 }

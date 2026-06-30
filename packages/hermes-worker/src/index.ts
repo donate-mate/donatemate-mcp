@@ -26,6 +26,7 @@ import { getJob, updateJob, storeTranscript } from './jobs.js';
 import { notify } from './notify.js';
 import { setScaleInProtection } from './taskprotection.js';
 import { findIssueKey, fetchIssueContext } from './jira.js';
+import { commentOnIssue, transitionIssue, COLUMN, jiraIssueKey } from './jiraBot.js';
 
 const sqs = new SQSClient({});
 const QUEUE = process.env.JOBS_QUEUE_URL!;
@@ -38,6 +39,7 @@ async function processJob(jobId: string): Promise<void> {
     return;
   }
   console.log(`[${jobId}] processing against ${job.repo}@${job.baseBranch}`);
+  const ticket = jiraIssueKey(job.source); // non-null → write progress back to this Jira issue
   await updateJob(jobId, 'running');
   await setScaleInProtection(true); // don't let the autoscaler kill us mid-job
 
@@ -59,12 +61,20 @@ async function processJob(jobId: string): Promise<void> {
       }
     }
 
-    const { transcript, exitCode } = await runAgent(dir, prompt);
+    const { transcript, exitCode, reason } = await runAgent(dir, prompt);
     const transcriptUri = await storeTranscript(jobId, transcript);
 
     if (!(await hasChanges(dir))) {
-      await updateJob(jobId, 'failed', { error: 'agent produced no changes', transcriptUri });
-      await notify(job, `:warning: Hermes job \`${jobId}\` finished but made no changes.`);
+      const why = reason ? ` (${reason})` : '';
+      await updateJob(jobId, 'failed', { error: `agent produced no changes${why}`, transcriptUri });
+      await notify(job, `:warning: Hermes job \`${jobId}\` finished but made no changes${why}.`);
+      if (ticket) {
+        await commentOnIssue(
+          ticket,
+          `:warning: I ran but produced no code changes${why}. Transcript: ${transcriptUri}\nMoving back to *To Do* — add detail or narrow the scope and re-assign me.`
+        );
+        await transitionIssue(ticket, COLUMN.toDo);
+      }
       return;
     }
 
@@ -85,12 +95,20 @@ async function processJob(jobId: string): Promise<void> {
 
     await updateJob(jobId, 'done', { prUrl, transcriptUri });
     await notify(job, `:white_check_mark: Hermes opened a PR for job \`${jobId}\`: ${prUrl}`);
+    if (ticket) {
+      await commentOnIssue(ticket, `:white_check_mark: PR opened: ${prUrl}\nMoving to *Code Review*.`);
+      await transitionIssue(ticket, COLUMN.codeReview);
+    }
     console.log(`[${jobId}] done → ${prUrl}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[${jobId}] failed:`, msg);
     await updateJob(jobId, 'failed', { error: msg });
     await notify(job, `:x: Hermes job \`${jobId}\` failed: ${msg}`);
+    if (ticket) {
+      await commentOnIssue(ticket, `:x: I hit a blocker and couldn't finish: ${msg}\nMoving back to *To Do*.`);
+      await transitionIssue(ticket, COLUMN.toDo);
+    }
     throw err; // do not delete the SQS message → redelivery, then DLQ
   } finally {
     await rm(dir, { recursive: true, force: true });

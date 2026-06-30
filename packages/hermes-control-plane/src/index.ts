@@ -12,9 +12,11 @@ import Fastify, { type FastifyRequest } from 'fastify';
 import { createJob, getJob, type WorkerType } from './jobs.js';
 import { verifySlackSignature, postSlackMessage, stripMention } from './slack.js';
 import { getSecretJson } from './secrets.js';
-import { converse, conversationToTask } from './converse.js';
+import { converse, conversationToTask, planIssue } from './converse.js';
 import { appendMessage, getConversation, setActivePointer, getActivePointer } from './convo.js';
-import { findIssueKey, fetchIssueContext } from './jira.js';
+import { findIssueKey, fetchIssueContext, fetchIssue } from './jira.js';
+import { getFlow, setFlow } from './jiraflow.js';
+import { commentOnIssue, transitionIssue, COLUMN } from './jiraBot.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 
@@ -33,6 +35,21 @@ function routeIntent(text: string): { type: WorkerType; repo: string } {
   const backend = /\bback[\s-]?end\b/.test(t) || /\bserver[\s-]?side\b/.test(t) || t.trimStart().startsWith('be:');
   const type: WorkerType = backend ? 'be' : 'fe';
   return { type, repo: REPO_BY_TYPE[type] };
+}
+
+// Route a Jira ticket to a repo using its structured signals (most reliable first): the
+// frontend/backend labels, then the FE:/BE:/Frontend:/Backend: summary prefix, then a text
+// fallback. `isDesign` flags Figma/design tickets that aren't coding tasks.
+function routeIntentFromJira(summary: string, labels: string[]): { type: WorkerType; repo: string; isDesign: boolean } {
+  const labelSet = new Set(labels.map((l) => l.toLowerCase()));
+  const s = (summary || '').toLowerCase();
+  const isDesign = labelSet.has('design') || /^\s*design\s*:/.test(s);
+  const backend =
+    labelSet.has('backend') ||
+    /^\s*(be|backend)\s*:/.test(s) ||
+    (!labelSet.has('frontend') && routeIntent(summary).type === 'be');
+  const type: WorkerType = backend ? 'be' : 'fe';
+  return { type, repo: REPO_BY_TYPE[type], isDesign };
 }
 
 const app = Fastify({ logger: true, bodyLimit: 5 * 1024 * 1024 });
@@ -169,6 +186,11 @@ async function handleStartCommand(body: Record<string, string>): Promise<void> {
 
 // ---------------------------------------------------------------------------
 // Jira automation webhook (shared-secret authenticated)
+//
+// Two-step, assignee-triggered flow driven by two Jira Automation rules:
+//   phase "assigned" → Hermes derives a plan and comments it, awaiting confirmation.
+//   phase "confirm"  → on a `/go` reply, Hermes queues the coding job and moves the ticket.
+// Back-compat: a body carrying an explicit `prompt` queues a job directly (legacy/dispatch).
 // ---------------------------------------------------------------------------
 app.post('/jira/webhook', async (req, reply) => {
   const { sharedSecret } = await getSecretJson(process.env.SECRET_JIRA_WEBHOOK!);
@@ -176,18 +198,84 @@ app.post('/jira/webhook', async (req, reply) => {
   if (!sharedSecret || provided !== sharedSecret) {
     return reply.code(401).send({ error: 'unauthorized' });
   }
-  const body = (req.body ?? {}) as { prompt?: string; type?: WorkerType; issueKey?: string };
-  if (!body.prompt) return reply.code(400).send({ error: 'prompt required' });
+  const body = (req.body ?? {}) as { prompt?: string; type?: WorkerType; issueKey?: string; phase?: string };
 
-  const type = body.type ?? 'fe';
-  const job = await createJob({
-    type,
-    repo: REPO_BY_TYPE[type],
-    prompt: body.prompt,
-    source: body.issueKey ? `jira:${body.issueKey}` : 'jira',
-  });
-  return reply.send({ ok: true, jobId: job.jobId });
+  // Legacy direct-prompt path.
+  if (body.prompt && !body.issueKey) {
+    const type = body.type ?? 'fe';
+    const job = await createJob({ type, repo: REPO_BY_TYPE[type], prompt: body.prompt, source: 'jira' });
+    return reply.send({ ok: true, jobId: job.jobId });
+  }
+
+  if (!body.issueKey) return reply.code(400).send({ error: 'issueKey or prompt required' });
+  const issueKey = body.issueKey.toUpperCase();
+  const phase = body.phase ?? 'assigned';
+
+  // Ack fast (Jira Automation has its own timeout); plan/queue asynchronously.
+  reply.send({ ok: true });
+  const work = phase === 'confirm' ? handleJiraConfirm(issueKey) : handleJiraAssigned(issueKey);
+  work.catch((err) => app.log.error({ err, issueKey, phase }, 'jira webhook handler failed'));
 });
+
+// Ticket assigned to Hermes → derive a plan, store it, and comment for confirmation. Does NOT
+// run the agent yet. Idempotent: a re-assignment while running is a no-op.
+async function handleJiraAssigned(issueKey: string): Promise<void> {
+  const existing = await getFlow(issueKey);
+  if (existing?.status === 'running') {
+    await commentOnIssue(issueKey, `:robot_face: I'm already working on this (job \`${existing.jobId}\`).`);
+    return;
+  }
+
+  const issue = await fetchIssue(issueKey);
+  if (!issue) {
+    await commentOnIssue(issueKey, ":warning: I couldn't read this ticket's details — check my Jira access.");
+    return;
+  }
+
+  const { type, repo, isDesign } = routeIntentFromJira(issue.summary, issue.labels);
+  if (isDesign) {
+    await commentOnIssue(
+      issueKey,
+      ':information_source: This looks like a *design* ticket, not a coding task, so I won\'t pick it up. Unassign me if that was unintended, or reassign once there\'s a concrete code change to make.'
+    );
+    return;
+  }
+
+  const plan = await planIssue(issue.context);
+  const taskPrompt = `Implement Jira issue ${issueKey}: ${issue.summary}\n\nPlanned approach:\n${plan}`;
+  await setFlow(issueKey, { status: 'awaiting_confirm', taskPrompt, repo, type, plan });
+
+  await commentOnIssue(
+    issueKey,
+    `:robot_face: *Hermes here.* I'll work this against \`${repo}\` (${type.toUpperCase()}).\n\n*Plan:*\n${plan}\n\nReply with \`/go\` to start, or refine the description and re-assign me to re-plan.`
+  );
+}
+
+// `/go` confirmation → queue the job and advance the board.
+async function handleJiraConfirm(issueKey: string): Promise<void> {
+  const flow = await getFlow(issueKey);
+  if (!flow) {
+    await commentOnIssue(issueKey, ':information_source: Assign this ticket to me first, then reply `/go` to start.');
+    return;
+  }
+  if (flow.status === 'running') {
+    await commentOnIssue(issueKey, `:robot_face: Already on it — job \`${flow.jobId}\`.`);
+    return;
+  }
+
+  const job = await createJob({
+    type: flow.type,
+    repo: flow.repo,
+    prompt: flow.taskPrompt,
+    source: `jira:${issueKey}`,
+  });
+  await setFlow(issueKey, { ...flow, status: 'running', jobId: job.jobId });
+  await transitionIssue(issueKey, COLUMN.inProgress);
+  await commentOnIssue(
+    issueKey,
+    `:hammer_and_wrench: Starting implementation — job \`${job.jobId}\` against \`${flow.repo}\`. I'll comment with the PR when it's ready.`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Programmatic dispatch (MCP / internal tools)

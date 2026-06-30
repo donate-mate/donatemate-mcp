@@ -98,6 +98,8 @@ export class HermesStack extends cdk.Stack {
     const secJiraHook = secretsmanager.Secret.fromSecretNameV2(this, 'SecJiraHook', `donatemate/${environment}/hermes/jira-webhook`);
     const secAnthropic = secretsmanager.Secret.fromSecretNameV2(this, 'SecAnthropic', `donatemate/${environment}/anthropic-api-key`);
     const secJira = secretsmanager.Secret.fromSecretNameV2(this, 'SecJira', `/donatemate/${environment}/knowledge/jira`);
+    // Dedicated hermes@ Atlassian account — write-backs (comments + transitions) post as Hermes.
+    const secJiraBot = secretsmanager.Secret.fromSecretNameV2(this, 'SecJiraBot', `donatemate/${environment}/hermes/jira-bot`);
     const secDmMcp = secretsmanager.Secret.fromSecretNameV2(this, 'SecDmMcp', `donatemate/${environment}/hermes/dm-mcp-key`);
 
     const cpRepo = ecr.Repository.fromRepositoryName(this, 'CpRepo', 'donatemate-hermes-control-plane');
@@ -140,6 +142,7 @@ export class HermesStack extends cdk.Stack {
         SECRET_GITHUB_APP: secGithub.secretName,
         SECRET_ANTHROPIC: secAnthropic.secretName, // conversational layer (Slack chat + /start)
         SECRET_JIRA: secJira.secretName, // read referenced Jira issues during conversation
+        SECRET_JIRA_BOT: secJiraBot.secretName, // write-backs (plan/progress comments + transitions) as Hermes
         MCP_ENDPOINT: props.mcpEndpoint ?? 'https://mcp.donate-mate.com/mcp',
       },
     });
@@ -197,6 +200,7 @@ export class HermesStack extends cdk.Stack {
     secGithub.grantRead(cpTaskDef.taskRole);
     secAnthropic.grantRead(cpTaskDef.taskRole);
     secJira.grantRead(cpTaskDef.taskRole);
+    secJiraBot.grantRead(cpTaskDef.taskRole);
 
     // ========================================================================
     // FE worker (Fargate service, no inbound; pulls jobs from SQS)
@@ -225,12 +229,14 @@ export class HermesStack extends cdk.Stack {
         SECRET_GITHUB_APP: secGithub.secretName,
         SECRET_ANTHROPIC: secAnthropic.secretName,
         SECRET_JIRA: secJira.secretName,
+        SECRET_JIRA_BOT: secJiraBot.secretName, // progress comments + column moves as Hermes
         SECRET_SLACK: secSlack.secretName, // worker posts PR links back to the Slack thread
         SECRET_DM_MCP: secDmMcp.secretName, // DonateMate MCP API key for the agent
         MCP_ENDPOINT: 'https://mcp.donate-mate.com/mcp',
-        // budget guardrails (Phase 1, not later)
+        // budget guardrails: token budget + hard timeout bind first; turns must be high enough
+        // to cover explore (grep/read/MCP) + edit on a large repo (40 starved exploration).
         MAX_AGENT_TOKENS: '400000',
-        MAX_AGENT_ITERATIONS: '40',
+        MAX_AGENT_ITERATIONS: '200',
         JOB_TIMEOUT_SECONDS: '2400',
       },
     });
@@ -250,6 +256,7 @@ export class HermesStack extends cdk.Stack {
     secGithub.grantRead(workerTaskDef.taskRole);
     secAnthropic.grantRead(workerTaskDef.taskRole);
     secJira.grantRead(workerTaskDef.taskRole);
+    secJiraBot.grantRead(workerTaskDef.taskRole);
     secSlack.grantRead(workerTaskDef.taskRole);
     secDmMcp.grantRead(workerTaskDef.taskRole);
 
