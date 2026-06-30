@@ -16,6 +16,14 @@ const QUEUE = process.env.JOBS_QUEUE_URL!;
 export type WorkerType = 'fe' | 'be' | 'qa';
 export type JobStatus = 'queued' | 'running' | 'done' | 'failed';
 
+// Default branch each worker type targets when a job doesn't specify one. The FE app's `main`
+// is a deploy-test skeleton — real code lives on `staging` — so FE/QA default there.
+const DEFAULT_BASE_BRANCH: Record<WorkerType, string> = {
+  fe: 'staging',
+  qa: 'staging',
+  be: 'main',
+};
+
 export interface HermesJob {
   jobId: string;
   type: WorkerType;
@@ -52,7 +60,7 @@ export async function createJob(input: CreateJobInput): Promise<HermesJob> {
     type: input.type,
     status: 'queued',
     repo: input.repo,
-    baseBranch: input.baseBranch ?? 'main',
+    baseBranch: input.baseBranch ?? DEFAULT_BASE_BRANCH[input.type] ?? 'main',
     prompt: input.prompt,
     source: input.source,
     channel: input.channel,
