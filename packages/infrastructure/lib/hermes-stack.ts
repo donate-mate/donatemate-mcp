@@ -154,14 +154,32 @@ export class HermesStack extends cdk.Stack {
       internetFacing: true,
       loadBalancerName: `dm-${environment}-hermes`,
     });
-    const listener = alb.addListener('HttpListener', { port: 80, open: true });
-    listener.addTargets('ControlPlaneTarget', {
+    const controlPlaneTg = new elbv2.ApplicationTargetGroup(this, 'ControlPlaneTG', {
+      vpc,
       port: 3000,
       protocol: elbv2.ApplicationProtocol.HTTP,
+      targetType: elbv2.TargetType.IP,
       targets: [cpService.loadBalancerTarget({ containerName: 'control-plane', containerPort: 3000 })],
       healthCheck: { path: '/health', healthyHttpCodes: '200', interval: cdk.Duration.seconds(30) },
       deregistrationDelay: cdk.Duration.seconds(15),
     });
+
+    // When a cert ARN is supplied (--context hermes-cert-arn=...), serve HTTPS on 443 and
+    // redirect 80→443 (Slack Events API requires HTTPS). Otherwise plain HTTP on 80.
+    const certArn = this.node.tryGetContext('hermes-cert-arn') as string | undefined;
+    if (certArn) {
+      alb.addListener('HttpsListener', {
+        port: 443,
+        certificates: [elbv2.ListenerCertificate.fromArn(certArn)],
+        defaultTargetGroups: [controlPlaneTg],
+      });
+      alb.addListener('HttpRedirect', {
+        port: 80,
+        defaultAction: elbv2.ListenerAction.redirect({ protocol: 'HTTPS', port: '443', permanent: true }),
+      });
+    } else {
+      alb.addListener('HttpListener', { port: 80, defaultTargetGroups: [controlPlaneTg] });
+    }
 
     jobsTable.grantReadWriteData(cpTaskDef.taskRole);
     jobsQueue.grantSendMessages(cpTaskDef.taskRole);
