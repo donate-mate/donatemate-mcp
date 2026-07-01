@@ -1,50 +1,27 @@
 /**
- * Coding engine: runs Claude Code headless inside the cloned repo. We shell out to the
- * `claude` CLI (installed in the worker image). The DonateMate MCP (dm_jira_*, dm_confluence_*,
- * dm_figma_*, dm_knowledge_*, …) is attached so the agent can read/write Jira and leverage the
- * rest of the platform's tools. Budget guardrails (max iterations, hard timeout) enforced here.
+ * Coding engine: runs OpenAI Codex headless inside the cloned repo. We shell out to the `codex`
+ * CLI (installed in the worker image) in non-interactive `codex exec` mode. The container is the
+ * sandbox (ephemeral, isolated), so Codex runs with --dangerously-bypass-approvals-and-sandbox.
+ * The model is pinned via AGENT_MODEL (default gpt-5.5). Hard timeout is the budget guardrail.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { writeFile, rm, mkdtemp } from 'node:fs/promises';
+import { rm, mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getSecretString, getSecretJson } from './secrets.js';
+import { getSecretJson } from './secrets.js';
 
 const pexec = promisify(execFile);
 
-const SECRET_ANTHROPIC = process.env.SECRET_ANTHROPIC!;
-const SECRET_DM_MCP = process.env.SECRET_DM_MCP;
-const MCP_ENDPOINT = process.env.MCP_ENDPOINT || 'https://mcp.donate-mate.com/mcp';
-// Turns must cover EXPLORE (grep/read/MCP, one turn each) + EDIT. 40 starved exploration on a
-// large RN/Expo repo and the agent never reached the edit phase. The token budget and the hard
-// timeout are the real guardrails; keep turns high enough that they bind first.
-const MAX_ITERATIONS = Number(process.env.MAX_AGENT_ITERATIONS ?? 200);
+const SECRET_OPENAI = process.env.SECRET_OPENAI!;
+const AGENT_MODEL = process.env.AGENT_MODEL || 'gpt-5.5';
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_SECONDS ?? 2400) * 1000;
 
 export interface AgentResult {
   transcript: string;
   exitCode: number;
-  /** Concise outcome for surfacing in Slack/Jira (e.g. "hit the 200-turn limit"). */
+  /** The agent's final message — surfaced in Slack/Jira and used to explain a no-change run. */
   reason?: string;
-}
-
-// Parse `claude --output-format json` result envelope into a human-readable reason.
-function summarize(stdout: string): { reason?: string; numTurns?: number } {
-  try {
-    const j = JSON.parse(stdout) as {
-      subtype?: string;
-      is_error?: boolean;
-      num_turns?: number;
-      result?: string;
-    };
-    const numTurns = j.num_turns;
-    if (j.subtype === 'error_max_turns') return { reason: `hit the ${MAX_ITERATIONS}-turn limit before finishing`, numTurns };
-    if (j.is_error) return { reason: (j.result || j.subtype || 'agent reported an error').slice(0, 300), numTurns };
-    return { reason: j.result ? j.result.slice(0, 300) : undefined, numTurns };
-  } catch {
-    return {};
-  }
 }
 
 // Prepended to every task. The harness owns git: the agent edits files only, so change-detection
@@ -61,75 +38,64 @@ Git is handled FOR you — do NOT manage it yourself:
 `;
 
 export async function runAgent(dir: string, taskPrompt: string): Promise<AgentResult> {
-  const apiKey = await getSecretString(SECRET_ANTHROPIC);
-  if (!apiKey) throw new Error('Anthropic API key not configured in Secrets Manager');
+  const { apiKey } = await getSecretJson(SECRET_OPENAI);
+  if (!apiKey) throw new Error('OpenAI API key not configured in Secrets Manager');
   const prompt = HARNESS_PREAMBLE + taskPrompt;
 
-  // JSON output so we always capture the outcome (num_turns, error subtype, final result) even
-  // when the run errors — text output yields nothing on a max-turns exit.
+  // Capture the agent's final message in a file OUTSIDE the clone so it can't pollute the diff.
+  // CODEX_HOME is left at its default (~/.codex under HOME) — Codex refuses to create its helper
+  // binaries when CODEX_HOME is under /tmp, and each Fargate task processes one job at a time.
+  const outDir = await mkdtemp(join(tmpdir(), 'hermes-codex-'));
+  const lastMsgFile = join(outDir, 'last.txt');
+
   const args = [
-    '-p',
+    'exec',
+    '--model',
+    AGENT_MODEL,
+    '--dangerously-bypass-approvals-and-sandbox', // the Fargate container is the sandbox
+    '--ephemeral', // don't persist session files
+    '--skip-git-repo-check',
+    '-C',
+    dir,
+    '-o',
+    lastMsgFile,
     prompt,
-    '--output-format',
-    'json',
-    '--dangerously-skip-permissions',
-    '--max-turns',
-    String(MAX_ITERATIONS),
   ];
 
-  // Attach the DonateMate MCP. The config (with the API key) is written OUTSIDE the repo clone
-  // so the credential can never be committed by the agent.
-  let mcpDir: string | null = null;
-  try {
-    if (SECRET_DM_MCP) {
-      const { apiKey: dmKey } = await getSecretJson(SECRET_DM_MCP);
-      if (dmKey) {
-        mcpDir = await mkdtemp(join(tmpdir(), 'hermes-mcp-'));
-        const cfgPath = join(mcpDir, 'mcp.json');
-        await writeFile(
-          cfgPath,
-          JSON.stringify({
-            mcpServers: {
-              donatemate: { type: 'http', url: MCP_ENDPOINT, headers: { Authorization: `Bearer ${dmKey}` } },
-            },
-          })
-        );
-        args.push(
-          '--mcp-config',
-          cfgPath,
-          '--strict-mcp-config',
-          // prevent the agent from recursively dispatching Hermes jobs
-          '--disallowedTools',
-          'mcp__donatemate__dm_hermes_create_pr',
-          'mcp__donatemate__dm_hermes_job_status'
-        );
-      }
-    }
-
+  const readReason = async (): Promise<string | undefined> => {
     try {
-      const { stdout, stderr } = await pexec('claude', args, {
+      const t = (await readFile(lastMsgFile, 'utf8')).trim();
+      return t ? t.slice(0, 500) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  try {
+    try {
+      const { stdout, stderr } = await pexec('codex', args, {
         cwd: dir,
         timeout: JOB_TIMEOUT_MS,
         maxBuffer: 32 * 1024 * 1024,
-        env: { ...process.env, ANTHROPIC_API_KEY: apiKey },
+        env: { ...process.env, OPENAI_API_KEY: apiKey },
       });
-      const { reason, numTurns } = summarize(stdout || '');
-      console.log(`[agent] completed in ${numTurns ?? '?'} turns`);
+      const reason = await readReason();
+      console.log('[agent] codex run completed');
       return { transcript: `${stdout || ''}\n${stderr || ''}`.trim(), exitCode: 0, reason };
     } catch (err) {
       const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
       if (e.code === 'ETIMEDOUT') throw new Error(`Agent timed out after ${JOB_TIMEOUT_MS / 1000}s`);
-      // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides
-      // based on whether the working tree changed.
-      const { reason, numTurns } = summarize(e.stdout || '');
-      console.log(`[agent] non-zero exit after ${numTurns ?? '?'} turns: ${reason ?? e.stderr ?? ''}`);
+      // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides based
+      // on whether the working tree changed.
+      const reason = (await readReason()) ?? ((e.stderr || '').trim().slice(0, 500) || undefined);
+      console.log(`[agent] codex non-zero exit: ${reason ?? ''}`);
       return {
         transcript: `${e.stdout || ''}\n${e.stderr || ''}`.trim(),
         exitCode: typeof e.code === 'number' ? e.code : 1,
-        reason: reason ?? ((e.stderr || '').trim().slice(0, 300) || undefined),
+        reason,
       };
     }
   } finally {
-    if (mcpDir) await rm(mcpDir, { recursive: true, force: true });
+    await rm(outDir, { recursive: true, force: true });
   }
 }

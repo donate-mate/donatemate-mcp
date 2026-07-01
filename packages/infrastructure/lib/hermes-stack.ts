@@ -97,6 +97,8 @@ export class HermesStack extends cdk.Stack {
     const secSlack = secretsmanager.Secret.fromSecretNameV2(this, 'SecSlack', `donatemate/${environment}/hermes/slack`);
     const secJiraHook = secretsmanager.Secret.fromSecretNameV2(this, 'SecJiraHook', `donatemate/${environment}/hermes/jira-webhook`);
     const secAnthropic = secretsmanager.Secret.fromSecretNameV2(this, 'SecAnthropic', `donatemate/${environment}/anthropic-api-key`);
+    // OpenAI API key — coding engine (Codex CLI) + planning/chat layer.
+    const secOpenai = secretsmanager.Secret.fromSecretNameV2(this, 'SecOpenai', `donatemate/${environment}/hermes/openai`);
     const secJira = secretsmanager.Secret.fromSecretNameV2(this, 'SecJira', `/donatemate/${environment}/knowledge/jira`);
     // Dedicated hermes@ Atlassian account — write-backs (comments + transitions) post as Hermes.
     const secJiraBot = secretsmanager.Secret.fromSecretNameV2(this, 'SecJiraBot', `donatemate/${environment}/hermes/jira-bot`);
@@ -140,7 +142,9 @@ export class HermesStack extends cdk.Stack {
         SECRET_SLACK: secSlack.secretName,
         SECRET_JIRA_WEBHOOK: secJiraHook.secretName,
         SECRET_GITHUB_APP: secGithub.secretName,
-        SECRET_ANTHROPIC: secAnthropic.secretName, // conversational layer (Slack chat + /start)
+        SECRET_ANTHROPIC: secAnthropic.secretName, // (legacy) Anthropic key, no longer used
+        SECRET_OPENAI: secOpenai.secretName, // conversational/planning layer (OpenAI)
+        CONVERSE_MODEL: 'gpt-5.3-chat-latest', // planning + chat model (pinned)
         SECRET_JIRA: secJira.secretName, // read referenced Jira issues during conversation
         SECRET_JIRA_BOT: secJiraBot.secretName, // write-backs (plan/progress comments + transitions) as Hermes
         MCP_ENDPOINT: props.mcpEndpoint ?? 'https://mcp.donate-mate.com/mcp',
@@ -199,6 +203,7 @@ export class HermesStack extends cdk.Stack {
     secJiraHook.grantRead(cpTaskDef.taskRole);
     secGithub.grantRead(cpTaskDef.taskRole);
     secAnthropic.grantRead(cpTaskDef.taskRole);
+    secOpenai.grantRead(cpTaskDef.taskRole);
     secJira.grantRead(cpTaskDef.taskRole);
     secJiraBot.grantRead(cpTaskDef.taskRole);
 
@@ -227,16 +232,14 @@ export class HermesStack extends cdk.Stack {
         JOBS_QUEUE_URL: jobsQueue.queueUrl,
         ARTIFACTS_BUCKET: artifacts.bucketName,
         SECRET_GITHUB_APP: secGithub.secretName,
-        SECRET_ANTHROPIC: secAnthropic.secretName,
+        SECRET_OPENAI: secOpenai.secretName, // coding engine (Codex CLI) auth
+        AGENT_MODEL: 'gpt-5.5', // coding model (pinned)
         SECRET_JIRA: secJira.secretName,
         SECRET_JIRA_BOT: secJiraBot.secretName, // progress comments + column moves as Hermes
         SECRET_SLACK: secSlack.secretName, // worker posts PR links back to the Slack thread
         SECRET_DM_MCP: secDmMcp.secretName, // DonateMate MCP API key for the agent
         MCP_ENDPOINT: 'https://mcp.donate-mate.com/mcp',
-        // budget guardrails: token budget + hard timeout bind first; turns must be high enough
-        // to cover explore (grep/read/MCP) + edit on a large repo (40 starved exploration).
-        MAX_AGENT_TOKENS: '400000',
-        MAX_AGENT_ITERATIONS: '200',
+        // Hard timeout is the budget guardrail for the Codex run.
         JOB_TIMEOUT_SECONDS: '2400',
       },
     });
@@ -254,7 +257,7 @@ export class HermesStack extends cdk.Stack {
     jobsQueue.grantConsumeMessages(workerTaskDef.taskRole);
     artifacts.grantReadWrite(workerTaskDef.taskRole);
     secGithub.grantRead(workerTaskDef.taskRole);
-    secAnthropic.grantRead(workerTaskDef.taskRole);
+    secOpenai.grantRead(workerTaskDef.taskRole);
     secJira.grantRead(workerTaskDef.taskRole);
     secJiraBot.grantRead(workerTaskDef.taskRole);
     secSlack.grantRead(workerTaskDef.taskRole);

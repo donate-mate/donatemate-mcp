@@ -12,8 +12,8 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --no-audit --no-fund --omit=dev
 
-# Claude Code CLI (the coding engine; invoked headless as `claude -p`).
-RUN npm install -g @anthropic-ai/claude-code
+# OpenAI Codex CLI (the coding engine; invoked headless as `codex exec`).
+RUN npm install -g @openai/codex
 
 COPY tsconfig.json ./
 COPY src ./src
