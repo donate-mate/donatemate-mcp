@@ -4,24 +4,58 @@
  * sandbox (ephemeral, isolated), so Codex runs with --dangerously-bypass-approvals-and-sandbox.
  * The model is pinned via AGENT_MODEL (default gpt-5.5). Hard timeout is the budget guardrail.
  */
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import { rm, mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getSecretJson } from './secrets.js';
 
-const pexec = promisify(execFile);
-
 const SECRET_OPENAI = process.env.SECRET_OPENAI!;
 const AGENT_MODEL = process.env.AGENT_MODEL || 'gpt-5.5';
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_SECONDS ?? 2400) * 1000;
+const OUTPUT_CAP = 16 * 1024 * 1024;
 
 export interface AgentResult {
   transcript: string;
   exitCode: number;
   /** The agent's final message — surfaced in Slack/Jira and used to explain a no-change run. */
   reason?: string;
+}
+
+interface RunResult {
+  stdout: string;
+  stderr: string;
+  code: number;
+  timedOut: boolean;
+}
+
+// Run codex with stdin set to /dev/null. `codex exec` treats a piped/open stdin as appended
+// input and blocks waiting for EOF — under execFile that pipe never closes, hanging the job.
+function runCodex(args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('codex', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, JOB_TIMEOUT_MS);
+    child.stdout.on('data', (d) => {
+      if (stdout.length < OUTPUT_CAP) stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      if (stderr.length < OUTPUT_CAP) stderr += d.toString();
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ stdout, stderr, code: code ?? 0, timedOut });
+    });
+  });
 }
 
 // Prepended to every task. The harness owns git: the agent edits files only, so change-detection
@@ -72,29 +106,16 @@ export async function runAgent(dir: string, taskPrompt: string): Promise<AgentRe
   };
 
   try {
-    try {
-      const { stdout, stderr } = await pexec('codex', args, {
-        cwd: dir,
-        timeout: JOB_TIMEOUT_MS,
-        maxBuffer: 32 * 1024 * 1024,
-        env: { ...process.env, OPENAI_API_KEY: apiKey },
-      });
-      const reason = await readReason();
-      console.log('[agent] codex run completed');
-      return { transcript: `${stdout || ''}\n${stderr || ''}`.trim(), exitCode: 0, reason };
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
-      if (e.code === 'ETIMEDOUT') throw new Error(`Agent timed out after ${JOB_TIMEOUT_MS / 1000}s`);
-      // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides based
-      // on whether the working tree changed.
-      const reason = (await readReason()) ?? ((e.stderr || '').trim().slice(0, 500) || undefined);
-      console.log(`[agent] codex non-zero exit: ${reason ?? ''}`);
-      return {
-        transcript: `${e.stdout || ''}\n${e.stderr || ''}`.trim(),
-        exitCode: typeof e.code === 'number' ? e.code : 1,
-        reason,
-      };
-    }
+    const { stdout, stderr, code, timedOut } = await runCodex(args, dir, {
+      ...process.env,
+      OPENAI_API_KEY: apiKey,
+    });
+    if (timedOut) throw new Error(`Agent timed out after ${JOB_TIMEOUT_MS / 1000}s`);
+    // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides based
+    // on whether the working tree changed.
+    const reason = (await readReason()) ?? (stderr.trim().slice(0, 500) || undefined);
+    console.log(`[agent] codex exit ${code}`);
+    return { transcript: `${stdout}\n${stderr}`.trim(), exitCode: code, reason };
   } finally {
     await rm(outDir, { recursive: true, force: true });
   }
