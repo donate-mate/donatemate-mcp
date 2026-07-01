@@ -29,6 +29,25 @@ interface RunResult {
   timedOut: boolean;
 }
 
+// Authenticate the Codex CLI with the API key. `codex exec` reads auth from ~/.codex/auth.json,
+// NOT from OPENAI_API_KEY (that env alone yields 401 on the /responses endpoint); the key must be
+// written via `codex login --with-api-key` (reads the key from stdin).
+function codexLogin(apiKey: string, env: NodeJS.ProcessEnv): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('codex', ['login', '--with-api-key'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) =>
+      code === 0 ? resolve() : reject(new Error(`codex login failed (exit ${code}): ${stderr.slice(0, 200)}`))
+    );
+    child.stdin.write(apiKey);
+    child.stdin.end();
+  });
+}
+
 // Run codex with stdin set to /dev/null. `codex exec` treats a piped/open stdin as appended
 // input and blocks waiting for EOF — under execFile that pipe never closes, hanging the job.
 function runCodex(args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
@@ -106,10 +125,9 @@ export async function runAgent(dir: string, taskPrompt: string): Promise<AgentRe
   };
 
   try {
-    const { stdout, stderr, code, timedOut } = await runCodex(args, dir, {
-      ...process.env,
-      OPENAI_API_KEY: apiKey,
-    });
+    const env = { ...process.env, OPENAI_API_KEY: apiKey };
+    await codexLogin(apiKey, env); // write ~/.codex/auth.json so `codex exec` can authenticate
+    const { stdout, stderr, code, timedOut } = await runCodex(args, dir, env);
     if (timedOut) throw new Error(`Agent timed out after ${JOB_TIMEOUT_MS / 1000}s`);
     // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides based
     // on whether the working tree changed.
