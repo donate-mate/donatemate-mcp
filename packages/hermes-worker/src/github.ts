@@ -218,11 +218,25 @@ export async function commitAndPush(dir: string, branch: string, message: string
     () => true
   );
   if (staged) await exec('git', ['-C', dir, 'commit', '-m', message]);
-  const repo = await refreshOriginToken(dir);
+
+  // Push with retry: a freshly-minted scoped installation token can transiently 404
+  // ("Repository not found") from GitHub propagation lag — the clone path already retries this,
+  // but push did not, so a one-off blip failed the whole job. Re-mint the token each attempt.
+  let repo = await refreshOriginToken(dir);
   try {
-    await exec('git', ['-C', dir, 'push', 'origin', branch]);
-  } catch (err) {
-    throw sanitizeGitAuthError(err);
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        await exec('git', ['-C', dir, 'push', 'origin', branch]);
+        break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const transient = /not found|could not resolve|timed out|connection|tls|ssl|remote end hung up|rpc failed/i.test(msg);
+        if (!transient || attempt === 4) throw sanitizeGitAuthError(err);
+        console.warn(`[push] attempt ${attempt} failed (${msg.split('\n')[0]}); retrying…`);
+        await new Promise((r) => setTimeout(r, 1500 * attempt));
+        repo = await refreshOriginToken(dir); // fresh token for the retry
+      }
+    }
   } finally {
     await exec('git', ['-C', dir, 'remote', 'set-url', 'origin', `https://github.com/${repo}.git`]).catch(() => {});
   }
