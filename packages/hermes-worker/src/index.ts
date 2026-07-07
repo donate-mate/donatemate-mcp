@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   getInstallationAuth,
+  commentOnPullRequest,
   cloneRepo,
   createBranch,
   getHeadSha,
@@ -198,8 +199,9 @@ async function completeFollowupJob(input: {
   dir: string;
   transcript: string;
   message: string;
+  octokit: Awaited<ReturnType<typeof getInstallationAuth>>['octokit'];
 }): Promise<void> {
-  const { jobId, job, ticket, branch, dir, transcript, message } = input;
+  const { jobId, job, ticket, branch, dir, transcript, message, octokit } = input;
   if (!job) throw new Error('job missing during follow-up completion');
   if (!job.prNumber || !job.prUrl) throw new Error('follow-up job missing prNumber/prUrl');
 
@@ -215,6 +217,21 @@ async function completeFollowupJob(input: {
   await updateJob(jobId, 'done', { prUrl: job.prUrl, transcriptUri, headSha });
   await markPrWatchWaiting(job.repo, job.prNumber, headSha);
   await notify(job, `:white_check_mark: ${message} Waiting for CI.`);
+
+  // Respond on the PR itself with what was fixed (mirrors the Jira/Slack write-back).
+  await commentOnPullRequest(
+    octokit,
+    job.repo,
+    job.prNumber,
+    [
+      `🤖 **Hermes** pushed a fix to this PR.`,
+      '',
+      job.feedbackSummary ? `**Addressed:**\n${job.feedbackSummary}` : 'Addressed the latest CI / review feedback.',
+      '',
+      `Commit \`${headSha.slice(0, 7)}\` — re-running CI. _Automated fix; please re-review._`,
+    ].join('\n')
+  );
+
   if (ticket) {
     await commentOnIssue(
       ticket,
@@ -333,6 +350,7 @@ async function processJob(jobId: string): Promise<void> {
           branch,
           dir,
           transcript,
+          octokit,
           message:
             mergePrep.status === 'merged_cleanly'
               ? `Hermes reconciled the PR branch with \`${job.baseBranch}\` without manual conflict edits.`

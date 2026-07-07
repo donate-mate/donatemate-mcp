@@ -252,6 +252,20 @@ export async function openPullRequest(
   }
 }
 
+/**
+ * Post a comment on a pull request (PR comments are issue comments) so the fix Hermes just
+ * pushed is visible on the PR itself, not only in Jira/Slack. Best-effort — never throws into
+ * the job pipeline.
+ */
+export async function commentOnPullRequest(octokit: Octokit, repo: string, prNumber: number, body: string): Promise<void> {
+  const { owner, name } = splitRepo(repo);
+  try {
+    await octokit.issues.createComment({ owner, repo: name, issue_number: prNumber, body });
+  } catch (err) {
+    console.warn(`[github] failed to comment on ${repo}#${prNumber}:`, err instanceof Error ? err.message : String(err));
+  }
+}
+
 async function ensureRepositoryLabel(octokit: Octokit, repo: string, label: string): Promise<void> {
   const { owner, name } = splitRepo(repo);
   const params = { owner, repo: name, name: label };
