@@ -3913,11 +3913,26 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
       // Check if client wants SSE (Accept: text/event-stream)
       const acceptHeader = event.headers['accept'] || '';
       if (acceptHeader.includes('text/event-stream')) {
-        // Return 405 - we don't support SSE for server-initiated messages
+        // Streamable HTTP listening channel. This server is stateless and serverless — API
+        // Gateway + buffered Lambda cannot hold a long-lived stream — so we open a VALID but
+        // immediately-completing event stream instead of returning 405. That matters: a 405 on
+        // the GET channel makes MCP connectors (claude.ai, mcporter, Claude Code) treat the
+        // connection as failed and flap (disconnect/reconnect loop). Returning 200 text/event-
+        // stream lets the listening channel connect cleanly; since we have no server-initiated
+        // messages, it carries only a keepalive comment and closes, and the client reconnects on
+        // its normal SSE cadence. Echo any session id the client supplied.
+        const sseHeaders: Record<string, string> = {
+          ...baseHeaders,
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+        };
+        const sid = event.headers['mcp-session-id'] || event.headers['Mcp-Session-Id'];
+        if (sid) sseHeaders['Mcp-Session-Id'] = sid;
         return {
-          statusCode: 405,
-          headers: { ...baseHeaders, 'Content-Type': 'application/json', 'Allow': 'POST, OPTIONS' },
-          body: JSON.stringify({ error: 'Method Not Allowed', message: 'SSE not supported. Use POST for requests.' }),
+          statusCode: 200,
+          headers: sseHeaders,
+          body: ': mcp stream open\n\n',
         };
       }
       // Browser/info request - return server info (not part of MCP protocol, but helpful)
