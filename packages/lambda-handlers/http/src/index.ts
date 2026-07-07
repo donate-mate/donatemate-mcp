@@ -24,6 +24,7 @@ import {
   UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import Anthropic from '@anthropic-ai/sdk';
@@ -1385,7 +1386,7 @@ const TOOL_TIMEOUTS: Record<string, number> = {
   // Operations that may scan more nodes
   dm_figma_get_all_nodes: 20000,
   dm_figma_get_file_context: 20000,
-  dm_figma_validate_design: 25000,
+  dm_figma_validate_design: 28000,
   dm_figma_query: 20000, // Queries may traverse document
   // Mutating operations (may need more time for Figma to process)
   dm_figma_create_frame: 15000,
@@ -1396,7 +1397,7 @@ const TOOL_TIMEOUTS: Record<string, number> = {
   dm_figma_clone_node: 20000,
   dm_figma_move_node: 20000,
   dm_figma_export_node: 30000, // Exports may be slow
-  dm_figma_review: 30000, // Exports + metadata
+  dm_figma_review: 28000, // under API Gateway 30s ceiling; large responses offloaded to S3 by the relay
   dm_figma_execute: 45000, // Arbitrary code may take time
   // File management (may need to wait for Figma to open)
   dm_figma_open_file: 45000, // Opening files can take time
@@ -1406,6 +1407,21 @@ const TOOL_TIMEOUTS: Record<string, number> = {
 
 const DEFAULT_RELAY_TIMEOUT = 25000; // 25 seconds default (was 30)
 const POLL_INTERVAL_MS = 300; // Poll every 300ms (was 500ms)
+
+// Large plugin responses (e.g. dm_figma_review's exported image) exceed the API Gateway
+// WebSocket 128KB frame limit, so they can't be sent back inline. The relay uploads oversized
+// responses to S3 (via the VM instance role) and returns a small pointer { __s3Key }; we fetch
+// the full payload from S3 here.
+const FIGMA_RESPONSE_BUCKET = process.env.FIGMA_RESPONSE_BUCKET || 'donatemate-staging-figma-responses';
+const s3Client = new S3Client({});
+
+async function resolveRelayResult(result: unknown): Promise<unknown> {
+  const key = (result as { __s3Key?: string })?.__s3Key;
+  if (!key) return result;
+  const obj = await s3Client.send(new GetObjectCommand({ Bucket: FIGMA_RESPONSE_BUCKET, Key: key }));
+  const body = await obj.Body!.transformToString();
+  return JSON.parse(body);
+}
 
 async function sendToRelayAndWait(
   tool: string,
@@ -1459,6 +1475,10 @@ async function sendToRelayAndWait(
             tool,
             args,
             httpRequest: true, // Flag so relay knows to store response
+            // Where the relay should upload an oversized (>~96KB) response instead of sending
+            // it inline over the size-limited WebSocket frame.
+            s3Bucket: FIGMA_RESPONSE_BUCKET,
+            s3Key: `figma-resp/${requestId}.json`,
           })
         ),
       })
@@ -1504,7 +1524,7 @@ async function sendToRelayAndWait(
 
       const responseData = result.Item.response?.S;
       if (responseData) {
-        return JSON.parse(responseData);
+        return await resolveRelayResult(JSON.parse(responseData));
       }
       throw new Error('Empty response from relay');
     }
