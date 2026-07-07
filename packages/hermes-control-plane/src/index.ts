@@ -14,11 +14,14 @@ import { verifySlackSignature, postSlackMessage, stripMention } from './slack.js
 import { getSecretJson } from './secrets.js';
 import { converse, conversationToTask, planIssue } from './converse.js';
 import { appendMessage, getConversation, resetConversation, setActivePointer, getActivePointer } from './convo.js';
-import { findIssueKey, fetchIssueContext, fetchIssue } from './jira.js';
-import { getFlow, setFlow } from './jiraflow.js';
+import { findIssueKey, fetchIssueContext, fetchIssue, type JiraIssue } from './jira.js';
+import { getFlow, setFlow, type JiraFlow } from './jiraflow.js';
 import { commentOnIssue, transitionIssue, getBotAccountId, COLUMN } from './jiraBot.js';
+import { handleGitHubWebhook, reconcileOpenPrs } from './prMonitor.js';
+import { captureQaScenarioForDone } from './qaCapture.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
+const PR_RECONCILE_SECONDS = Number(process.env.PR_RECONCILE_SECONDS ?? 300);
 
 // Default repo per worker type. FE = the Expo app; BE = the lambdas monorepo.
 const REPO_BY_TYPE: Record<WorkerType, string> = {
@@ -27,12 +30,24 @@ const REPO_BY_TYPE: Record<WorkerType, string> = {
   qa: 'donate-mate/donatemate-app',
 };
 
+function hasBackendTextSignal(text: string): boolean {
+  const t = (text || '').toLowerCase();
+  return (
+    /\bback[\s-]?end\b/.test(t) ||
+    /\bserver[\s-]?side\b/.test(t) ||
+    /\binfra(structure)?\b/.test(t) ||
+    /\b(api gateway|lambda|step function|cloudwatch|synthetics?|canary|alarm|datastore|dynamodb|sqs|sns|eventbridge|opensearch)\b/.test(t) ||
+    /\b(prod|production|staging)\b.{0,80}\b(alert|alarm|canary|incident|outage)\b/.test(t) ||
+    /\b(alert|alarm|canary|incident|outage)\b.{0,80}\b(prod|production|staging)\b/.test(t)
+  );
+}
+
 // Route a free-text Slack/Jira request to the right worker + repo. Backend signals
-// ("backend", "back-end", "server-side", or an explicit "be:" prefix) → the lambdas repo;
-// everything else defaults to the frontend app.
+// ("backend", "back-end", operational alarms/canaries, or an explicit "be:" prefix) →
+// the lambdas repo; everything else defaults to the frontend app.
 function routeIntent(text: string): { type: WorkerType; repo: string } {
   const t = (text || '').toLowerCase();
-  const backend = /\bback[\s-]?end\b/.test(t) || /\bserver[\s-]?side\b/.test(t) || t.trimStart().startsWith('be:');
+  const backend = t.trimStart().startsWith('be:') || hasBackendTextSignal(t);
   const type: WorkerType = backend ? 'be' : 'fe';
   return { type, repo: REPO_BY_TYPE[type] };
 }
@@ -40,16 +55,34 @@ function routeIntent(text: string): { type: WorkerType; repo: string } {
 // Route a Jira ticket to a repo using its structured signals (most reliable first): the
 // frontend/backend labels, then the FE:/BE:/Frontend:/Backend: summary prefix, then a text
 // fallback. `isDesign` flags Figma/design tickets that aren't coding tasks.
-function routeIntentFromJira(summary: string, labels: string[]): { type: WorkerType; repo: string; isDesign: boolean } {
-  const labelSet = new Set(labels.map((l) => l.toLowerCase()));
-  const s = (summary || '').toLowerCase();
+function routeIntentFromJira(issue: JiraIssue): { type: WorkerType; repo: string; isDesign: boolean } {
+  const labelSet = new Set(issue.labels.map((l) => l.toLowerCase()));
+  const s = (issue.summary || '').toLowerCase();
+  const parent = (issue.parentSummary || '').toLowerCase();
+  const allText = [issue.summary, issue.issueType, issue.parentSummary, issue.context, issue.labels.join(' ')].filter(Boolean).join('\n');
   const isDesign = labelSet.has('design') || /^\s*design\s*:/.test(s);
-  const backend =
+  const explicitFrontend = labelSet.has('frontend') || labelSet.has('fe') || /^\s*(fe|frontend)\s*:/.test(s);
+  const explicitBackend =
     labelSet.has('backend') ||
+    labelSet.has('be') ||
     /^\s*(be|backend)\s*:/.test(s) ||
-    (!labelSet.has('frontend') && routeIntent(summary).type === 'be');
+    /\bbackend\b/.test(parent);
+  const backend =
+    explicitBackend ||
+    (!explicitFrontend && (routeIntent(issue.summary).type === 'be' || hasBackendTextSignal(allText)));
   const type: WorkerType = backend ? 'be' : 'fe';
   return { type, repo: REPO_BY_TYPE[type], isDesign };
+}
+
+function refreshFlowRoute(flow: JiraFlow, issue: JiraIssue): JiraFlow {
+  const { type, repo } = routeIntentFromJira(issue);
+  if (flow.type === type && flow.repo === repo) return flow;
+  return {
+    ...flow,
+    type,
+    repo,
+    taskPrompt: flow.taskPrompt.replace(/donate-mate\/donatemate-app|donate-mate\/donatemate/g, repo),
+  };
 }
 
 const app = Fastify({ logger: true, bodyLimit: 5 * 1024 * 1024 });
@@ -225,8 +258,36 @@ app.post('/jira/webhook', async (req, reply) => {
       ? handleJiraConfirm(issueKey, body.author)
       : phase === 'comment'
         ? handleJiraComment(issueKey, body.text, body.author)
+        : phase === 'done'
+          ? handleJiraDone(issueKey, body.author)
         : handleJiraAssigned(issueKey);
   work.catch((err) => app.log.error({ err, issueKey, phase }, 'jira webhook handler failed'));
+});
+
+// ---------------------------------------------------------------------------
+// GitHub webhooks + manual reconciliation
+// ---------------------------------------------------------------------------
+app.post('/github/webhook', async (req, reply) => {
+  const raw = (req as FastifyRequest & { rawBody?: string }).rawBody ?? '';
+  try {
+    const result = await handleGitHubWebhook(raw, req.headers, (req.body ?? {}) as Record<string, unknown>, app.log);
+    return reply.send(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('signature')) return reply.code(401).send({ error: msg });
+    app.log.error({ err }, 'github webhook failed');
+    return reply.code(500).send({ error: 'github webhook failed' });
+  }
+});
+
+app.post('/github/reconcile', async (req, reply) => {
+  const { sharedSecret } = await getSecretJson(process.env.SECRET_JIRA_WEBHOOK!);
+  const provided = String(req.headers['x-hermes-secret'] ?? '');
+  if (!sharedSecret || provided !== sharedSecret) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
+  await reconcileOpenPrs(app.log);
+  return reply.send({ ok: true });
 });
 
 // Conversation thread key for a Jira ticket (mirrors Slack's convo store, channel "jira").
@@ -236,18 +297,24 @@ const JIRA_CHANNEL = 'jira';
 // run the agent yet. Idempotent: a re-assignment while running is a no-op.
 async function handleJiraAssigned(issueKey: string): Promise<void> {
   const existing = await getFlow(issueKey);
-  if (existing?.status === 'running') {
-    await commentOnIssue(issueKey, `🤖 I'm already working on this (job \`${existing.jobId}\`).`);
-    return;
-  }
-
   const issue = await fetchIssue(issueKey);
   if (!issue) {
     await commentOnIssue(issueKey, "⚠️ I couldn't read this ticket's details — check my Jira access.");
     return;
   }
 
-  const { type, repo, isDesign } = routeIntentFromJira(issue.summary, issue.labels);
+  const { type, repo, isDesign } = routeIntentFromJira(issue);
+  if (existing?.status === 'running' && existing.type === type && existing.repo === repo) {
+    await commentOnIssue(issueKey, `🤖 I'm already working on this (job \`${existing.jobId}\`).`);
+    return;
+  }
+  if (existing?.status === 'running') {
+    await commentOnIssue(
+      issueKey,
+      `⚠️ My existing flow was scoped to \`${existing.repo}\` (${existing.type.toUpperCase()}), but the current ticket routes to \`${repo}\` (${type.toUpperCase()}). I'll re-plan against the corrected repo.`
+    );
+  }
+
   if (isDesign) {
     await commentOnIssue(
       issueKey,
@@ -282,12 +349,19 @@ async function handleJiraComment(issueKey: string, text?: string, author?: strin
   const clean = (text ?? '').trim();
   if (!clean) return;
 
-  const flow = await getFlow(issueKey);
+  let flow = await getFlow(issueKey);
   if (!flow || flow.status !== 'awaiting_confirm') return; // only refine before the job is queued
 
   await appendMessage(JIRA_CHANNEL, issueKey, { role: 'user', content: clean });
   const history = await getConversation(JIRA_CHANNEL, issueKey);
   const issue = await fetchIssue(issueKey);
+  if (issue) {
+    const refreshed = refreshFlowRoute(flow, issue);
+    if (refreshed !== flow) {
+      flow = refreshed;
+      await setFlow(issueKey, flow);
+    }
+  }
   const reply = await converse(history, { jiraContext: issue?.context, startCommand: '/go' });
   await appendMessage(JIRA_CHANNEL, issueKey, { role: 'assistant', content: reply });
   await commentOnIssue(issueKey, reply);
@@ -306,7 +380,17 @@ async function handleJiraConfirm(issueKey: string, author?: string): Promise<voi
     await commentOnIssue(issueKey, 'ℹ️ Assign this ticket to me first, then reply `/go` to start.');
     return;
   }
+  const issue = await fetchIssue(issueKey);
+  const routedFlow = issue ? refreshFlowRoute(flow, issue) : flow;
   if (flow.status === 'running') {
+    if (routedFlow !== flow) {
+      await setFlow(issueKey, { ...routedFlow, status: 'awaiting_confirm', jobId: undefined });
+      await commentOnIssue(
+        issueKey,
+        `⚠️ My existing flow was scoped to \`${flow.repo}\` (${flow.type.toUpperCase()}), but this ticket now routes to \`${routedFlow.repo}\` (${routedFlow.type.toUpperCase()}). I updated the stored plan to the corrected repo. Reply \`/go\` again to start the backend-scoped job.`
+      );
+      return;
+    }
     await commentOnIssue(issueKey, `🤖 Already on it — job \`${flow.jobId}\`.`);
     return;
   }
@@ -315,9 +399,13 @@ async function handleJiraConfirm(issueKey: string, author?: string): Promise<voi
     return;
   }
 
+  if (routedFlow !== flow) {
+    await setFlow(issueKey, routedFlow);
+  }
+
   // If the plan was refined via comments, condense the whole conversation into the task so the
   // clarifications are baked in; otherwise fall back to the original plan-derived prompt.
-  let prompt = flow.taskPrompt;
+  let prompt = routedFlow.taskPrompt;
   const msgs = await getConversation(JIRA_CHANNEL, issueKey);
   if (msgs.length > 2) {
     const transcript = msgs.map((m) => `${m.role === 'assistant' ? 'Hermes' : 'User'}: ${m.content}`).join('\n');
@@ -325,17 +413,32 @@ async function handleJiraConfirm(issueKey: string, author?: string): Promise<voi
   }
 
   const job = await createJob({
-    type: flow.type,
-    repo: flow.repo,
+    type: routedFlow.type,
+    repo: routedFlow.repo,
     prompt,
     source: `jira:${issueKey}`,
   });
-  await setFlow(issueKey, { ...flow, status: 'running', jobId: job.jobId });
+  await setFlow(issueKey, { ...routedFlow, status: 'running', jobId: job.jobId });
   await transitionIssue(issueKey, COLUMN.inProgress);
   await commentOnIssue(
     issueKey,
-    `🛠️ Starting implementation — job \`${job.jobId}\` against \`${flow.repo}\`. I'll comment with the PR when it's ready.`
+    `🛠️ Starting implementation — job \`${job.jobId}\` against \`${routedFlow.repo}\`. I'll comment with the PR when it's ready.`
   );
+}
+
+async function handleJiraDone(issueKey: string, _author?: string): Promise<void> {
+  // Unlike comment/confirm hooks, Done scenario capture must run even when Hermes moved the
+  // issue to Done after a passing QA proof.
+  const issue = await fetchIssue(issueKey);
+  if (!issue) {
+    await commentOnIssue(issueKey, "⚠️ I couldn't read this ticket to complete QA scenario capture.");
+    return;
+  }
+  const result = await captureQaScenarioForDone(issueKey, issue);
+  await commentOnIssue(issueKey, result.message);
+  if (result.status === 'needs_human') {
+    await transitionIssue(issueKey, COLUMN.blocked);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +470,12 @@ app.get('/jobs/:id', async (req, reply) => {
   if (!job) return reply.code(404).send({ error: 'not found' });
   return reply.send(job);
 });
+
+if (PR_RECONCILE_SECONDS > 0) {
+  const run = () => reconcileOpenPrs(app.log).catch((err) => app.log.error({ err }, 'periodic PR reconciliation failed'));
+  setInterval(run, PR_RECONCILE_SECONDS * 1000).unref();
+  setTimeout(run, 30_000).unref();
+}
 
 app
   .listen({ port: PORT, host: '0.0.0.0' })

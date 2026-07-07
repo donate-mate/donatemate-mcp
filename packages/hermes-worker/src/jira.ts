@@ -29,12 +29,15 @@ export async function fetchIssueContext(issueKey: string): Promise<string | null
     if (!host || !email || !token) return null;
     const auth = Buffer.from(`${email}:${token}`).toString('base64');
     const res = await fetch(
-      `${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=summary,description,status,issuetype,labels,comment`,
+      `${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=summary,description,status,issuetype,labels,parent,comment`,
       { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } }
     );
     if (!res.ok) return null;
     const d = (await res.json()) as any;
     const f = d.fields || {};
+    const parentKey = f.parent?.key as string | undefined;
+    const parentSummary = f.parent?.fields?.summary as string | undefined;
+    const parentType = f.parent?.fields?.issuetype?.name as string | undefined;
     const desc = f.description ? adfText(f.description).trim() : '';
     const comments = (f.comment?.comments || [])
       .slice(-5)
@@ -43,6 +46,9 @@ export async function fetchIssueContext(issueKey: string): Promise<string | null
     return [
       `Jira ${issueKey}: ${f.summary ?? ''}`,
       `Type: ${f.issuetype?.name ?? '?'} | Status: ${f.status?.name ?? '?'}${f.labels?.length ? ` | Labels: ${f.labels.join(', ')}` : ''}`,
+      ...(parentKey || parentSummary
+        ? [`Parent: ${parentKey ?? '?'}${parentSummary ? ` ${parentSummary}` : ''}${parentType ? ` (${parentType})` : ''}`]
+        : []),
       '',
       'Description:',
       desc || '(none)',

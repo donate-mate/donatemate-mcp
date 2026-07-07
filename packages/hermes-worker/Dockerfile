@@ -1,10 +1,10 @@
-# Hermes FE Worker — runs Claude Code headless to open PRs.
+# Hermes FE Worker — runs Codex headless to open PRs.
 # Build context = this package dir.
 FROM node:22-slim
 
-# git for clone/commit/push; ca-certificates for HTTPS to GitHub/Anthropic.
+# git for clone/commit/push; awscli for backend alarm/log investigations; ca-certificates for HTTPS.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ca-certificates \
+  && apt-get install -y --no-install-recommends git awscli ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -18,9 +18,8 @@ RUN npm install -g @openai/codex
 COPY tsconfig.json ./
 COPY src ./src
 
-# Claude Code refuses --dangerously-skip-permissions as root. Run as the non-root `node`
-# user (ships with the node image). /tmp (clone workspace) and /home/node (CLI config) are
-# writable by this user.
+# Run as the non-root `node` user. /tmp (clone workspace) and /home/node (CLI config)
+# are writable by this user.
 RUN chown -R node:node /app
 USER node
 ENV HOME=/home/node

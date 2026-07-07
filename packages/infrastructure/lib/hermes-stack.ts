@@ -30,6 +30,11 @@ import { Construct } from 'constructs';
 
 export type Environment = 'staging' | 'production';
 
+const HERMES_CERTIFICATE_ARNS: Record<Environment, string> = {
+  staging: 'arn:aws:acm:us-east-2:690788838096:certificate/8767f3d6-c259-4488-8943-a0c3870b5359',
+  production: 'arn:aws:acm:us-east-2:690788838096:certificate/8767f3d6-c259-4488-8943-a0c3870b5359',
+};
+
 export interface HermesStackProps extends cdk.StackProps {
   environment: Environment;
   mcpEndpoint?: string;
@@ -75,7 +80,7 @@ export class HermesStack extends cdk.Stack {
     });
     const jobsQueue = new sqs.Queue(this, 'HermesJobsQueue', {
       queueName: `donatemate-${environment}-hermes-jobs`,
-      visibilityTimeout: cdk.Duration.hours(1), // coding jobs can run long
+      visibilityTimeout: cdk.Duration.hours(6), // coding + post-merge mobile QA jobs can run long
       enforceSSL: true,
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
     });
@@ -148,6 +153,10 @@ export class HermesStack extends cdk.Stack {
         SECRET_JIRA: secJira.secretName, // read referenced Jira issues during conversation
         SECRET_JIRA_BOT: secJiraBot.secretName, // write-backs (plan/progress comments + transitions) as Hermes
         MCP_ENDPOINT: props.mcpEndpoint ?? 'https://mcp.donate-mate.com/mcp',
+        PR_RECONCILE_SECONDS: '300',
+        QA_BUILD_WORKFLOW_ID: 'staging.yml',
+        QA_AUTOMATION_ENABLED: 'false',
+        BE_DEPLOY_WORKFLOW_ID: '208630294', // donate-mate/donatemate "Deploy to Staging"
       },
     });
 
@@ -178,9 +187,9 @@ export class HermesStack extends cdk.Stack {
       deregistrationDelay: cdk.Duration.seconds(15),
     });
 
-    // When a cert ARN is supplied (--context hermes-cert-arn=...), serve HTTPS on 443 and
-    // redirect 80→443 (Slack Events API requires HTTPS). Otherwise plain HTTP on 80.
-    const certArn = this.node.tryGetContext('hermes-cert-arn') as string | undefined;
+    // Serve HTTPS on 443 and redirect 80→443. The context override is kept for cert rotation,
+    // but staging/production default to the issued hermes.donate-mate.com certificate.
+    const certArn = (this.node.tryGetContext('hermes-cert-arn') as string | undefined) ?? HERMES_CERTIFICATE_ARNS[environment];
     if (certArn) {
       alb.addListener('HttpsListener', {
         port: 443,
@@ -227,6 +236,8 @@ export class HermesStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'fe-worker', logGroup: workerLogs }),
       environment: {
         ENVIRONMENT: environment,
+        AWS_REGION: this.region,
+        AWS_DEFAULT_REGION: this.region,
         WORKER_TYPE: 'fe',
         JOBS_TABLE: jobsTable.tableName,
         JOBS_QUEUE_URL: jobsQueue.queueUrl,
@@ -241,6 +252,29 @@ export class HermesStack extends cdk.Stack {
         MCP_ENDPOINT: 'https://mcp.donate-mate.com/mcp',
         // Hard timeout is the budget guardrail for the Codex run.
         JOB_TIMEOUT_SECONDS: '2400',
+        QA_BUILD_WORKFLOW_ID: 'staging.yml',
+        QA_EXECUTION_WORKFLOW_ID: 'hermes-qa.yml',
+        QA_AUTOMATION_ENABLED: 'false',
+        QA_BUILD_WAIT_SECONDS: '7200',
+        QA_EXECUTION_WAIT_SECONDS: '7200',
+        QA_POLL_SECONDS: '60',
+        BE_DEPLOY_WORKFLOW_ID: '208630294', // donate-mate/donatemate "Deploy to Staging"
+        DEPLOY_WAIT_SECONDS: '7200',
+        DEPLOY_POLL_SECONDS: '60',
+        JIRA_BROWSE_BASE_URL: 'https://donatemate.atlassian.net',
+        FE_TESTFLIGHT_FIX_VERSION: 'v61.0.0',
+        FE_TESTFLIGHT_RELEASE_VERSION: 'v61.0.0',
+        QA_ASSIGNEE_ACCOUNT_ID: '712020:1782f20d-c1fc-4831-ac3f-925cc0773332',
+        QA_ASSIGNEE_NAME: 'Patrick Sheehy',
+        QA_ASSIGNEE_EMAIL: 'patrick.sheehy@donate-mate.com',
+        QA_SLACK_CHANNEL: '#qa',
+        // Slack mentions require a member ID token such as <@U123>; display names do not notify.
+        QA_SLACK_MENTION: '',
+        BE_QA_ASSIGNEE_ACCOUNT_ID: '712020:5168d41e-0688-4f0d-8e00-a3e2048c556e',
+        BE_QA_ASSIGNEE_NAME: 'Andrew Sheehy',
+        BE_QA_ASSIGNEE_EMAIL: 'andrew.sheehy@donate-mate.com',
+        // Slack mentions require a member ID token such as <@U123>; display names do not notify.
+        BE_QA_SLACK_MENTION: '',
       },
     });
 
@@ -262,6 +296,91 @@ export class HermesStack extends cdk.Stack {
     secJiraBot.grantRead(workerTaskDef.taskRole);
     secSlack.grantRead(workerTaskDef.taskRole);
     secDmMcp.grantRead(workerTaskDef.taskRole);
+
+    // Backend defect/alert jobs need read-only production/staging observability. The agent uses
+    // AWS CLI evidence to distinguish false positives, noisy alarms, and real source defects.
+    workerTaskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          'cloudwatch:DescribeAlarms',
+          'cloudwatch:DescribeAlarmHistory',
+          'cloudwatch:GetMetricData',
+          'cloudwatch:GetMetricStatistics',
+          'cloudwatch:ListMetrics',
+          'logs:DescribeLogGroups',
+          'logs:DescribeLogStreams',
+          'logs:FilterLogEvents',
+          'logs:GetLogEvents',
+          'logs:StartQuery',
+          'logs:GetQueryResults',
+          'logs:StopQuery',
+          'synthetics:DescribeCanaries',
+          'synthetics:DescribeCanariesLastRun',
+          'synthetics:GetCanary',
+          'synthetics:GetCanaryRuns',
+          'synthetics:ListTagsForResource',
+          'lambda:GetFunction',
+          'lambda:GetFunctionConfiguration',
+          'lambda:ListFunctions',
+          'apigateway:GET',
+          'states:DescribeStateMachine',
+          'states:DescribeExecution',
+          'states:GetExecutionHistory',
+          'states:ListExecutions',
+          'states:ListStateMachines',
+          'cloudformation:DescribeStacks',
+          'cloudformation:DescribeStackEvents',
+          'cloudformation:ListStackResources',
+          'codebuild:BatchGetBuilds',
+          'codebuild:ListBuildsForProject',
+          'codebuild:ListProjects',
+          'codepipeline:GetPipeline',
+          'codepipeline:GetPipelineExecution',
+          'codepipeline:GetPipelineState',
+          'codepipeline:ListPipelineExecutions',
+          'codepipeline:ListPipelines',
+          'events:DescribeRule',
+          'events:ListRules',
+          'events:ListTargetsByRule',
+          'ecs:DescribeServices',
+          'ecs:DescribeTasks',
+          'ecs:DescribeTaskDefinition',
+          'ecs:ListServices',
+          'ecs:ListTasks',
+          'xray:BatchGetTraces',
+          'xray:GetTraceSummaries',
+        ],
+        resources: ['*'],
+      })
+    );
+    workerTaskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['s3:ListAllMyBuckets', 's3:GetBucketLocation'],
+        resources: ['*'],
+      })
+    );
+    workerTaskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['s3:ListBucket'],
+        resources: [
+          'arn:aws:s3:::donatemate-*-synthetics-artifacts',
+          'arn:aws:s3:::cw-syn-results-*',
+        ],
+      })
+    );
+    workerTaskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['s3:GetObject'],
+        resources: [
+          'arn:aws:s3:::donatemate-*-synthetics-artifacts/*',
+          'arn:aws:s3:::cw-syn-results-*/*',
+        ],
+      })
+    );
 
     // The worker protects its own task from scale-in while it's processing a job, so the
     // autoscaler can scale down after a burst without killing an active coding job.
@@ -303,8 +422,10 @@ export class HermesStack extends cdk.Stack {
       stringValue: alb.loadBalancerDnsName,
     });
 
-    new cdk.CfnOutput(this, 'ControlPlaneUrl', { value: `http://${alb.loadBalancerDnsName}` });
-    new cdk.CfnOutput(this, 'SlackEventsUrl', { value: `http://${alb.loadBalancerDnsName}/slack/events`, description: 'Needs HTTPS before Slack will accept it' });
+    const publicBaseUrl = certArn ? 'https://hermes.donate-mate.com' : `http://${alb.loadBalancerDnsName}`;
+    new cdk.CfnOutput(this, 'ControlPlaneUrl', { value: publicBaseUrl });
+    new cdk.CfnOutput(this, 'SlackEventsUrl', { value: `${publicBaseUrl}/slack/events` });
+    new cdk.CfnOutput(this, 'GitHubWebhookUrl', { value: `${publicBaseUrl}/github/webhook` });
     new cdk.CfnOutput(this, 'JobsQueueUrlOut', { value: jobsQueue.queueUrl });
     new cdk.CfnOutput(this, 'ArtifactsBucketOut', { value: artifacts.bucketName });
     new cdk.CfnOutput(this, 'ControlPlaneImageOut', { value: `${cpRepo.repositoryUri}:latest` });

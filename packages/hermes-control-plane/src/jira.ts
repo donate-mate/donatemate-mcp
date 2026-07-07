@@ -25,6 +25,9 @@ export interface JiraIssue {
   summary: string;
   labels: string[];
   status: string;
+  issueType: string;
+  parentKey?: string;
+  parentSummary?: string;
   context: string; // human-readable block (summary + type + description + recent comments)
 }
 
@@ -36,7 +39,7 @@ export async function fetchIssue(issueKey: string): Promise<JiraIssue | null> {
     if (!host || !email || !token) return null;
     const auth = Buffer.from(`${email}:${token}`).toString('base64');
     const res = await fetch(
-      `${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=summary,description,status,issuetype,labels,comment`,
+      `${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=summary,description,status,issuetype,labels,parent,comment`,
       { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } }
     );
     if (!res.ok) return null;
@@ -45,6 +48,10 @@ export async function fetchIssue(issueKey: string): Promise<JiraIssue | null> {
     const summary = f.summary ?? '';
     const labels: string[] = Array.isArray(f.labels) ? f.labels : [];
     const status = f.status?.name ?? '?';
+    const issueType = f.issuetype?.name ?? '?';
+    const parentKey = f.parent?.key as string | undefined;
+    const parentSummary = f.parent?.fields?.summary as string | undefined;
+    const parentType = f.parent?.fields?.issuetype?.name as string | undefined;
     const desc = f.description ? adfText(f.description).trim() : '';
     const comments = (f.comment?.comments || [])
       .slice(-5)
@@ -52,13 +59,16 @@ export async function fetchIssue(issueKey: string): Promise<JiraIssue | null> {
       .join('\n');
     const context = [
       `Jira ${issueKey}: ${summary}`,
-      `Type: ${f.issuetype?.name ?? '?'} | Status: ${status}${labels.length ? ` | Labels: ${labels.join(', ')}` : ''}`,
+      `Type: ${issueType} | Status: ${status}${labels.length ? ` | Labels: ${labels.join(', ')}` : ''}`,
+      ...(parentKey || parentSummary
+        ? [`Parent: ${parentKey ?? '?'}${parentSummary ? ` ${parentSummary}` : ''}${parentType ? ` (${parentType})` : ''}`]
+        : []),
       '',
       'Description:',
       desc || '(none)',
       ...(comments ? ['', 'Recent comments:', comments] : []),
     ].join('\n');
-    return { summary, labels, status, context };
+    return { summary, labels, status, issueType, parentKey, parentSummary, context };
   } catch {
     return null;
   }

@@ -75,10 +75,34 @@ export async function conversationToTask(transcript: string): Promise<string> {
 
 const PLAN_SYSTEM = `You are Hermes, DonateMate's coding agent. You've been assigned a Jira ticket. Read its content and write a SHORT implementation plan for a human reviewer to approve before you start coding.
 
-Format: 3-6 concise bullet points covering your understanding of the defect/feature, where in the codebase you expect to make changes, and the approach. If anything is ambiguous or risky, call it out. Do NOT write code. Keep it tight — this is a Jira comment, not an essay.`;
+Format: 3-6 concise bullet points covering your understanding of the defect/feature, where in the codebase you expect to make changes, and the approach. If anything is ambiguous or risky, call it out. Do NOT write code. Keep it tight — this is a Jira comment, not an essay.
+
+For backend defects, production/staging alerts, alarms, or canary failures: assume AWS CLI observability access is available. The plan must explicitly verify evidence first: CloudWatch alarm history/metrics, Synthetics runs/artifacts, relevant CloudWatch Logs, deploy/e2e timing, and whether real traffic was impacted. It must classify the alarm as a false positive, too sensitive/misconfigured, or a real source defect before proposing the fix. Do not ask whether AWS access exists.`;
 
 /** Produce a short, reviewer-facing implementation plan from a Jira issue's context. */
 export async function planIssue(issueContext: string): Promise<string> {
   const plan = await complete(PLAN_SYSTEM, [{ role: 'user', content: issueContext }], 1024);
   return plan || 'I will investigate the codebase and implement the change described in this ticket.';
+}
+
+const QA_SCENARIO_SYSTEM = `You draft DonateMate QA scenarios for Confluence using the locked scenario template.
+
+Rules:
+- Output exactly one scenario in markdown.
+- Use the supplied scenario ID exactly.
+- Use observable UI behavior only.
+- Reference test data by TD-* ID when known; do not invent credentials.
+- Include Priority, Platforms, Related tickets, Given/When/Then steps, Edge variants if relevant, and Out of scope if relevant.
+- If the ticket is backend-only, infra-only, a spike, or has no user-facing behavior, output exactly: N/A
+- Do not claim behavior that is currently broken or defect-held.`;
+
+export async function draftQaScenario(issueContext: string, scenarioId: string, pageTitle: string): Promise<string> {
+  const prompt = [
+    `Scenario ID: ${scenarioId}`,
+    `Target Confluence page: ${pageTitle}`,
+    '',
+    'Jira context:',
+    issueContext,
+  ].join('\n');
+  return complete(QA_SCENARIO_SYSTEM, [{ role: 'user', content: prompt }], 1600);
 }

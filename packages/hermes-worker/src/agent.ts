@@ -86,6 +86,12 @@ Git is handled FOR you — do NOT manage it yourself:
 - Do NOT run \`git commit\`, \`git push\`, \`git checkout\`, \`git branch\`, or any \`gh\` command, and do NOT open a pull request. The harness automatically commits your working-tree changes and opens the PR after you finish.
 - Leave your edits uncommitted in the working tree and end your turn when the change is complete.
 
+AWS observability is available through the task role and the \`aws\` CLI. For backend defects, production/staging alerts, alarms, canary failures, or incident tickets:
+- Use \`aws\` CLI evidence before changing code or alarm configuration. Check CloudWatch alarm history/metrics, Synthetics runs and artifacts, relevant CloudWatch Logs, and deployment/e2e timing for the reported window.
+- Decide and state in your final message whether the alarm was a false positive, too sensitive/misconfigured, or correctly indicating defective source logic.
+- If source logic is defective, fix the source logic directly and optimally. Do not hide real defects by only weakening alarms or adding superficial retries.
+- If the alarm/canary is the defect, tune the canary/alarm with evidence and keep the production signal meaningful.
+
 --- TASK ---
 
 `;

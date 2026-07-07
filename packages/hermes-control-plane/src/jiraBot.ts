@@ -84,6 +84,10 @@ export async function transitionIssue(issueKey: string, candidates: string[]): P
 // Canonical DonateMate workflow column names (with common synonyms) for each agent phase.
 export const COLUMN = {
   inProgress: ['In Progress'],
+  waitingCi: ['Waiting CI', 'Waiting for CI', 'Code Review', 'In Review', 'Review'],
   codeReview: ['Code Review', 'In Review', 'Review'],
+  qa: ['QA', 'In QA', 'Testing', 'Ready for QA', 'Release QA'],
+  blocked: ['Blocked For Development', 'Blocked for QA', 'Blocked', 'On Hold'],
   toDo: ['To Do', 'Selected for Development', 'Backlog'],
+  done: ['Done', 'Complete', 'Completed'],
 };
