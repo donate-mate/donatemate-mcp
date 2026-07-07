@@ -85,6 +85,38 @@ export async function planIssue(issueContext: string): Promise<string> {
   return plan || 'I will investigate the codebase and implement the change described in this ticket.';
 }
 
+// --- WS5 --- Derive an acceptance/defect checklist from a Jira ticket for readiness gating.
+const CHECKLIST_SYSTEM = `You extract a verification checklist from a DonateMate Jira ticket for an autonomous coding agent's PR.
+
+From the ticket description AND its comments, list the independently-observable defect fixes and acceptance criteria that a reviewer could each verify on their own. Each item must be a short, concrete, checkable statement (no vague "works correctly").
+
+Output ONLY a JSON array of strings. No prose, no markdown fences. If there are no observable items, output [].`;
+
+// --- WS5 --- Parse a JSON array of strings defensively, tolerating code fences / surrounding prose.
+function parseJsonStringArray(raw: string): string[] {
+  const text = raw.replace(/```(?:json)?/gi, '').trim();
+  const start = text.indexOf('[');
+  const end = text.lastIndexOf(']');
+  if (start === -1 || end === -1 || end < start) return [];
+  try {
+    const parsed = JSON.parse(text.slice(start, end + 1));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((v) => String(v).trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// --- WS5 --- LLM pass returning a checklist of observable items from the ticket context.
+export async function extractChecklist(issueContext: string): Promise<string[]> {
+  try {
+    const raw = await complete(CHECKLIST_SYSTEM, [{ role: 'user', content: issueContext }], 1024);
+    return parseJsonStringArray(raw);
+  } catch {
+    return [];
+  }
+}
+
 const QA_SCENARIO_SYSTEM = `You draft DonateMate QA scenarios for Confluence using the locked scenario template.
 
 Rules:

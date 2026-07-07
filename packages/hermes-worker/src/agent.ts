@@ -15,11 +15,42 @@ const AGENT_MODEL = process.env.AGENT_MODEL || 'gpt-5.5';
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_SECONDS ?? 2400) * 1000;
 const OUTPUT_CAP = 16 * 1024 * 1024;
 
+// WS3.1 — reasoning effort. Codex takes `-c model_reasoning_effort=<minimal|low|medium|high>`.
+// Default is env-configurable ("medium") for implementation jobs; the pre-open review session
+// (WS4) passes "high" per call. Previously NO flag was passed, so Codex ran at its own default.
+const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high']);
+const DEFAULT_REASONING_EFFORT = normalizeEffort(process.env.AGENT_REASONING_EFFORT) ?? 'medium';
+
+function normalizeEffort(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const v = value.trim().toLowerCase();
+  // Historic value "none" maps to Codex's lowest tier.
+  const mapped = v === 'none' ? 'minimal' : v;
+  return VALID_EFFORTS.has(mapped) ? mapped : undefined;
+}
+
+export interface RunAgentOptions {
+  /** Override reasoning effort for this call (minimal|low|medium|high). Falls back to the env default. */
+  reasoningEffort?: string;
+  /** Override the model for this call (defaults to AGENT_MODEL). */
+  model?: string;
+  /**
+   * Override the preamble prepended to the prompt. Defaults to HARNESS_PREAMBLE (which instructs the
+   * agent to edit files). The WS4 pre-open review passes a read-only preamble instead so the review
+   * session analyzes rather than mutates.
+   */
+  preamble?: string;
+}
+
 export interface AgentResult {
   transcript: string;
   exitCode: number;
-  /** The agent's final message — surfaced in Slack/Jira and used to explain a no-change run. */
+  /** The agent's final message, truncated for Slack/Jira display and no-change explanations. */
   reason?: string;
+  /** The agent's final message, untruncated — used by the WS4 review session to parse findings JSON. */
+  finalMessage?: string;
+  /** Whether the Codex session was killed by the JOB_TIMEOUT guardrail. */
+  timedOut?: boolean;
 }
 
 interface RunResult {
@@ -96,10 +127,12 @@ AWS observability is available through the task role and the \`aws\` CLI. For ba
 
 `;
 
-export async function runAgent(dir: string, taskPrompt: string): Promise<AgentResult> {
+export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOptions = {}): Promise<AgentResult> {
   const { apiKey } = await getSecretJson(SECRET_OPENAI);
   if (!apiKey) throw new Error('OpenAI API key not configured in Secrets Manager');
-  const prompt = HARNESS_PREAMBLE + taskPrompt;
+  const prompt = (opts.preamble ?? HARNESS_PREAMBLE) + taskPrompt;
+  const model = opts.model || AGENT_MODEL;
+  const effort = normalizeEffort(opts.reasoningEffort) ?? DEFAULT_REASONING_EFFORT;
 
   // Capture the agent's final message in a file OUTSIDE the clone so it can't pollute the diff.
   // CODEX_HOME is left at its default (~/.codex under HOME) — Codex refuses to create its helper
@@ -110,7 +143,9 @@ export async function runAgent(dir: string, taskPrompt: string): Promise<AgentRe
   const args = [
     'exec',
     '--model',
-    AGENT_MODEL,
+    model,
+    '-c',
+    `model_reasoning_effort=${effort}`, // WS3.1
     '--dangerously-bypass-approvals-and-sandbox', // the Fargate container is the sandbox
     '--ephemeral', // don't persist session files
     '--skip-git-repo-check',
@@ -121,10 +156,10 @@ export async function runAgent(dir: string, taskPrompt: string): Promise<AgentRe
     prompt,
   ];
 
-  const readReason = async (): Promise<string | undefined> => {
+  const readFinalMessage = async (): Promise<string | undefined> => {
     try {
       const t = (await readFile(lastMsgFile, 'utf8')).trim();
-      return t ? t.slice(0, 500) : undefined;
+      return t || undefined;
     } catch {
       return undefined;
     }
@@ -137,9 +172,10 @@ export async function runAgent(dir: string, taskPrompt: string): Promise<AgentRe
     if (timedOut) throw new Error(`Agent timed out after ${JOB_TIMEOUT_MS / 1000}s`);
     // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides based
     // on whether the working tree changed.
-    const reason = (await readReason()) ?? (stderr.trim().slice(0, 500) || undefined);
-    console.log(`[agent] codex exit ${code}`);
-    return { transcript: `${stdout}\n${stderr}`.trim(), exitCode: code, reason };
+    const finalMessage = (await readFinalMessage()) ?? (stderr.trim() || undefined);
+    const reason = finalMessage?.slice(0, 500);
+    console.log(`[agent] codex exit ${code} (model=${model}, effort=${effort})`);
+    return { transcript: `${stdout}\n${stderr}`.trim(), exitCode: code, reason, finalMessage };
   } finally {
     await rm(outDir, { recursive: true, force: true });
   }

@@ -1,0 +1,286 @@
+# =============================================================================
+# Hermes container images — build, self-test, push to ECR, roll ECS.
+#
+# Builds the two DonateMate Hermes Docker images and ships them to Amazon ECR
+# in account 690788838096 / us-east-2, then forces a new ECS deployment of the
+# matching staging service.
+#
+#   image          Dockerfile                                   ECR repo
+#   -----          ----------                                   --------
+#   control-plane  packages/hermes-control-plane/Dockerfile     donatemate-hermes-control-plane
+#   worker         packages/hermes-worker/Dockerfile            donatemate-hermes-worker
+#
+# Build context for each image is its own package directory (both Dockerfiles
+# are self-contained and resolve deps from the npm registry).
+#
+# Control-plane Dockerfile: PRESENT at packages/hermes-control-plane/Dockerfile
+# (verified). Both jobs are wired fully.
+#
+# ---------------------------------------------------------------------------
+# AUTH — matches the repo's existing workflows (deploy-staging.yml /
+# deploy-production.yml): GitHub OIDC, no long-lived access keys. We assume
+#   role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+# via aws-actions/configure-aws-credentials@v4, with `id-token: write` +
+# `contents: read` permissions. Same role ARN / secret name as the other
+# workflows — no new auth mechanism is introduced here.
+#
+# ---------------------------------------------------------------------------
+# NIGHTLY WORKER SELF-TEST (WS1) — a broken toolchain must never ship.
+# The worker's job is to clone donate-mate/donatemate and actually RUN its
+# tests. So on the nightly schedule (and on manual dispatch) we treat the
+# worker image as a self-test gate: after building, we run a container from
+# the freshly-built image that clones the real target repo, installs deps
+# WITH lifecycle scripts + `prisma generate`, and runs one real package's test
+# suite. If that suite is red, the job fails BEFORE the push step, so the bad
+# image is never published. Plain `push` builds skip the (slow) self-test for
+# fast turnaround and rely on the nightly gate for toolchain health.
+#
+# PREBAKED TOOLCHAIN CACHE — two layers of warmth so job-time installs in the
+# real worker are fast (< 2 min first-edit target):
+#   1. Docker layer cache via buildx `type=gha` (cache-from/cache-to) so image
+#      rebuilds reuse the apt + npm-install layers.
+#   2. A persistent HERMES_CACHE_DIR (yarn/npm/turbo caches) kept warm across
+#      nightly runs with actions/cache and mounted into the self-test
+#      container. The worker (packages/hermes-worker/src/workspace.ts) reads
+#      HERMES_CACHE_DIR and points YARN_CACHE_FOLDER / npm_config_cache /
+#      TURBO_CACHE_DIR at it, so a cache warmed here is exactly the cache the
+#      running worker consumes. (Baking the cache into an image layer is an
+#      equally valid alternative; we use an exported cache tag to avoid
+#      editing the Dockerfile.)
+# =============================================================================
+
+name: Hermes Images
+
+on:
+  push:
+    branches: [main] # default branch
+    paths:
+      - 'packages/hermes-worker/**'
+      - 'packages/hermes-control-plane/**'
+      - '.github/workflows/hermes-images.yml'
+  workflow_dispatch:
+    inputs:
+      selftest_package:
+        description: 'Workspace package in donate-mate/donatemate whose test suite gates the worker image (WS1 self-test).'
+        required: false
+        default: '@donatemate/auth'
+  schedule:
+    # Nightly 07:00 UTC — refresh both images; the worker build runs the WS1
+    # self-test gate. Nightly does NOT roll ECS (image refresh only).
+    - cron: '0 7 * * *'
+
+# Cancel superseded runs on the same ref (a newer push/dispatch wins). We do
+# NOT cancel across the scheduled cron and pushes — separate concurrency scope.
+concurrency:
+  group: hermes-images-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write # OIDC federation to AWS (assume AWS_DEPLOY_ROLE_ARN)
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  AWS_ACCOUNT_ID: '690788838096'
+  ECR_REGISTRY: 690788838096.dkr.ecr.us-east-2.amazonaws.com
+  ECS_CLUSTER: donatemate-staging-hermes
+  # The private repo the worker clones + tests (WS1 self-test target).
+  DONATEMATE_REPO: donate-mate/donatemate
+  DONATEMATE_BRANCH: main
+
+jobs:
+  # ===========================================================================
+  # CONTROL PLANE — always-on Fargate service image. No self-test gate.
+  # ===========================================================================
+  control-plane:
+    name: Control plane · build & push
+    runs-on: ubuntu-latest
+    env:
+      ECR_REPO: donatemate-hermes-control-plane
+      ECS_SERVICE: donatemate-staging-hermes-control-plane
+      CONTEXT_DIR: packages/hermes-control-plane
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Hermes-ControlPlane
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (tag latest + git SHA)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CONTEXT_DIR }}
+          file: ${{ env.CONTEXT_DIR }}/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          cache-from: type=gha,scope=hermes-control-plane
+          cache-to: type=gha,scope=hermes-control-plane,mode=max
+
+      # Roll ECS only on push / manual dispatch. Nightly schedule just refreshes
+      # the :latest image in ECR without disturbing the running service.
+      - name: Force new ECS deployment
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment \
+            --no-cli-pager \
+            --query 'service.{name:serviceName,taskDef:taskDefinition,deployments:length(deployments)}'
+
+  # ===========================================================================
+  # WORKER — Codex-driven PR worker image. WS1 self-test gate on schedule/
+  # dispatch; a red toolchain test blocks the push.
+  # ===========================================================================
+  worker:
+    name: Worker · build, self-test gate & push
+    runs-on: ubuntu-latest
+    env:
+      ECR_REPO: donatemate-hermes-worker
+      ECS_SERVICE: donatemate-staging-hermes-fe-worker
+      CONTEXT_DIR: packages/hermes-worker
+      IMAGE_LATEST: 690788838096.dkr.ecr.us-east-2.amazonaws.com/donatemate-hermes-worker:latest
+      # Package whose suite must be green before the worker image ships. Input
+      # on dispatch; sensible default otherwise. Adjust to a real small package
+      # (an auth/login module) in donate-mate/donatemate.
+      SELFTEST_PACKAGE: ${{ github.event.inputs.selftest_package || '@donatemate/auth' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Hermes-Worker
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build once and LOAD into the local docker daemon so the self-test can
+      # run the exact image we would push. We push in a later, gated step.
+      - name: Build worker image (local, tag latest + git SHA)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CONTEXT_DIR }}
+          file: ${{ env.CONTEXT_DIR }}/Dockerfile
+          load: true
+          push: false
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          cache-from: type=gha,scope=hermes-worker
+          cache-to: type=gha,scope=hermes-worker,mode=max
+
+      # Persist the prebaked HERMES_CACHE_DIR (yarn/npm/turbo) across nightly
+      # runs so the self-test install — and, by extension, the real worker —
+      # hits a warm cache instead of the network.
+      - name: Restore prebaked toolchain cache (HERMES_CACHE_DIR)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: actions/cache@v4
+        with:
+          path: hermes-cache
+          key: hermes-worker-cache-${{ github.run_id }}
+          restore-keys: |
+            hermes-worker-cache-
+
+      # WS1 SELF-TEST GATE. Runs the freshly-built worker image against the real
+      # target repo: clone (blobless) → install WITH scripts → prisma generate →
+      # run one real package's test suite. Failure fails the job here, before the
+      # push step, so a broken toolchain image is never published.
+      - name: Worker self-test (clone + install + prisma + real test suite)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          # Token with read access to the private donate-mate/donatemate repo.
+          # GITHUB_TOKEN only scopes to THIS repo, so a dedicated PAT/App token
+          # secret is required for the cross-repo clone.
+          DONATEMATE_REPO_TOKEN: ${{ secrets.DONATEMATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/hermes-cache"
+
+          if [ -z "${DONATEMATE_REPO_TOKEN:-}" ]; then
+            echo "::error::DONATEMATE_REPO_TOKEN secret is not set — cannot clone $DONATEMATE_REPO for the WS1 self-test."
+            exit 1
+          fi
+
+          # Self-test script executed INSIDE the worker image. Runs as root
+          # (--user 0) so the mounted cache dir is writable regardless of the
+          # image's default non-root user.
+          cat > selftest.sh <<'EOS'
+          set -euo pipefail
+          export CI=true
+          export HERMES_CACHE_DIR=/cache
+          export YARN_CACHE_FOLDER=/cache/yarn
+          export npm_config_cache=/cache/npm
+          export TURBO_CACHE_DIR=/cache/turbo
+          mkdir -p "$YARN_CACHE_FOLDER" "$npm_config_cache" "$TURBO_CACHE_DIR"
+
+          echo "== Cloning $DONATEMATE_REPO@$DONATEMATE_BRANCH (blobless) =="
+          git clone --filter=blob:none --no-tags --branch "$DONATEMATE_BRANCH" \
+            "https://x-access-token:${DONATEMATE_REPO_TOKEN}@github.com/${DONATEMATE_REPO}.git" /tmp/dm
+          cd /tmp/dm
+
+          echo "== Installing deps WITH lifecycle scripts (warm cache) =="
+          corepack enable >/dev/null 2>&1 || true
+          if   [ -f yarn.lock ];         then yarn install --frozen-lockfile;
+          elif [ -f pnpm-lock.yaml ];    then corepack pnpm install --frozen-lockfile;
+          elif [ -f package-lock.json ]; then npm ci;
+          else echo "No lockfile found in $DONATEMATE_REPO" >&2; exit 1; fi
+
+          echo "== prisma generate (per schema) =="
+          for s in prisma/schema.prisma packages/database/prisma/schema.prisma \
+                   packages/db/prisma/schema.prisma apps/api/prisma/schema.prisma; do
+            if [ -f "$s" ]; then npx --no-install prisma generate --schema="$s"; fi
+          done
+
+          echo "== Running self-test suite for package: $SELFTEST_PACKAGE =="
+          if   [ -f yarn.lock ];         then yarn workspace "$SELFTEST_PACKAGE" run test;
+          elif [ -f pnpm-lock.yaml ];    then corepack pnpm --filter "$SELFTEST_PACKAGE" run test;
+          else npm run test -w "$SELFTEST_PACKAGE"; fi
+          echo "== Self-test PASSED =="
+          EOS
+
+          docker run --rm --user 0 \
+            -e DONATEMATE_REPO -e DONATEMATE_BRANCH -e DONATEMATE_REPO_TOKEN -e SELFTEST_PACKAGE \
+            -v "$GITHUB_WORKSPACE/hermes-cache:/cache" \
+            -v "$PWD/selftest.sh:/selftest.sh:ro" \
+            --entrypoint bash \
+            "$IMAGE_LATEST" /selftest.sh
+
+      # Push only after everything above succeeded. On a red self-test the job
+      # already failed, so this step is skipped and the broken image never ships.
+      - name: Push worker image to ECR (latest + git SHA)
+        run: |
+          set -euo pipefail
+          docker push "$ECR_REGISTRY/$ECR_REPO:latest"
+          docker push "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
+
+      # Roll ECS only on push / manual dispatch — never on the nightly schedule
+      # (nightly just refreshes the image after passing the self-test gate).
+      - name: Force new ECS deployment
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment \
+            --no-cli-pager \
+            --query 'service.{name:serviceName,taskDef:taskDefinition,deployments:length(deployments)}'

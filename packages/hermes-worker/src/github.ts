@@ -57,7 +57,14 @@ export async function getInstallationAuth(repoFullName: string): Promise<GitHubA
 }
 
 /**
- * Clone `owner/repo` at `baseBranch` into `dir`, shallow + clean, using the install token.
+ * Clone `owner/repo` at `baseBranch` into `dir` using the install token.
+ *
+ * WS1: uses a blobless (`--filter=blob:none`) clone rather than `--depth 1`. A shallow clone has
+ * no commit history, which breaks turborepo's `--changedSince`/`--filter=[base...]` change
+ * detection and any `git diff` against the merge base — the worker (and the pre-commit gate)
+ * need history to scope lint/test to changed packages. Blobless keeps the full commit graph while
+ * fetching file blobs lazily on demand, so it stays fast without sacrificing history.
+ *
  * Retries a few times: a freshly-minted scoped installation token can briefly 404 ("Repository
  * not found") on clone due to GitHub token-propagation lag.
  */
@@ -66,7 +73,9 @@ export async function cloneRepo(token: string, repo: string, baseBranch: string,
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      await exec('git', ['clone', '--depth', '1', '--branch', baseBranch, url, dir]);
+      await exec('git', ['clone', '--filter=blob:none', '--no-tags', '--branch', baseBranch, url, dir], {
+        maxBuffer: 16 * 1024 * 1024,
+      });
       await exec('git', ['-C', dir, 'config', 'user.name', 'DonateMate Hermes']);
       await exec('git', ['-C', dir, 'config', 'user.email', 'hermes@donate-mate.com']);
       return;
@@ -235,6 +244,58 @@ export async function commitAndPush(dir: string, branch: string, message: string
         console.warn(`[push] attempt ${attempt} failed (${msg.split('\n')[0]}); retrying…`);
         await new Promise((r) => setTimeout(r, 1500 * attempt));
         repo = await refreshOriginToken(dir); // fresh token for the retry
+      }
+    }
+  } finally {
+    await exec('git', ['-C', dir, 'remote', 'set-url', 'origin', `https://github.com/${repo}.git`]).catch(() => {});
+  }
+}
+
+/** Diff of the working tree (staged + unstaged) against a baseline SHA — the agent's full change. */
+export async function getDiff(dir: string, baseSha: string, maxChars = 200_000): Promise<string> {
+  await exec('git', ['-C', dir, 'add', '-A']);
+  const { stdout } = await exec('git', ['-C', dir, 'diff', '--cached', baseSha], { maxBuffer: 32 * 1024 * 1024 });
+  await exec('git', ['-C', dir, 'reset', '--quiet']).catch(() => {});
+  return stdout.length > maxChars ? `${stdout.slice(0, maxChars)}\n… [diff truncated]` : stdout;
+}
+
+/**
+ * Commit the working tree locally WITHOUT pushing (WS4 needs a clean tree so the review session's
+ * stray edits can be discarded without losing the real change). Returns true if a commit was made.
+ */
+export async function commitLocal(dir: string, message: string): Promise<boolean> {
+  await exec('git', ['-C', dir, 'add', '-A']);
+  await assertNoUnmergedFiles(dir);
+  await assertNoConflictMarkers(dir);
+  const staged = await exec('git', ['-C', dir, 'diff', '--cached', '--quiet']).then(
+    () => false,
+    () => true
+  );
+  if (staged) await exec('git', ['-C', dir, 'commit', '-m', message]);
+  return staged;
+}
+
+/** Discard all working-tree changes (used to drop any files a read-only review session touched). */
+export async function discardWorkingTreeChanges(dir: string): Promise<void> {
+  await exec('git', ['-C', dir, 'checkout', '--', '.']).catch(() => {});
+  await exec('git', ['-C', dir, 'clean', '-fd']).catch(() => {});
+}
+
+/** Push the current branch (with the same transient-404 retry + token re-mint as commitAndPush). */
+export async function pushBranch(dir: string, branch: string): Promise<void> {
+  let repo = await refreshOriginToken(dir);
+  try {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        await exec('git', ['-C', dir, 'push', 'origin', branch]);
+        return;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const transient = /not found|could not resolve|timed out|connection|tls|ssl|remote end hung up|rpc failed/i.test(msg);
+        if (!transient || attempt === 4) throw sanitizeGitAuthError(err);
+        console.warn(`[push] attempt ${attempt} failed (${msg.split('\n')[0]}); retrying…`);
+        await new Promise((r) => setTimeout(r, 1500 * attempt));
+        repo = await refreshOriginToken(dir);
       }
     }
   } finally {

@@ -11,6 +11,8 @@ import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from '@aws-sdk
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { rm as rmFile } from 'node:fs/promises';
+import { join as joinPath } from 'node:path';
 import {
   getInstallationAuth,
   commentOnPullRequest,
@@ -19,12 +21,20 @@ import {
   getHeadSha,
   hasChanges,
   commitAndPush,
+  commitLocal,
+  pushBranch,
   openPullRequest,
   ensurePullRequestLabels,
   prepareMergeConflictResolution,
   type MergeConflictPreparation,
 } from './github.js';
 import { runAgent } from './agent.js';
+import { installWorkspace } from './workspace.js';
+import { runGate, gateSummary, type GateResult } from './gate.js';
+import { loadContract, contractPromptBlock, validatePrBody, buildReportRepairPrompt, loadReport } from './contract.js';
+import { runPreopenReview, buildReviewFixPrompt, reviewSummary } from './review.js';
+import { knowledgePromptBlock } from './knowledge.js';
+import { putMetric } from './metrics.js';
 import {
   getJob,
   updateJob,
@@ -49,6 +59,7 @@ const WORKER_TYPE = process.env.WORKER_TYPE ?? 'fe';
 const FRONTEND_DEPLOY_LABEL = 'deploy-dev';
 const JOB_HEARTBEAT_SECONDS = Number(process.env.JOB_HEARTBEAT_SECONDS ?? 60);
 const PRECOMMIT_REPAIR_ATTEMPTS = Number(process.env.PRECOMMIT_REPAIR_ATTEMPTS ?? 2);
+const GATE_MAX_RETRIES = Number(process.env.GATE_MAX_RETRIES ?? 3); // WS2
 const FAILURE_COMMENT_MAX = 2400;
 
 function startJobHeartbeat(jobId: string): () => void {
@@ -189,6 +200,76 @@ async function commitAndPushWithPrecommitRepair(input: {
   }
 
   return transcriptUri;
+}
+
+/**
+ * WS2 — run the pre-commit gate, feeding failures back into fresh Codex repair rounds up to
+ * GATE_MAX_RETRIES. Returns the final gate result (may still be failing → caller opens fail-open,
+ * never blocks forever). Emits HermesGateCycles / HermesGateFailShipped.
+ */
+async function runGateLoop(input: {
+  jobId: string;
+  dir: string;
+  baseSha: string;
+  installOk: boolean;
+  type?: string;
+  onTranscript: (chunk: string) => void;
+}): Promise<GateResult> {
+  let gate = await runGate(input.dir, input.baseSha, input.installOk);
+  let cycles = 0;
+  while (!gate.ok && cycles < GATE_MAX_RETRIES) {
+    cycles++;
+    console.warn(`[${input.jobId}] gate failed (${gateSummary(gate)}); repair round ${cycles}/${GATE_MAX_RETRIES}`);
+    const repair = await runAgent(input.dir, ['The pre-commit gate is failing on the packages you changed.', '', gate.report].join('\n'));
+    input.onTranscript(`\n--- Gate repair round ${cycles} ---\n${repair.transcript || `(exit ${repair.exitCode})`}`);
+    gate = await runGate(input.dir, input.baseSha, input.installOk);
+  }
+  await putMetric('HermesGateCycles', cycles, { type: input.type });
+  if (!gate.ok) {
+    await putMetric('HermesGateFailShipped', 1, { type: input.type });
+    console.warn(`[${input.jobId}] gate still failing after ${cycles} rounds; opening PR fail-open`);
+  }
+  return gate;
+}
+
+/** Assemble the initial-PR body: task, outcome report, gate + review sections, warnings. */
+function assemblePrBody(input: {
+  jobId: string;
+  source: string;
+  prompt: string;
+  exitCode: number;
+  transcriptUri: string;
+  report?: string;
+  reportIncomplete?: string[];
+  gate: GateResult;
+  reviewText?: string;
+}): string {
+  const parts: string[] = [
+    `Automated PR by **Hermes** (job \`${input.jobId}\`, source: ${input.source}).`,
+    '',
+    '**Task**',
+    `> ${input.prompt}`,
+  ];
+  if (input.report) {
+    parts.push('', '---', '', input.report);
+  }
+  if (input.reportIncomplete?.length) {
+    parts.push('', `> ⚠️ **Incomplete report** — missing required section(s): ${input.reportIncomplete.join(', ')}.`);
+  }
+  parts.push('', '---', '', `**Pre-commit gate:** ${gateSummary(input.gate)}`);
+  if (!input.gate.ok) {
+    const failed = input.gate.checks.filter((c) => !c.ok);
+    parts.push(
+      '',
+      '> ⚠️ **Gate failures shipped** — the following checks did not pass after repair attempts; review carefully before merge:',
+      ...failed.map((c) => `> - \`${c.name}\``)
+    );
+  }
+  if (input.reviewText) {
+    parts.push('', '**Pre-open review**', '', input.reviewText);
+  }
+  parts.push('', `Agent exit code: ${input.exitCode}. Transcript: ${input.transcriptUri}`, '', '⚠️ Agent-generated — review before merge.');
+  return parts.join('\n');
 }
 
 async function completeFollowupJob(input: {
@@ -361,13 +442,24 @@ async function processJob(jobId: string): Promise<void> {
       }
     }
 
+    // WS1 — install dependencies + generate the Prisma client so the agent and the pre-commit gate
+    // can actually run jest/typecheck (a bare clone has no node_modules).
+    const install = await installWorkspace(dir);
+    if (install.durationMs) await putMetric('HermesInstallSeconds', Math.round(install.durationMs / 1000), { type: job.type });
+    if (!install.ok && !install.skipped) console.warn(`[${jobId}] workspace install degraded:\n${install.log.slice(-800)}`);
+
+    // WS3.2 — inject the repo-versioned contract (HERMES.md) verbatim as authoritative guidance.
+    const contract = await loadContract(dir);
+
     // If the task references a Jira issue, pull its context so the agent builds the right thing.
     let prompt = job.prompt;
+    let jiraContext: string | undefined;
     const issueKey = ticket ?? findIssueKey(`${job.source} ${job.prompt}`);
     if (issueKey) {
       const ctx = await fetchIssueContext(issueKey);
       if (ctx) {
         console.log(`[${jobId}] enriched prompt with Jira ${issueKey}`);
+        jiraContext = ctx;
         prompt = `Context from ${ctx}\n\n---\n\nTask:\n${job.prompt}`;
       }
     }
@@ -375,7 +467,20 @@ async function processJob(jobId: string): Promise<void> {
       prompt = `${prompt}\n\n---\n\nMerge conflict resolution context:\n${mergeConflictPrompt(job.baseBranch, mergePrep)}`;
     }
 
-    const { transcript, exitCode, reason } = await runAgent(dir, prompt);
+    // WS6 — prepend "previously flagged patterns in this area" from the knowledge base (fail-open).
+    const kbBlock = await knowledgePromptBlock(`${job.prompt} ${jiraContext ?? ''}`, [job.repo, job.type]);
+    // WS3.3 — ask for the six-section outcome report up front (initial PRs only) to avoid an extra round.
+    const reportInstruction = isPrFollowup
+      ? ''
+      : '\n\n--- OUTCOME REPORT ---\nWhen the change is complete, ALSO write an outcome report to a file named HERMES_REPORT.md at the repo root, with a level-2 Markdown heading for EACH section: Root cause, Evidence, Verification, Blast radius, Data repair, Deferred. The harness reads this into the PR description. Do not commit or push it.';
+    const agentPrompt =
+      [contract ? contractPromptBlock(contract) : undefined, kbBlock || undefined, prompt].filter(Boolean).join('\n\n') +
+      reportInstruction;
+
+    const agentRun = await runAgent(dir, agentPrompt);
+    const exitCode = agentRun.exitCode;
+    const reason = agentRun.reason;
+    let transcript = agentRun.transcript;
     let transcriptUri = await storeTranscript(jobId, transcript);
 
     if (!(await hasChanges(dir, baseSha))) {
@@ -398,29 +503,19 @@ async function processJob(jobId: string): Promise<void> {
     }
 
     const title = isPrFollowup ? `[hermes] address PR feedback (${jobId.slice(0, 8)})` : `[hermes] ${job.prompt.slice(0, 60)}`;
-    const body = [
-      `Automated PR by **Hermes** (job \`${jobId}\`, source: ${job.source}).`,
-      '',
-      '**Task**',
-      `> ${job.prompt}`,
-      '',
-      `Agent exit code: ${exitCode}. Transcript: ${transcriptUri}`,
-      '',
-      '⚠️ Agent-generated — review before merge.',
-    ].join('\n');
 
-    transcriptUri = await commitAndPushWithPrecommitRepair({
-      jobId,
-      dir,
-      branch,
-      message: title,
-      taskPrompt: prompt,
-      transcript,
-    });
-    const headSha = await getHeadSha(dir);
+    // WS2 — pre-commit gate: lint/format/tests on the changed packages, repairing via Codex up to
+    // GATE_MAX_RETRIES. Fail-open: after the retries, still open the PR (with a loud warning).
+    const installOk = install.skipped || install.ok;
+    const gate = await runGateLoop({ jobId, dir, baseSha, installOk, type: job.type, onTranscript: (c) => (transcript += c) });
+    transcriptUri = await storeTranscript(jobId, transcript);
 
     if (isPrFollowup) {
+      // Follow-up jobs push straight back to the PR branch; the post-open reconcile loop is unchanged.
+      transcriptUri = await commitAndPushWithPrecommitRepair({ jobId, dir, branch, message: title, taskPrompt: prompt, transcript });
+      const headSha = await getHeadSha(dir);
       if (!job.prNumber || !job.prUrl) throw new Error('follow-up job missing prNumber/prUrl');
+      await putMetric('HermesCiFixAttempts', 1, { type: job.type }); // WS2 — post-open auto-repair round
       await updateJob(jobId, 'done', { prUrl: job.prUrl, transcriptUri, headSha });
       await markPrWatchWaiting(job.repo, job.prNumber, headSha);
       await notify(
@@ -447,6 +542,60 @@ async function processJob(jobId: string): Promise<void> {
       console.log(`[${jobId}] follow-up pushed → ${job.prUrl}`);
       return;
     }
+
+    // ---- Initial PR: commit locally → WS4 adversarial review → WS3.3 body validation → push ----
+    await commitLocal(dir, title);
+
+    // WS4 — pre-open adversarial review (reasoning HIGH). BLOCKING findings → one fix round → re-gate.
+    let reviewText: string | undefined;
+    const review = await runPreopenReview({ dir, baseSha, ticketContext: jiraContext, contract });
+    if (review.ran) {
+      await putMetric('HermesPreopenFindings', review.findings.length, { type: job.type });
+      const blocking = review.findings.filter((f) => f.severity === 'BLOCKING');
+      await putMetric('HermesPreopenBlocking', blocking.length, { type: job.type });
+      let fixed = 0;
+      if (blocking.length) {
+        const fix = await runAgent(dir, buildReviewFixPrompt(review.findings));
+        transcript += `\n--- Pre-open review fix round ---\n${fix.transcript || `(exit ${fix.exitCode})`}`;
+        await runGateLoop({ jobId, dir, baseSha, installOk, type: job.type, onTranscript: (c) => (transcript += c) });
+        if (await hasChanges(dir, await getHeadSha(dir))) {
+          await commitLocal(dir, `[hermes] address pre-open review (${jobId.slice(0, 8)})`);
+          fixed = blocking.length;
+        }
+      }
+      reviewText = reviewSummary(review.findings, fixed, review.findings.length - fixed);
+    }
+
+    // WS3.3 — ensure the six-section outcome report exists; one repair round, then open fail-open.
+    let report = await loadReport(dir);
+    const bodyCheck = validatePrBody(report ?? '');
+    if (!bodyCheck.ok) {
+      const rep = await runAgent(dir, buildReportRepairPrompt(bodyCheck.missing, contract));
+      transcript += `\n--- Outcome report repair round ---\n${rep.transcript || `(exit ${rep.exitCode})`}`;
+      report = (await loadReport(dir)) ?? report;
+    }
+    // Keep HERMES_REPORT.md out of the committed diff — its content is folded into the PR body.
+    await rmFile(joinPath(dir, 'HERMES_REPORT.md')).catch(() => {});
+    if (await hasChanges(dir, await getHeadSha(dir))) {
+      await commitLocal(dir, `[hermes] outcome report follow-through (${jobId.slice(0, 8)})`);
+    }
+    const finalBodyCheck = validatePrBody(report ?? '');
+    const reportIncomplete = finalBodyCheck.ok ? undefined : finalBodyCheck.missing;
+
+    transcriptUri = await storeTranscript(jobId, transcript);
+    await pushBranch(dir, branch);
+    const headSha = await getHeadSha(dir);
+    const body = assemblePrBody({
+      jobId,
+      source: job.source,
+      prompt: job.prompt,
+      exitCode,
+      transcriptUri,
+      report,
+      reportIncomplete,
+      gate,
+      reviewText,
+    });
 
     const pr = await openPullRequest(octokit, job.repo, branch, job.baseBranch, title, body);
     if (job.type === 'fe') {

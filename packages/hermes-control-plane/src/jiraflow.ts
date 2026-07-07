@@ -9,7 +9,10 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import type { WorkerType } from './jobs.js';
 
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+// --- WS5 --- drop undefined attributes (e.g. absent jobId/checklist) so PutCommand won't throw.
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+  marshallOptions: { removeUndefinedValues: true },
+});
 const TABLE = process.env.JOBS_TABLE!;
 
 export type FlowStatus = 'awaiting_confirm' | 'running' | 'done';
@@ -21,6 +24,8 @@ export interface JiraFlow {
   type: WorkerType;
   plan: string;
   jobId?: string;
+  // --- WS5 --- Acceptance/defect checklist derived from the ticket, used for readiness gating.
+  checklist?: string[];
 }
 
 const flowKey = (issueKey: string) => `jiraflow:${issueKey.toUpperCase()}`;
@@ -28,8 +33,9 @@ const flowKey = (issueKey: string) => `jiraflow:${issueKey.toUpperCase()}`;
 export async function getFlow(issueKey: string): Promise<JiraFlow | undefined> {
   const r = await ddb.send(new GetCommand({ TableName: TABLE, Key: { jobId: flowKey(issueKey) } }));
   if (!r.Item) return undefined;
-  const { status, taskPrompt, repo, type, plan, flowJobId } = r.Item as Record<string, unknown>;
-  return { status, taskPrompt, repo, type, plan, jobId: flowJobId } as JiraFlow;
+  const { status, taskPrompt, repo, type, plan, flowJobId, checklist } = r.Item as Record<string, unknown>;
+  // --- WS5 --- surface the persisted checklist (may be absent on older flow rows).
+  return { status, taskPrompt, repo, type, plan, jobId: flowJobId, checklist } as JiraFlow;
 }
 
 export async function setFlow(issueKey: string, flow: JiraFlow): Promise<void> {
@@ -44,6 +50,7 @@ export async function setFlow(issueKey: string, flow: JiraFlow): Promise<void> {
         type: flow.type,
         plan: flow.plan,
         flowJobId: flow.jobId,
+        checklist: flow.checklist, // --- WS5 ---
         updatedAt: new Date().toISOString(),
         expiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 3600,
       },

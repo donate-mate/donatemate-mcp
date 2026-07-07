@@ -6,17 +6,23 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyBaseLogger } from 'fastify';
 import { createJob, getJob, updateJob, type HermesJob, type JobKind } from './jobs.js';
 import {
+  collectPrBodyAndComments,
   collectPrSnapshot,
+  commentOnPullRequest,
   ensurePullRequestLabels,
   latestSuccessfulWorkflowSignalContainingCommit,
   latestWorkflowSignalForCommit,
   listPullRequestChangedFiles,
   listRepositoryPaths,
+  rebasePullRequestBranch,
   signalFromPrCommentWebhook,
   signalFromReviewWebhook,
   verifyGitHubSignature,
   type WorkflowRunSummary,
 } from './github.js';
+// --- WS5 ---
+import { announceOverlaps, computeOverlaps } from './overlap.js';
+import { evaluateChecklist, evaluateEvidence, extractEvidenceIds, renderChecklist } from './readiness.js';
 import {
   clearActiveFix,
   appendHandledSignals,
@@ -50,6 +56,10 @@ const FRONTEND_DEPLOY_LABEL = 'deploy-dev';
 const BACKEND_DEPLOY_WORKFLOW_ID = process.env.BE_DEPLOY_WORKFLOW_ID || '208630294';
 const FRONTEND_BUILD_WORKFLOW_ID = process.env.QA_BUILD_WORKFLOW_ID || 'staging.yml';
 const QA_AUTOMATION_ENABLED = /^(1|true|yes)$/i.test(process.env.QA_AUTOMATION_ENABLED ?? 'false');
+// --- WS5 --- Control-plane orchestration gates (all default on; every path fails open).
+const OVERLAP_COORDINATION_ENABLED = !/^(0|false|no|off)$/i.test(process.env.OVERLAP_COORDINATION_ENABLED ?? 'true');
+const CHECKLIST_ENABLED = !/^(0|false|no|off)$/i.test(process.env.CHECKLIST_ENABLED ?? 'true');
+const EVIDENCE_CHECK_ENABLED = !/^(0|false|no|off)$/i.test(process.env.EVIDENCE_CHECK_ENABLED ?? 'true');
 
 function compact(value: string, max = 900): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, max);
@@ -124,7 +134,7 @@ async function recoveryWorkflowSignal(watch: PrWatch, mergeCommitSha: string, lo
   return branchSignal;
 }
 
-function buildFollowupPrompt(watch: PrWatch, signals: PrSignal[], feedbackSummary: string): string {
+function buildFollowupPrompt(watch: PrWatch, _signals: PrSignal[], feedbackSummary: string): string {
   return [
     `You are updating an existing Hermes PR branch, not starting a new task.`,
     '',
@@ -419,6 +429,150 @@ async function startPostMergeDeploymentVerification(watch: PrWatch, mergeCommitS
   await notifyThread(watch, `:rocket: Hermes queued post-merge deployment verification for ${watch.prUrl} (job ${job.jobId}).`);
 }
 
+// --- WS5.1 --- Warn on cross-PR file overlap. Posts once per overlapping peer (deduped via a
+// synthetic `overlap:<peer>` handled-signal id). Cheap and fully fail-open.
+async function coordinateOverlaps(watch: PrWatch, changedFiles: string[], log: FastifyBaseLogger): Promise<void> {
+  if (!OVERLAP_COORDINATION_ENABLED) return;
+  try {
+    const overlaps = await computeOverlaps(watch.repo, watch.prNumber, changedFiles);
+    const handled = new Set(watch.handledSignalIds ?? []);
+    const fresh = overlaps.filter((o) => !handled.has(`overlap:${o.prNumber}`));
+    if (!fresh.length) return;
+    const announced = await announceOverlaps(watch.repo, watch.prNumber, watch.prUrl, fresh);
+    if (announced.length) await appendHandledSignals(watch, announced);
+  } catch (err) {
+    log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 overlap coordination failed');
+  }
+}
+
+// --- WS5.3 --- Post the ticket checklist on the PR the first time its watch becomes active
+// (deduped via `checklist-posted`). Fail-open.
+async function postChecklistOnce(watch: PrWatch, log: FastifyBaseLogger): Promise<void> {
+  if (!CHECKLIST_ENABLED || !watch.issueKey) return;
+  if ((watch.handledSignalIds ?? []).includes('checklist-posted')) return;
+  try {
+    const flow = await getFlow(watch.issueKey);
+    const items = flow?.checklist ?? [];
+    if (!items.length) return;
+    const body = renderChecklist(items);
+    if (!body) return;
+    await commentOnPullRequest(
+      watch.repo,
+      watch.prNumber,
+      `${body}\n\nHermes will not move this PR to Ready for review until every item is checked \`- [x]\` or explicitly deferred to a follow-up ticket (DM-####).`
+    );
+    await appendHandledSignals(watch, ['checklist-posted']);
+  } catch (err) {
+    log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 checklist post failed');
+  }
+}
+
+// --- WS5.3 + WS5.4 --- Additive readiness gate consulted only when CI already passes. Returns
+// true (proceed to Ready) on satisfaction OR on any error (fail-open: never weaken CI behavior).
+async function readinessGatesSatisfied(watch: PrWatch, log: FastifyBaseLogger): Promise<boolean> {
+  if (!watch.issueKey || (!CHECKLIST_ENABLED && !EVIDENCE_CHECK_ENABLED)) return true;
+  try {
+    const [flow, issueContext, prText] = await Promise.all([
+      getFlow(watch.issueKey),
+      fetchIssueContext(watch.issueKey).catch(() => null),
+      collectPrBodyAndComments(watch.repo, watch.prNumber),
+    ]);
+
+    const missing: string[] = [];
+    if (CHECKLIST_ENABLED && flow?.checklist?.length) {
+      const res = evaluateChecklist(flow.checklist, prText);
+      if (!res.satisfied) missing.push(...res.missing.map((m) => `☐ ${m}`));
+    }
+    if (EVIDENCE_CHECK_ENABLED && issueContext) {
+      const ids = extractEvidenceIds(issueContext);
+      if (ids.length) {
+        const res = evaluateEvidence(ids, prText);
+        if (!res.satisfied) {
+          missing.push(
+            `Evidence/"Data repair" section referencing record ID(s) ${res.missing.join(', ')} with a before/after`
+          );
+        }
+      }
+    }
+
+    if (!missing.length) return true;
+
+    if (!(watch.handledSignalIds ?? []).includes('readiness-blocked')) {
+      await commentOnIssue(
+        watch.issueKey,
+        [
+          `🔒 Hermes is holding ${watch.prUrl} in code review: CI passes but the readiness checklist is not satisfied.`,
+          '',
+          'Outstanding:',
+          ...missing.map((m) => `- ${m}`),
+          '',
+          'Check each item off in the PR (`- [x]`), defer it to a follow-up ticket (DM-####), or add the required evidence, then re-run.',
+        ].join('\n')
+      );
+      await appendHandledSignals(watch, ['readiness-blocked']);
+    }
+    log.info({ repo: watch.repo, prNumber: watch.prNumber, missing }, 'WS5 readiness gate held PR in review');
+    return false;
+  } catch (err) {
+    log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 readiness gate errored; failing open');
+    return true;
+  }
+}
+
+// --- WS5.2 --- After a Hermes PR merges, auto-rebase overlapping open Hermes PRs and re-validate.
+async function rebaseOverlappingPrsAfterMerge(mergedWatch: PrWatch, log: FastifyBaseLogger): Promise<void> {
+  if (!OVERLAP_COORDINATION_ENABLED) return;
+  try {
+    const mergedFiles = await listPullRequestChangedFiles(mergedWatch.repo, mergedWatch.prNumber).catch(() => [] as string[]);
+    if (!mergedFiles.length) return;
+    const mergedSet = new Set(mergedFiles);
+    const peers = (await listActivePrWatches()).filter(
+      (w) => w.repo === mergedWatch.repo && w.prNumber !== mergedWatch.prNumber
+    );
+    const dedupeId = `rebased-after:${mergedWatch.prNumber}`;
+
+    for (const peer of peers) {
+      try {
+        if ((peer.handledSignalIds ?? []).includes(dedupeId)) continue;
+        const peerFiles = await listPullRequestChangedFiles(peer.repo, peer.prNumber).catch(() => [] as string[]);
+        const shared = peerFiles.filter((f) => mergedSet.has(f));
+        if (!shared.length) continue;
+
+        const rebase = await rebasePullRequestBranch(peer.repo, peer.headBranch, peer.baseBranch);
+        const rebaseNote = rebase.ok
+          ? `The branch was auto-rebased onto \`${peer.baseBranch}\` and re-validation was queued.`
+          : rebase.conflict
+            ? `Auto-rebase hit conflicts; a merge-conflict fix was queued to reconcile the branch.`
+            : `Auto-rebase could not be applied automatically; a re-validation was queued.`;
+
+        // Re-run the worker's gate/review on the (re)based branch via a synthetic merge-conflict
+        // signal. Its id doubles as the dedupe marker (startFollowupJob persists handled ids).
+        const signal: PrSignal = {
+          id: dedupeId,
+          kind: 'merge_conflict',
+          headSha: peer.headSha,
+          summary: `Overlapping Hermes PR #${mergedWatch.prNumber} merged; ${peer.baseBranch} advanced`,
+          details: [
+            `An overlapping Hermes PR (${mergedWatch.prUrl}) merged into ${peer.baseBranch} and changed files this PR also touches: ${shared.slice(0, 20).join(', ')}.`,
+            `Reconcile ${peer.headBranch} with ${peer.baseBranch}, resolve any conflicts, and re-run validation.`,
+          ].join(' '),
+          createdAt: new Date().toISOString(),
+        };
+        await startFollowupJob(peer, [signal]);
+        await commentOnPullRequest(
+          peer.repo,
+          peer.prNumber,
+          `♻️ Overlapping Hermes PR ${mergedWatch.prUrl} merged and touched files this PR also changes. ${rebaseNote}`
+        );
+      } catch (err) {
+        log.warn({ err, repo: peer.repo, prNumber: peer.prNumber, mergedPr: mergedWatch.prNumber }, 'WS5 per-peer rebase failed');
+      }
+    }
+  } catch (err) {
+    log.warn({ err, repo: mergedWatch.repo, prNumber: mergedWatch.prNumber }, 'WS5 post-merge overlap rebase failed');
+  }
+}
+
 export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, extraSignals: PrSignal[] = []): Promise<void> {
   let currentWatch = watch;
   const snapshot = await collectPrSnapshot(currentWatch, extraSignals);
@@ -431,6 +585,9 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
       recoveryRun = await recoveryWorkflowSignal(currentWatch, mergeCommitSha, log);
       if (!recoveryRun) return;
     }
+    // --- WS5.2 --- Rebase + re-validate overlapping open Hermes PRs before kicking off post-merge
+    // QA/deploy verification (which return). Fail-open — never blocks the merge flow.
+    await rebaseOverlappingPrsAfterMerge(currentWatch, log);
     if (currentWatch.type === 'fe') {
       await startPostMergeQa(
         { ...currentWatch, prUrl: snapshot.prUrl, headSha: mergeCommitSha, headBranch: snapshot.headBranch },
@@ -461,6 +618,16 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
   }
   currentWatch = recoveredWatch;
 
+  // --- WS5.1 + WS5.3 --- Active-watch coordination: warn on cross-PR file overlap and post the
+  // ticket checklist once. Both are best-effort and gated internally; they never short-circuit the
+  // existing signal handling below.
+  const activeWatch: PrWatch = { ...currentWatch, headSha: snapshot.headSha, headBranch: snapshot.headBranch, prUrl: snapshot.prUrl };
+  await postChecklistOnce(activeWatch, log);
+  if (OVERLAP_COORDINATION_ENABLED) {
+    const changedFiles = await listPullRequestChangedFiles(currentWatch.repo, currentWatch.prNumber).catch(() => [] as string[]);
+    await coordinateOverlaps(activeWatch, changedFiles, log);
+  }
+
   const actionable = dedupeNewSignals(currentWatch, snapshot.signals);
   if (actionable.length) {
     await startFollowupJob({ ...currentWatch, headSha: snapshot.headSha, headBranch: snapshot.headBranch, prUrl: snapshot.prUrl }, actionable);
@@ -477,6 +644,12 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
   }
 
   if (snapshot.ciState === 'passing') {
+    // --- WS5.3 + WS5.4 --- Additive readiness gate: even with green CI, hold the PR in code review
+    // until the ticket checklist is satisfied and any staging-record evidence is documented. Gate
+    // fails open, so a gate error can never keep a green PR out of review.
+    if (!(await readinessGatesSatisfied(currentWatch, log))) {
+      return;
+    }
     const marked = await markWatchReady(currentWatch, snapshot.headSha);
     if (marked) {
       if (currentWatch.issueKey) {

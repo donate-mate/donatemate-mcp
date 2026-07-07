@@ -129,6 +129,66 @@ export async function listPullRequestChangedFiles(repo: string, pullNumber: numb
   return files;
 }
 
+// --- WS5 --- Post a comment on a PR (best-effort; never throws into the caller). Uses the
+// issues.createComment endpoint since a PR is an issue for comment purposes.
+export async function commentOnPullRequest(repo: string, prNumber: number, body: string): Promise<boolean> {
+  try {
+    const { octokit } = await getInstallationAuth(repo);
+    const { owner, name } = splitRepo(repo);
+    await octokit.issues.createComment({ owner, repo: name, issue_number: prNumber, body });
+    return true;
+  } catch (err) {
+    console.warn(`[github] comment on ${repo}#${prNumber} failed: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+// --- WS5 --- Rebase a PR branch onto its base by merging the base branch into the head branch
+// (creates a merge commit that updates the PR branch). Best-effort; reports conflicts instead of
+// throwing so the caller can fall back to a follow-up job.
+export async function rebasePullRequestBranch(
+  repo: string,
+  headBranch: string,
+  baseBranch: string
+): Promise<{ ok: boolean; conflict?: boolean }> {
+  try {
+    const { octokit } = await getInstallationAuth(repo);
+    const { owner, name } = splitRepo(repo);
+    await octokit.repos.merge({
+      owner,
+      repo: name,
+      base: headBranch,
+      head: baseBranch,
+      commit_message: `Merge ${baseBranch} into ${headBranch} (Hermes auto-rebase after overlapping merge)`,
+    });
+    return { ok: true };
+  } catch (err: any) {
+    if (err?.status === 409) return { ok: false, conflict: true };
+    console.warn(`[github] rebase ${repo} ${headBranch}<-${baseBranch} failed: ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: false };
+  }
+}
+
+// --- WS5 --- Concatenate a PR's body and its issue comments into a single searchable blob for
+// readiness gates (checklist / evidence). Best-effort — returns '' on any failure.
+export async function collectPrBodyAndComments(repo: string, prNumber: number): Promise<string> {
+  try {
+    const { octokit } = await getInstallationAuth(repo);
+    const { owner, name } = splitRepo(repo);
+    const pr = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber }).then((r) => r.data);
+    const parts: string[] = [String(pr.body ?? '')];
+    for (let page = 1; page <= 5; page++) {
+      const res = await octokit.issues.listComments({ owner, repo: name, issue_number: prNumber, per_page: 100, page });
+      parts.push(...res.data.map((c) => String(c.body ?? '')));
+      if (res.data.length < 100) break;
+    }
+    return parts.filter(Boolean).join('\n\n');
+  } catch (err) {
+    console.warn(`[github] collect PR body/comments for ${repo}#${prNumber} failed: ${err instanceof Error ? err.message : String(err)}`);
+    return '';
+  }
+}
+
 export async function listRepositoryPaths(repo: string, ref: string): Promise<string[]> {
   const { octokit } = await getInstallationAuth(repo);
   const { owner, name } = splitRepo(repo);

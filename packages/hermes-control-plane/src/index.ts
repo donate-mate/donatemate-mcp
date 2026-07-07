@@ -12,7 +12,7 @@ import Fastify, { type FastifyRequest } from 'fastify';
 import { createJob, getJob, type WorkerType } from './jobs.js';
 import { verifySlackSignature, postSlackMessage, stripMention } from './slack.js';
 import { getSecretJson } from './secrets.js';
-import { converse, conversationToTask, planIssue } from './converse.js';
+import { converse, conversationToTask, planIssue, extractChecklist } from './converse.js';
 import { appendMessage, getConversation, resetConversation, setActivePointer, getActivePointer } from './convo.js';
 import { findIssueKey, fetchIssueContext, fetchIssue, type JiraIssue } from './jira.js';
 import { getFlow, setFlow, type JiraFlow } from './jiraflow.js';
@@ -22,6 +22,8 @@ import { captureQaScenarioForDone } from './qaCapture.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const PR_RECONCILE_SECONDS = Number(process.env.PR_RECONCILE_SECONDS ?? 300);
+// --- WS5 --- Ticket-checklist extraction gate (default on; fail-open).
+const CHECKLIST_ENABLED = !/^(0|false|no|off)$/i.test(process.env.CHECKLIST_ENABLED ?? 'true');
 
 // Default repo per worker type. FE = the Expo app; BE = the lambdas monorepo.
 const REPO_BY_TYPE: Record<WorkerType, string> = {
@@ -325,7 +327,9 @@ async function handleJiraAssigned(issueKey: string): Promise<void> {
 
   const plan = await planIssue(issue.context);
   const taskPrompt = `Implement Jira issue ${issueKey}: ${issue.summary}\n\nPlanned approach:\n${plan}`;
-  await setFlow(issueKey, { status: 'awaiting_confirm', taskPrompt, repo, type, plan });
+  // --- WS5 --- Derive a readiness checklist from the ticket (env-gated, fail-open).
+  const checklist = CHECKLIST_ENABLED ? await extractChecklist(issue.context).catch(() => [] as string[]) : undefined;
+  await setFlow(issueKey, { status: 'awaiting_confirm', taskPrompt, repo, type, plan, checklist });
 
   // Seed a FRESH per-ticket conversation so follow-up comments refine this plan (Slack-thread
   // parity). Reset first so a re-assignment re-plans from scratch, not on top of an old run.

@@ -501,6 +501,48 @@ export class KnowledgeStack extends cdk.Stack {
     });
 
     // ========================================================================
+    // Hermes PR Review Ingest (nightly)
+    // Ingests human code-review comments on Hermes-authored PRs (head branch
+    // prefix `hermes/`) into the knowledge base so future Hermes jobs can
+    // surface previously-flagged patterns. Additive; mirrors SyncHandler.
+    // ========================================================================
+
+    const hermesReviewIngestHandler = new lambdaNodejs.NodejsFunction(this, 'HermesReviewIngestHandler', {
+      ...lambdaDefaults,
+      functionName: `donatemate-${environment}-kb-hermes-review-ingest`,
+      entry: path.join(handlersPath, 'hermes-review-ingest', 'src', 'index.ts'),
+      handler: 'handler',
+      timeout: cdk.Duration.minutes(10),
+      memorySize: 1024,
+      description: 'Knowledge Base Hermes PR review ingest - nightly ingest of review comments on hermes/ PRs',
+      environment: {
+        ...lambdaDefaults.environment,
+        GITHUB_SECRET_ARN: githubSecret.secretArn,
+        DATABASE_SECRET_ARN: dbSecretAttachment.secretArn,
+      },
+    });
+
+    // Grant permissions (read GitHub token + DB credentials)
+    githubSecret.grantRead(hermesReviewIngestHandler);
+    dbSecretAttachment.grantRead(hermesReviewIngestHandler);
+
+    // Grant Bedrock access for comment embeddings
+    hermesReviewIngestHandler.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['bedrock:InvokeModel'],
+        resources: ['arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0'],
+      })
+    );
+
+    // Schedule nightly at 07:00 UTC
+    new events.Rule(this, 'HermesReviewIngestSchedule', {
+      ruleName: `donatemate-${environment}-kb-hermes-review-ingest`,
+      schedule: events.Schedule.cron({ minute: '0', hour: '7' }),
+      targets: [new eventsTargets.LambdaFunction(hermesReviewIngestHandler)],
+    });
+
+    // ========================================================================
     // Admin Lambda (for managing integrations)
     // ========================================================================
 

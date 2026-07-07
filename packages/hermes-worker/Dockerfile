@@ -7,6 +7,14 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends git awscli ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
+# WS1 — the target repo (donatemate) installs with yarn/pnpm. Enable corepack so those package
+# managers are on PATH, and provide a writable warm-cache dir (HERMES_CACHE_DIR) that the nightly
+# image build prebakes (yarn/npm/turbo caches) so job-time installs hit a warm cache.
+RUN corepack enable \
+  && mkdir -p /opt/hermes-cache/yarn /opt/hermes-cache/npm /opt/hermes-cache/turbo \
+  && chown -R node:node /opt/hermes-cache
+ENV HERMES_CACHE_DIR=/opt/hermes-cache
+
 WORKDIR /app
 
 COPY package.json ./

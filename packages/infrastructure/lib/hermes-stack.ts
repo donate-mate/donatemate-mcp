@@ -26,6 +26,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as appscaling from 'aws-cdk-lib/aws-applicationautoscaling';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import { Construct } from 'constructs';
 
 export type Environment = 'staging' | 'production';
@@ -157,6 +158,11 @@ export class HermesStack extends cdk.Stack {
         QA_BUILD_WORKFLOW_ID: 'staging.yml',
         QA_AUTOMATION_ENABLED: 'false',
         BE_DEPLOY_WORKFLOW_ID: '208630294', // donate-mate/donatemate "Deploy to Staging"
+        // --- WS5 control-plane orchestration flags (env-tunable, safe fallbacks) ---
+        OVERLAP_COORDINATION_ENABLED: 'true', // WS5.1/5.2 cross-PR overlap + merge re-review
+        CHECKLIST_ENABLED: 'true', // WS5.3 ticket checklist + readiness gate
+        EVIDENCE_CHECK_ENABLED: 'true', // WS5.4 evidence-ID verification gate
+        HERMES_METRICS_NAMESPACE: 'DonateMate/Hermes',
       },
     });
 
@@ -252,6 +258,15 @@ export class HermesStack extends cdk.Stack {
         MCP_ENDPOINT: 'https://mcp.donate-mate.com/mcp',
         // Hard timeout is the budget guardrail for the Codex run.
         JOB_TIMEOUT_SECONDS: '2400',
+        // --- Hermes PR-process enhancements (WS1–WS4), all env-tunable with safe fallbacks ---
+        AGENT_REASONING_EFFORT: 'medium', // WS3.1 Codex model_reasoning_effort for implementation jobs
+        PREOPEN_REVIEW_ENABLED: 'true', // WS4 pre-open adversarial review stage
+        PREOPEN_REVIEW_EFFORT: 'high', // WS4 review runs at high reasoning effort
+        GATE_MAX_RETRIES: '3', // WS2 pre-commit gate repair rounds before fail-open
+        KB_INJECTION_ENABLED: 'true', // WS6 inject "previously flagged patterns" from the KB
+        WORKSPACE_INSTALL_TIMEOUT_SECONDS: '600', // WS1 dependency-install budget
+        HERMES_CACHE_DIR: '/opt/hermes-cache', // WS1 warm yarn/turbo cache baked by the nightly image
+        HERMES_METRICS_NAMESPACE: 'DonateMate/Hermes', // WS2 CloudWatch metrics namespace
         QA_BUILD_WORKFLOW_ID: 'staging.yml',
         QA_EXECUTION_WORKFLOW_ID: 'hermes-qa.yml',
         QA_AUTOMATION_ENABLED: 'false',
@@ -296,6 +311,16 @@ export class HermesStack extends cdk.Stack {
     secJiraBot.grantRead(workerTaskDef.taskRole);
     secSlack.grantRead(workerTaskDef.taskRole);
     secDmMcp.grantRead(workerTaskDef.taskRole);
+
+    // WS2 — publish Hermes PR-pipeline metrics (DonateMate/Hermes namespace). PutMetricData has no
+    // resource-level scoping, so it is granted broadly (constrained to the namespace at call time).
+    const putMetricStatement = new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['cloudwatch:PutMetricData'],
+      resources: ['*'],
+    });
+    workerTaskDef.taskRole.addToPrincipalPolicy(putMetricStatement);
+    cpTaskDef.taskRole.addToPrincipalPolicy(putMetricStatement);
 
     // Backend defect/alert jobs need read-only production/staging observability. The agent uses
     // AWS CLI evidence to distinguish false positives, noisy alarms, and real source defects.
@@ -405,6 +430,63 @@ export class HermesStack extends cdk.Stack {
         { lower: 5, change: +2 },
       ],
     });
+
+    // ========================================================================
+    // CloudWatch dashboard for the PR-process enhancement metrics (deliverable #6).
+    // Baselines (measure one week of staging against these): avg ~2.4 CI fix cycles/PR (worst 6),
+    // ~3 blocking human review findings/PR, 0% locally-executed tests.
+    // ========================================================================
+    const dashboard = new cloudwatch.Dashboard(this, 'HermesDashboard', {
+      dashboardName: `donatemate-${environment}-hermes`,
+    });
+    const hMetric = (metricName: string, statistic: string, label: string) =>
+      new cloudwatch.Metric({
+        namespace: 'DonateMate/Hermes',
+        metricName,
+        dimensionsMap: { Environment: environment },
+        statistic,
+        period: cdk.Duration.hours(6),
+        label,
+      });
+    const baseline = (value: number, label: string): cloudwatch.HorizontalAnnotation => ({
+      value,
+      label,
+      color: cloudwatch.Color.RED,
+    });
+    dashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'WS2 · Pre-commit gate cycles per PR (baseline avg 2.4 CI fix cycles)',
+        left: [hMetric('HermesGateCycles', 'Average', 'gate cycles (avg)'), hMetric('HermesGateCycles', 'Maximum', 'gate cycles (max)')],
+        leftAnnotations: [baseline(2.4, 'baseline avg CI fix cycles')],
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'Post-open CI/review auto-repair attempts (baseline worst 6)',
+        left: [hMetric('HermesCiFixAttempts', 'Sum', 'ci fix attempts')],
+        leftAnnotations: [baseline(6, 'baseline worst-case cycles')],
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'WS4 · Pre-open review findings (baseline ~3 blocking human findings/PR)',
+        left: [
+          hMetric('HermesPreopenFindings', 'Average', 'findings (avg)'),
+          hMetric('HermesPreopenBlocking', 'Average', 'blocking (avg)'),
+        ],
+        leftAnnotations: [baseline(3, 'baseline blocking human findings/PR')],
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: 'WS1 · Toolchain install time + gate-failures shipped (fail-open count)',
+        left: [hMetric('HermesInstallSeconds', 'Average', 'install seconds (avg)')],
+        right: [hMetric('HermesGateFailShipped', 'Sum', 'gate-failures shipped')],
+        width: 12,
+        height: 6,
+      })
+    );
+    new cdk.CfnOutput(this, 'HermesDashboardName', { value: dashboard.dashboardName });
 
     // ========================================================================
     // SSM exports + outputs
