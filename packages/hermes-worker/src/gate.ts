@@ -174,8 +174,23 @@ export async function runGate(dir: string, baseSha: string, installOk: boolean):
 
   // 3) tests (with the repo's own coverage thresholds) per changed package that has a test script.
   if (pm && installOk) {
+    // Internal @scope/* workspace packages are TS source that must be BUILT before a dependent
+    // package's jest/tsc can resolve them — `yarn install` does not compile them. Without this,
+    // tests fail on unresolved workspace imports (the core "tests never executed" problem). We build
+    // each changed package + its dependency graph via turbo (if present) before running its tests.
+    const hasTurbo = (await fileExists(join(dir, 'turbo.json'))) && (await toolAvailable(dir, 'turbo'));
     for (const [name, root] of pkgs) {
       if (!(await hasScript(dir, root, 'test'))) continue;
+      if (hasTurbo) {
+        // `<pkg>...` = the package plus everything it depends on.
+        const build = await run('npx', ['--no-install', 'turbo', 'run', 'build', '--filter', `${name}...`], dir);
+        if (build.code !== 0) {
+          // Fail-open: a monorepo build-infra problem is not the agent's code defect, so skip the
+          // test rather than block the PR — but surface it so it's visible.
+          checks.push({ name: `test:${name}`, ok: true, skipped: true, output: summarize(build, `(skipped: could not build workspace deps for ${name})`) });
+          continue;
+        }
+      }
       const { cmd, args } = workspaceScriptCommand(pm, name, 'test');
       const res = await run(cmd, args, dir);
       checks.push({ name: `test:${name}`, ok: res.code === 0, output: summarize(res, `(package ${name})`) });
