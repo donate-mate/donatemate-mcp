@@ -1413,6 +1413,22 @@ const POLL_INTERVAL_MS = 300; // Poll every 300ms (was 500ms)
 // responses to S3 (via the VM instance role) and returns a small pointer { __s3Key }; we fetch
 // the full payload from S3 here.
 const FIGMA_RESPONSE_BUCKET = process.env.FIGMA_RESPONSE_BUCKET || 'donatemate-staging-figma-responses';
+
+// Async submit→poll for heavy plugin tools that can exceed API Gateway's hard ~29s ceiling.
+// For these tools, if the plugin hasn't responded within FIGMA_ASYNC_SUBMIT_WAIT_MS we return a
+// { status:'processing', jobId } handle instead of holding the request open (which both hit the
+// timeout AND saturated Lambda concurrency). The result still lands in the connections table via
+// the `message` Lambda whenever the plugin finishes, so a later poll (same tool + jobId) retrieves
+// it — the industry-standard asynchronous request-reply pattern. Small/medium targets still return
+// inline within the fast-path window, so callers only poll for genuinely long exports.
+const FIGMA_ASYNC_TOOLS = new Set(
+  (process.env.FIGMA_ASYNC_TOOLS ?? 'dm_figma_review,dm_figma_validate_design')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+const FIGMA_ASYNC_SUBMIT_WAIT_MS = Number(process.env.FIGMA_ASYNC_SUBMIT_WAIT_MS ?? 18000);
+const FIGMA_ASYNC_JOB_TTL_SECONDS = Number(process.env.FIGMA_ASYNC_JOB_TTL_SECONDS ?? 900);
 const s3Client = new S3Client({});
 
 async function resolveRelayResult(result: unknown): Promise<unknown> {
@@ -1421,6 +1437,31 @@ async function resolveRelayResult(result: unknown): Promise<unknown> {
   const obj = await s3Client.send(new GetObjectCommand({ Bucket: FIGMA_RESPONSE_BUCKET, Key: key }));
   const body = await obj.Body!.transformToString();
   return JSON.parse(body);
+}
+
+// Read a relay job's current state from the connections table. Returns null if the item is gone
+// (expired). `done` distinguishes completed/error from still-pending.
+async function readRelayJob(
+  tableName: string,
+  requestId: string
+): Promise<{ done: boolean; result?: unknown; error?: string } | null> {
+  const result = await dynamoClient.send(
+    new GetItemCommand({ TableName: tableName, Key: { connectionId: { S: `http-request:${requestId}` } } })
+  );
+  if (!result.Item) return null;
+  const status = result.Item.status?.S;
+  if (status === 'completed') {
+    const responseData = result.Item.response?.S;
+    return { done: true, result: responseData ? await resolveRelayResult(JSON.parse(responseData)) : undefined };
+  }
+  if (status === 'error') return { done: true, error: result.Item.error?.S || 'Relay error' };
+  return { done: false };
+}
+
+async function deleteRelayJob(tableName: string, requestId: string): Promise<void> {
+  await dynamoClient
+    .send(new DeleteItemCommand({ TableName: tableName, Key: { connectionId: { S: `http-request:${requestId}` } } }))
+    .catch(() => {});
 }
 
 async function sendToRelayAndWait(
@@ -1435,6 +1476,29 @@ async function sendToRelayAndWait(
     throw new Error('Relay not configured');
   }
 
+  const isAsyncTool = FIGMA_ASYNC_TOOLS.has(tool);
+  // A control-only `jobId` arg (poll mode) must never be forwarded to the plugin.
+  const { jobId: pollJobId, ...pluginArgs } = (args ?? {}) as Record<string, unknown> & { jobId?: string };
+
+  // ---- POLL MODE: caller is retrieving the result of a previously-submitted async job ----
+  if (typeof pollJobId === 'string' && pollJobId.length > 0) {
+    const job = await readRelayJob(tableName, pollJobId);
+    if (!job) {
+      throw new Error(`Figma job ${pollJobId} not found or expired. Re-run ${tool} to start a new one.`);
+    }
+    if (!job.done) {
+      return {
+        status: 'processing',
+        jobId: pollJobId,
+        retryAfterMs: 3000,
+        message: `Still processing. Call ${tool} again with { "jobId": "${pollJobId}" } to retrieve the result.`,
+      };
+    }
+    await deleteRelayJob(tableName, pollJobId);
+    if (job.error) throw new Error(job.error);
+    return job.result;
+  }
+
   const relayConnectionId = await getFigmaRelayConnectionId();
   if (!relayConnectionId) {
     throw new Error(
@@ -1442,13 +1506,15 @@ async function sendToRelayAndWait(
     );
   }
 
-  // Use tool-specific timeout or default
-  const effectiveTimeout = timeoutMs ?? TOOL_TIMEOUTS[tool] ?? DEFAULT_RELAY_TIMEOUT;
+  // Fast-path wait: async tools cap at FIGMA_ASYNC_SUBMIT_WAIT_MS then hand off a job handle; other
+  // tools keep their existing synchronous tool-specific timeout.
+  const submitWait = isAsyncTool ? FIGMA_ASYNC_SUBMIT_WAIT_MS : timeoutMs ?? TOOL_TIMEOUTS[tool] ?? DEFAULT_RELAY_TIMEOUT;
+  const jobTtlSeconds = isAsyncTool ? FIGMA_ASYNC_JOB_TTL_SECONDS : 120;
   const requestId = `http_${++relayRequestId}_${Date.now()}`;
 
-  console.info('[relay] sending request', { tool, requestId, timeoutMs: effectiveTimeout });
+  console.info('[relay] sending request', { tool, requestId, timeoutMs: submitWait, async: isAsyncTool });
 
-  // Store pending request
+  // Store pending request (longer TTL for async so the result survives until the caller polls)
   await dynamoClient.send(
     new PutItemCommand({
       TableName: tableName,
@@ -1456,7 +1522,7 @@ async function sendToRelayAndWait(
         connectionId: { S: `http-request:${requestId}` },
         status: { S: 'pending' },
         createdAt: { S: new Date().toISOString() },
-        ttl: { N: String(Math.floor(Date.now() / 1000) + 120) },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + jobTtlSeconds) },
       },
     })
   );
@@ -1473,7 +1539,7 @@ async function sendToRelayAndWait(
             type: 'FIGMA_TOOL_CALL',
             relayRequestId: requestId,
             tool,
-            args,
+            args: pluginArgs,
             httpRequest: true, // Flag so relay knows to store response
             // Where the relay should upload an oversized (>~96KB) response instead of sending
             // it inline over the size-limited WebSocket frame.
@@ -1484,79 +1550,50 @@ async function sendToRelayAndWait(
       })
     );
   } catch (sendError) {
-    // Clean up pending request on send failure
-    await dynamoClient.send(
-      new DeleteItemCommand({
-        TableName: tableName,
-        Key: { connectionId: { S: `http-request:${requestId}` } },
-      })
-    ).catch(() => {});
+    await deleteRelayJob(tableName, requestId);
     console.error('[relay] send failed', { tool, requestId, error: sendError instanceof Error ? sendError.message : 'Unknown' });
     throw new Error('Failed to send request to Figma relay - connection may be stale');
   }
 
-  // Poll for response with adaptive backoff
+  // Poll for response
   const startTime = Date.now();
   let pollCount = 0;
 
-  while (Date.now() - startTime < effectiveTimeout) {
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+  while (Date.now() - startTime < submitWait) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     pollCount++;
 
-    const result = await dynamoClient.send(
-      new GetItemCommand({
-        TableName: tableName,
-        Key: { connectionId: { S: `http-request:${requestId}` } },
-      })
-    );
-
-    if (result.Item?.status?.S === 'completed') {
+    const job = await readRelayJob(tableName, requestId);
+    if (job?.done) {
       const duration = Date.now() - startTime;
       console.info('[relay] response received', { tool, requestId, duration, pollCount });
-
-      // Clean up
-      await dynamoClient.send(
-        new DeleteItemCommand({
-          TableName: tableName,
-          Key: { connectionId: { S: `http-request:${requestId}` } },
-        })
-      ).catch(() => {});
-
-      const responseData = result.Item.response?.S;
-      if (responseData) {
-        return await resolveRelayResult(JSON.parse(responseData));
-      }
-      throw new Error('Empty response from relay');
-    }
-
-    if (result.Item?.status?.S === 'error') {
-      const duration = Date.now() - startTime;
-      const errorMessage = result.Item.error?.S || 'Relay error';
-      console.error('[relay] error response', { tool, requestId, duration, error: errorMessage });
-
-      await dynamoClient.send(
-        new DeleteItemCommand({
-          TableName: tableName,
-          Key: { connectionId: { S: `http-request:${requestId}` } },
-        })
-      ).catch(() => {});
-
-      throw new Error(errorMessage);
+      await deleteRelayJob(tableName, requestId);
+      if (job.error) throw new Error(job.error);
+      return job.result;
     }
   }
 
-  // Timeout - clean up and throw
   const duration = Date.now() - startTime;
-  console.error('[relay] timeout', { tool, requestId, duration, pollCount, timeoutMs: effectiveTimeout });
 
-  await dynamoClient.send(
-    new DeleteItemCommand({
-      TableName: tableName,
-      Key: { connectionId: { S: `http-request:${requestId}` } },
-    })
-  ).catch(() => {});
+  // ASYNC hand-off: return a job handle instead of erroring. We intentionally do NOT delete the
+  // pending item — the `message` Lambda UpdateItem-upserts the completed result into this same key
+  // when the plugin finishes, and the caller retrieves it by polling with the jobId.
+  if (isAsyncTool) {
+    console.info('[relay] async hand-off', { tool, requestId, duration, pollCount });
+    return {
+      status: 'processing',
+      jobId: requestId,
+      retryAfterMs: 3000,
+      message: `${tool} is working on a large target and exceeded the ${Math.round(
+        submitWait / 1000
+      )}s fast-path. Call ${tool} again with { "jobId": "${requestId}" } and no other arguments to fetch the result; repeat every few seconds until it returns.`,
+    };
+  }
 
-  throw new Error(`Timeout waiting for Figma plugin response (${Math.round(effectiveTimeout / 1000)}s). Tool: ${tool}`);
+  // Synchronous tools: timeout is a hard failure.
+  console.error('[relay] timeout', { tool, requestId, duration, pollCount, timeoutMs: submitWait });
+  await deleteRelayJob(tableName, requestId);
+  throw new Error(`Timeout waiting for Figma plugin response (${Math.round(submitWait / 1000)}s). Tool: ${tool}`);
 }
 
 // Plugin-based tools (routed through relay)
@@ -1910,7 +1947,8 @@ async function handleToolsList(): Promise<unknown> {
     },
     {
       name: 'dm_figma_validate_design',
-      description: 'CALL AFTER CHANGES: Verify design tokens and component patterns are correct.',
+      description:
+        'CALL AFTER CHANGES: Verify design tokens and component patterns are correct. For large targets (whole page / many nodes) this may return {"status":"processing","jobId":"..."} — in that case call this tool again with ONLY {"jobId":"<that id>"} every few seconds until it returns the validation result.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1918,6 +1956,7 @@ async function handleToolsList(): Promise<unknown> {
           checkTokens: { type: 'boolean', description: 'Verify design tokens' },
           checkComponents: { type: 'boolean', description: 'Verify component usage' },
           componentPatterns: { type: 'array', items: { type: 'string' }, description: 'Expected patterns' },
+          jobId: { type: 'string', description: 'Poll: pass the jobId from a prior {"status":"processing"} response (with no other args) to retrieve the result.' },
         },
       },
     },
@@ -1962,12 +2001,14 @@ async function handleToolsList(): Promise<unknown> {
     },
     {
       name: 'dm_figma_review',
-      description: 'Export a node as PNG and get visual description. Use to see what you created and iterate.',
+      description:
+        'Export a node as PNG and get visual description. Use to see what you created and iterate. For large/complex nodes this may return {"status":"processing","jobId":"..."} — in that case call this tool again with ONLY {"jobId":"<that id>"} every few seconds until it returns the export result.',
       inputSchema: {
         type: 'object',
         properties: {
           nodeId: { type: 'string', description: 'Node ID to export (or uses current selection)' },
           scale: { type: 'number', description: 'Export scale (default: 2)' },
+          jobId: { type: 'string', description: 'Poll: pass the jobId from a prior {"status":"processing"} response (with no other args) to retrieve the result.' },
         },
       },
     },
