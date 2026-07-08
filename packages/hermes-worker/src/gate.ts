@@ -47,7 +47,10 @@ interface Cmd {
 
 function run(cmd: string, args: string[], cwd: string): Promise<Cmd> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, env: { ...process.env, CI: 'true' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    // NODE_ENV=test (not the image's 'production', which would skip dev tooling/behavior); HUSKY=0 so
+    // no repo hook fires while the gate runs the repo's own prettier/eslint/test scripts.
+    const env = { ...process.env, CI: 'true', HUSKY: '0', NODE_ENV: process.env.NODE_ENV === 'production' ? 'test' : process.env.NODE_ENV ?? 'test' };
+    const child = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     let timedOut = false;
     const timer = setTimeout(() => {

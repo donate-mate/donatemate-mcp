@@ -78,6 +78,10 @@ export async function cloneRepo(token: string, repo: string, baseBranch: string,
       });
       await exec('git', ['-C', dir, 'config', 'user.name', 'DonateMate Hermes']);
       await exec('git', ['-C', dir, 'config', 'user.email', 'hermes@donate-mate.com']);
+      // Disable repo git hooks (husky) — the harness owns validation via the WS2 gate + post-open CI.
+      // Leaving hooks live lets a repo pre-commit/pre-push hook block the harness's controlled
+      // commit/push (observed failing BE jobs after WS1 started installing husky).
+      await exec('git', ['-C', dir, 'config', 'core.hooksPath', '/dev/null']);
       return;
     } catch (err) {
       lastErr = err;

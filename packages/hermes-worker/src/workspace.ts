@@ -162,7 +162,14 @@ export async function installWorkspace(dir: string): Promise<InstallResult> {
   if (!pm) {
     return { ok: true, skipped: true, log: 'No JS/TS lockfile detected; skipping install.', durationMs: 0 };
   }
-  const env = cacheEnv();
+  // CRITICAL install env:
+  //  - NODE_ENV=development: the worker image sets NODE_ENV=production for its OWN runtime, but that
+  //    leaks into the target-repo install and makes yarn/npm SKIP devDependencies — exactly the tools
+  //    WS1/WS2 need (prisma, jest, ts-jest, eslint, prettier). Force dev so devDeps install.
+  //  - HUSKY=0: the target repo's `prepare`/postinstall runs `husky install`, which fails (exit 127)
+  //    and, worse, wires git hooks that then interfere with the harness's controlled commit/push.
+  //    The harness owns validation via the WS2 gate + post-open CI, so repo hooks must stay disabled.
+  const env = { ...cacheEnv(), NODE_ENV: 'development', HUSKY: '0', npm_config_production: 'false' };
   const { cmd, args } = installCommand(pm);
   console.log(`[workspace] installing with ${cmd} ${args.join(' ')} (pm=${pm})`);
   const install = await run(cmd, args, dir, env);
