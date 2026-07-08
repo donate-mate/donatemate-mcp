@@ -42,23 +42,35 @@ export function evaluateChecklist(items: string[], text: string): { satisfied: b
   return { satisfied: missing.length === 0, missing };
 }
 
-// A staging record ID must be EXPLICITLY tied to a donation/request/transaction/record/payment —
-// a bare UUID is NOT enough. Hermes's own jobIds, transcript URIs (s3://.../jobs/<uuid>/...), and
-// session UUIDs pervade the Jira ticket context (Hermes posts them as comments), so matching any
-// UUIDv4 mistook those for staging records and held EVERY PR in review forever.
+// A staging record ID must be BOTH (a) explicitly tied to a donation/request/transaction/record/etc.
+// AND (b) actually ID-SHAPED. Two failure modes seen live otherwise: bare UUIDs (Hermes's own jobIds
+// and transcript URIs pervade ticket comments), and short word+digit tokens from UI text like
+// "request tab2" / "payment page3". Both wrongly held PRs in review. So we require the captured token
+// to look like a real identifier, not any word containing a digit.
 const EVIDENCE_ID_PATTERN =
-  /\b(?:donation|request|transaction|txn|payment|receipt|record)s?\b[\s#:_-]*(?:id[\s#:=_-]*)?([A-Za-z0-9][A-Za-z0-9-]{3,})/gi;
+  /\b(?:donation|request|transaction|txn|payment|receipt|record)s?\b[\s#:_-]*(?:\b(?:id|record|number|no|ref)s?\b[\s#:=_-]*)*([A-Za-z0-9][A-Za-z0-9_-]{3,})/gi;
 
-// --- WS5 --- Extract staging record IDs the ticket explicitly names (labeled donation/request/etc.).
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True only for tokens that genuinely look like a record identifier (not "tab2", "page3", "flow"). */
+function looksLikeRecordId(id: string): boolean {
+  if (/^DM-\d+$/i.test(id)) return false; // Jira issue key, not a staging record
+  const digits = (id.match(/\d/g) ?? []).length;
+  if (UUID_RE.test(id)) return true; // UUID
+  if (/^\d{5,}$/.test(id)) return true; // long numeric id (e.g. request #482193)
+  if (/[-_]/.test(id) && digits >= 2) return true; // delimited alphanumeric id (e.g. TXN-98442, d_10023)
+  if (id.length >= 8 && digits >= 3) return true; // long mixed-alphanumeric id
+  return false;
+}
+
+// --- WS5 --- Extract staging record IDs the ticket explicitly names AND that are ID-shaped.
 export function extractEvidenceIds(issueContext: string): string[] {
   const found = new Set<string>();
   EVIDENCE_ID_PATTERN.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = EVIDENCE_ID_PATTERN.exec(issueContext)) !== null) {
     const id = (m[1] ?? '').trim();
-    // Require a digit (real identifiers have one; drops trailing words like "donation flow"), and
-    // exclude Jira issue keys (DM-####) which are not staging records.
-    if (id.length >= 4 && /\d/.test(id) && !/^DM-\d+$/i.test(id)) found.add(id);
+    if (looksLikeRecordId(id)) found.add(id);
   }
   return [...found];
 }
