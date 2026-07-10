@@ -303,6 +303,37 @@ export async function markWatchBlocked(watch: PrWatch, reason: string): Promise<
   }
 }
 
+/**
+ * Reset a blocked watch back to active — clears the block reason, active fix, handled-signal dedupe,
+ * and the fix-attempt budget — so the reconcile loop resumes automated fixes. Used when a human
+ * advances a blocked PR (auto-unblock) or on an explicit revive. Returns the updated watch, or null.
+ */
+export async function unblockWatch(watch: PrWatch, headSha: string): Promise<PrWatch | null> {
+  try {
+    const res = await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        UpdateExpression:
+          'SET #s = :watching, fixAttemptCount = :zero, headSha = :headSha, updatedAt = :updatedAt REMOVE blockReason, activeFixJobId, handledSignalIds',
+        ConditionExpression: '#s <> :done',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':watching': 'prwatch:watching',
+          ':zero': 0,
+          ':headSha': headSha,
+          ':updatedAt': new Date().toISOString(),
+          ':done': 'prwatch:done',
+        },
+        ReturnValues: 'ALL_NEW',
+      })
+    );
+    return (res.Attributes as PrWatch) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function markWatchDone(watch: PrWatch, jiraState: Extract<JiraState, 'done'> = 'done'): Promise<boolean> {
   try {
     await ddb.send(

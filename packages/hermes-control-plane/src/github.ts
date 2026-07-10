@@ -117,6 +117,32 @@ export async function ensurePullRequestLabels(repo: string, pullNumber: number, 
   await octokit.issues.addLabels({ owner, repo: name, issue_number: pullNumber, labels: uniqueLabels });
 }
 
+// The git identity the worker commits under (packages/hermes-worker cloneRepo sets user.email).
+const HERMES_GIT_EMAIL = (process.env.HERMES_GIT_EMAIL || 'hermes@donate-mate.com').toLowerCase();
+
+/**
+ * True when the given commit was authored/committed by Hermes itself (vs. a human push). Used to
+ * auto-unblock a PR only when a HUMAN advances it. Best-effort: on any error returns true (assume
+ * Hermes) so we never mistakenly unblock/loop on our own commits.
+ */
+export async function isHermesCommit(repo: string, sha: string): Promise<boolean> {
+  try {
+    const { octokit } = await getInstallationAuth(repo);
+    const { owner, name } = splitRepo(repo);
+    const { data } = await octokit.repos.getCommit({ owner, repo: name, ref: sha });
+    const authorEmail = (data.commit?.author?.email || '').toLowerCase();
+    const committerEmail = (data.commit?.committer?.email || '').toLowerCase();
+    const authorLogin = (data.author?.login || '').toLowerCase();
+    return (
+      authorEmail === HERMES_GIT_EMAIL ||
+      committerEmail === HERMES_GIT_EMAIL ||
+      authorLogin.includes('hermes') // the GitHub App bot identity, e.g. donatemate-hermes[bot]
+    );
+  } catch {
+    return true;
+  }
+}
+
 export async function listPullRequestChangedFiles(repo: string, pullNumber: number): Promise<string[]> {
   const { octokit } = await getInstallationAuth(repo);
   const { owner, name } = splitRepo(repo);

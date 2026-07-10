@@ -31,6 +31,30 @@ export interface JiraIssue {
   context: string; // human-readable block (summary + type + description + recent comments)
 }
 
+/**
+ * The accountId of the issue's current assignee. Distinguishes:
+ *   - `undefined` → could NOT determine (unconfigured / Jira unreachable) → callers should fail open.
+ *   - `null`      → fetched successfully and the issue is genuinely UNASSIGNED.
+ *   - string      → the assignee's accountId.
+ * Used to stop making follow-up commits once a ticket is unassigned from Hermes.
+ */
+export async function getIssueAssigneeAccountId(issueKey: string): Promise<string | null | undefined> {
+  if (!SECRET_JIRA) return undefined;
+  try {
+    const { host, email, token } = await getSecretJson(SECRET_JIRA);
+    if (!host || !email || !token) return undefined;
+    const auth = Buffer.from(`${email}:${token}`).toString('base64');
+    const res = await fetch(`${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=assignee`, {
+      headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+    });
+    if (!res.ok) return undefined;
+    const d = (await res.json()) as any;
+    return (d.fields?.assignee?.accountId as string | undefined) ?? null;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Fetch an issue's structured fields plus a readable context block (used for routing + planning). */
 export async function fetchIssue(issueKey: string): Promise<JiraIssue | null> {
   if (!SECRET_JIRA) return null;

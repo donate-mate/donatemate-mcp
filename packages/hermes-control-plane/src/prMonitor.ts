@@ -10,6 +10,7 @@ import {
   collectPrSnapshot,
   commentOnPullRequest,
   ensurePullRequestLabels,
+  isHermesCommit,
   latestSuccessfulWorkflowSignalContainingCommit,
   latestWorkflowSignalForCommit,
   listPullRequestChangedFiles,
@@ -34,15 +35,16 @@ import {
   markWatchReady,
   rememberGitHubDelivery,
   tryStartFix,
+  unblockWatch,
   updateWatchHead,
   type JiraState,
   type PrSignal,
   type PrWatch,
 } from './prWatch.js';
-import { commentOnIssue, transitionIssue, COLUMN } from './jiraBot.js';
+import { commentOnIssue, transitionIssue, COLUMN, getBotAccountId } from './jiraBot.js';
 import { postSlackMessage } from './slack.js';
 import { getFlow, setFlow } from './jiraflow.js';
-import { fetchIssueContext } from './jira.js';
+import { fetchIssueContext, getIssueAssigneeAccountId } from './jira.js';
 import { loadQaScenarioCatalog } from './qaConfluence.js';
 import { buildQaProofPlan, buildQaReadinessPlan, summarizeQaPlan, type QaProofPlan } from './qaPlanner.js';
 
@@ -60,6 +62,10 @@ const QA_AUTOMATION_ENABLED = /^(1|true|yes)$/i.test(process.env.QA_AUTOMATION_E
 const OVERLAP_COORDINATION_ENABLED = !/^(0|false|no|off)$/i.test(process.env.OVERLAP_COORDINATION_ENABLED ?? 'true');
 const CHECKLIST_ENABLED = !/^(0|false|no|off)$/i.test(process.env.CHECKLIST_ENABLED ?? 'true');
 const EVIDENCE_CHECK_ENABLED = !/^(0|false|no|off)$/i.test(process.env.EVIDENCE_CHECK_ENABLED ?? 'true');
+// Stop making follow-up commits once a ticket is no longer assigned to Hermes; auto-unblock a
+// blocked PR when a human pushes a new commit to it. Both default on, fail open.
+const ASSIGNEE_GUARD_ENABLED = !/^(0|false|no|off)$/i.test(process.env.ASSIGNEE_GUARD_ENABLED ?? 'true');
+const AUTO_UNBLOCK_ON_HUMAN_COMMIT = !/^(0|false|no|off)$/i.test(process.env.AUTO_UNBLOCK_ON_HUMAN_COMMIT ?? 'true');
 
 function compact(value: string, max = 900): string {
   return value.replace(/\s+/g, ' ').trim().slice(0, max);
@@ -134,6 +140,31 @@ async function recoveryWorkflowSignal(watch: PrWatch, mergeCommitSha: string, lo
   return branchSignal;
 }
 
+// Targeted remediation for the API contract-sync checks ("Enforce OpenAPI Sync" / "Contract drift
+// (runtime ↔ OpenAPI ↔ SDK)"). These fail when API contract files change but packages/docs/openapi.yaml
+// (+ the FE SDK) are not updated; the generic "address the feedback" prompt was not connecting the
+// failure to that action, so PRs churned to the attempt cap without ever touching the spec.
+function openApiRemediation(feedbackSummary: string): string {
+  if (!/openapi|contract\s*drift|contract-drift|openapi\.yaml/i.test(feedbackSummary)) return '';
+  return [
+    '',
+    '--- API CONTRACT-SYNC CHECK IS FAILING — THIS IS THE PRIORITY ---',
+    'One of the failing checks is the API contract-sync check (e.g. "Enforce OpenAPI Sync" or',
+    '"Contract drift (runtime ↔ OpenAPI ↔ SDK)"). It fails when API contract source files changed but',
+    '`packages/docs/openapi.yaml` was not updated in this PR. Per HERMES.md §5 you MUST resolve it by',
+    'EITHER:',
+    '  1. If this PR changes the API contract (new/changed fields, enum members, request/response',
+    '     shapes): update `packages/docs/openapi.yaml` to exactly match the change, and update the',
+    '     frontend SDK. Prefer the repo\'s codegen script if one exists (check package.json scripts',
+    '     for e.g. `generate:openapi`/`openapi`/`build:openapi` and run it); otherwise hand-edit the',
+    '     spec. Do not leave it stale — the check re-runs on every push.',
+    '  2. If this PR is a pure internal refactor with NO API contract change: do NOT edit the spec.',
+    '     Instead, state clearly and prominently in your FINAL MESSAGE the exact line',
+    '     `HERMES-APPLY-LABEL: skip-openapi-sync` (the harness applies it to bypass the check).',
+    'Do not finish until you have done one of these two.',
+  ].join('\n');
+}
+
 function buildFollowupPrompt(watch: PrWatch, _signals: PrSignal[], feedbackSummary: string): string {
   return [
     `You are updating an existing Hermes PR branch, not starting a new task.`,
@@ -150,6 +181,7 @@ function buildFollowupPrompt(watch: PrWatch, _signals: PrSignal[], feedbackSumma
     'Address ONLY the new CI/review/merge-conflict feedback below. Keep the fix scoped, preserve unrelated code, and do not broaden the original PR.',
     '',
     feedbackSummary,
+    openApiRemediation(feedbackSummary),
     '',
     'Before finishing, run the narrowest relevant local validation you can infer from the changed files. If validation cannot run locally, mention that in your final message.',
   ]
@@ -187,7 +219,34 @@ async function blockWatch(watch: PrWatch, reason: string): Promise<void> {
   await notifyThread(watch, `:warning: Hermes stopped automated PR repair for ${watch.prUrl}: ${reason}`);
 }
 
+/**
+ * True while the ticket is still Hermes's to work. Fail-open: if we can't determine assignment
+ * (Jira unreachable, or the bot accountId is unknown) we keep working. Returns false only when we
+ * positively determined the ticket is unassigned or reassigned to someone other than Hermes.
+ */
+async function isAssignedToHermes(issueKey: string): Promise<boolean> {
+  const assignee = await getIssueAssigneeAccountId(issueKey);
+  if (assignee === undefined) return true; // couldn't determine → keep working
+  const hermes = await getBotAccountId();
+  if (!hermes) return true; // no bot accountId to compare against → keep working
+  return assignee === hermes; // assignee === null (unassigned) or a different person → stop
+}
+
 async function startFollowupJob(watch: PrWatch, signals: PrSignal[]): Promise<void> {
+  // Do not make further commits once the ticket is no longer assigned to Hermes (someone took it
+  // over / parked it). Post a one-time note and stop — reassigning to Hermes resumes it naturally.
+  if (ASSIGNEE_GUARD_ENABLED && watch.issueKey && !(await isAssignedToHermes(watch.issueKey))) {
+    console.warn(`[prmonitor] ${watch.repo}#${watch.prNumber}: ticket ${watch.issueKey} not assigned to Hermes — skipping follow-up commit`);
+    if (!(watch.handledSignalIds ?? []).includes('unassigned-paused')) {
+      await commentOnIssue(
+        watch.issueKey,
+        `⏸️ Hermes paused automated fixes for ${watch.prUrl} — this ticket is no longer assigned to Hermes. Reassign it to Hermes to resume.`
+      ).catch(() => {});
+      await appendHandledSignals(watch, ['unassigned-paused']).catch(() => {});
+    }
+    return;
+  }
+
   const nextAttempt = (watch.fixAttemptCount ?? 0) + 1;
   if (nextAttempt > MAX_FIX_ATTEMPTS) {
     await blockWatch(watch, `maximum automated fix attempts reached (${MAX_FIX_ATTEMPTS})`);
@@ -608,6 +667,28 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
   if (snapshot.state === 'CLOSED') {
     await blockWatch(currentWatch, `PR was closed before merge: ${snapshot.prUrl}`);
     return;
+  }
+
+  // Auto-unblock: a watch that hit the fix cap (or was otherwise blocked) is normally never retried,
+  // but if a HUMAN pushes a new commit to it the situation changed — give the fixer a fresh budget
+  // and resume. Only triggers when the head advanced to a commit Hermes did not author.
+  if (currentWatch.status === 'prwatch:blocked') {
+    if (!AUTO_UNBLOCK_ON_HUMAN_COMMIT) return;
+    const advanced = snapshot.headSha && snapshot.headSha !== currentWatch.headSha;
+    if (!advanced || (await isHermesCommit(currentWatch.repo, snapshot.headSha))) return;
+    const unblocked = await unblockWatch(currentWatch, snapshot.headSha);
+    if (!unblocked) return;
+    log.info(
+      { repo: currentWatch.repo, prNumber: currentWatch.prNumber, headSha: snapshot.headSha.slice(0, 8) },
+      'auto-unblocked PR watch after a human commit'
+    );
+    if (currentWatch.issueKey) {
+      await commentOnIssue(
+        currentWatch.issueKey,
+        `▶️ A new commit was pushed to ${snapshot.prUrl}; Hermes resumed automated CI/review fixes.`
+      ).catch(() => {});
+    }
+    currentWatch = unblocked;
   }
 
   await ensureFrontendDeployLabel(currentWatch, log);

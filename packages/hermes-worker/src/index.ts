@@ -515,6 +515,16 @@ async function processJob(jobId: string): Promise<void> {
       transcriptUri = await commitAndPushWithPrecommitRepair({ jobId, dir, branch, message: title, taskPrompt: prompt, transcript });
       const headSha = await getHeadSha(dir);
       if (!job.prNumber || !job.prUrl) throw new Error('follow-up job missing prNumber/prUrl');
+      // Apply any labels the agent explicitly requested via a `HERMES-APPLY-LABEL: <label>` line in
+      // its final message (e.g. `skip-openapi-sync` when it determines the change is a pure refactor
+      // with no API-contract change). Best-effort.
+      const requestedLabels = [...(agentRun.finalMessage ?? '').matchAll(/HERMES-APPLY-LABEL:\s*([A-Za-z0-9._-]+)/g)].map((m) => m[1]);
+      if (requestedLabels.length) {
+        await ensurePullRequestLabels(octokit, job.repo, job.prNumber, requestedLabels).catch((e) =>
+          console.warn(`[${jobId}] failed to apply requested labels:`, e instanceof Error ? e.message : String(e))
+        );
+        console.log(`[${jobId}] applied agent-requested labels: ${requestedLabels.join(', ')}`);
+      }
       await putMetric('HermesCiFixAttempts', 1, { type: job.type }); // WS2 — post-open auto-repair round
       await updateJob(jobId, 'done', { prUrl: job.prUrl, transcriptUri, headSha });
       await markPrWatchWaiting(job.repo, job.prNumber, headSha);
