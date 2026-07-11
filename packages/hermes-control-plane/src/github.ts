@@ -15,6 +15,54 @@ export interface GitHubAuth {
   octokit: Octokit;
 }
 
+/**
+ * The installation REST budget is 5,000 requests/hour and the reconcile loop used to blow through it
+ * — it re-fetched, on every 5-minute tick, data that cannot change: the file list of a given commit
+ * and the annotations of a completed check run. Once the budget was gone every call 403'd,
+ * collectPrSnapshot threw for every watch, and the whole monitor silently stopped. So: key these by
+ * something immutable (a head sha, a check-run id) and serve them from memory.
+ */
+function immutableCache<T>(maxEntries: number) {
+  const entries = new Map<string, T>();
+  return async (key: string, load: () => Promise<T>): Promise<T> => {
+    const hit = entries.get(key);
+    if (hit !== undefined) {
+      entries.delete(key); // re-insert to keep the map in LRU order
+      entries.set(key, hit);
+      return hit;
+    }
+    const value = await load();
+    entries.set(key, value);
+    while (entries.size > maxEntries) entries.delete(entries.keys().next().value as string);
+    return value;
+  };
+}
+
+const changedFilesCache = immutableCache<string[]>(500);
+const annotationsCache = immutableCache<string>(1000);
+
+/** A rate-limit 403/429 from GitHub, as opposed to a permissions 403. */
+export function isRateLimitError(err: unknown): boolean {
+  const e = err as { status?: number; message?: string };
+  if (!e) return false;
+  if (e.status !== 403 && e.status !== 429) return false;
+  return /rate limit|secondary rate/i.test(String(e.message ?? ''));
+}
+
+/**
+ * Remaining REST calls in the installation's hourly budget. `GET /rate_limit` is itself free, so the
+ * reconcile loop can cheaply refuse to start a sweep it cannot finish.
+ */
+export async function remainingRestBudget(repo: string): Promise<number> {
+  try {
+    const { octokit } = await getInstallationAuth(repo);
+    const res = await octokit.request('GET /rate_limit');
+    return Number(res.data?.resources?.core?.remaining ?? Number.POSITIVE_INFINITY);
+  } catch {
+    return Number.POSITIVE_INFINITY; // fail open — never let a budget probe stop the monitor
+  }
+}
+
 export interface PrSnapshot {
   repo: string;
   prNumber: number;
@@ -59,14 +107,24 @@ export async function verifyGitHubSignature(
   }
 }
 
+// Installation tokens are valid for an hour. Minting one is itself a GitHub API call, and every
+// helper in this file starts by calling getInstallationAuth — including once per peer PR inside the
+// overlap scan — so re-minting per call multiplied our API usage by the number of helper calls.
+// Cache per repo and re-mint a few minutes before expiry.
+const authCache = new Map<string, { auth: GitHubAuth; expiresAt: number }>();
+const AUTH_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
 export async function getInstallationAuth(repoFullName: string): Promise<GitHubAuth> {
+  const repoName = repoFullName.split('/')[1];
+  const cached = authCache.get(repoFullName);
+  if (cached && cached.expiresAt - AUTH_REFRESH_MARGIN_MS > Date.now()) return cached.auth;
+
   const { appId, installationId, privateKey } = await getSecretJson(SECRET_GITHUB_APP);
   if (!appId || !installationId || !privateKey) {
     throw new Error('GitHub App credentials not configured in Secrets Manager');
   }
-  const repoName = repoFullName.split('/')[1];
   const auth = createAppAuth({ appId, installationId, privateKey });
-  const { token } = await auth({
+  const { token, expiresAt } = await auth({
     type: 'installation',
     repositoryNames: repoName ? [repoName] : undefined,
     permissions: {
@@ -78,7 +136,13 @@ export async function getInstallationAuth(repoFullName: string): Promise<GitHubA
       metadata: 'read',
     },
   });
-  return { token, octokit: new Octokit({ auth: token }) };
+  const value: GitHubAuth = { token, octokit: new Octokit({ auth: token }) };
+  const expiryMs = Date.parse(String(expiresAt));
+  authCache.set(repoFullName, {
+    auth: value,
+    expiresAt: Number.isFinite(expiryMs) ? expiryMs : Date.now() + 55 * 60 * 1000,
+  });
+  return value;
 }
 
 function splitRepo(repo: string): { owner: string; name: string } {
@@ -143,16 +207,24 @@ export async function isHermesCommit(repo: string, sha: string): Promise<boolean
   }
 }
 
-export async function listPullRequestChangedFiles(repo: string, pullNumber: number): Promise<string[]> {
-  const { octokit } = await getInstallationAuth(repo);
-  const { owner, name } = splitRepo(repo);
-  const files: string[] = [];
-  for (let page = 1; page <= 10; page++) {
-    const res = await octokit.pulls.listFiles({ owner, repo: name, pull_number: pullNumber, per_page: 100, page });
-    files.push(...res.data.map((file) => file.filename));
-    if (res.data.length < 100) break;
-  }
-  return files;
+/**
+ * Changed files for a PR. Pass `headSha` whenever the caller knows it: the file list of a commit is
+ * immutable, so it is then served from cache instead of costing up to 10 REST calls on every tick.
+ */
+export async function listPullRequestChangedFiles(repo: string, pullNumber: number, headSha?: string): Promise<string[]> {
+  const load = async (): Promise<string[]> => {
+    const { octokit } = await getInstallationAuth(repo);
+    const { owner, name } = splitRepo(repo);
+    const files: string[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const res = await octokit.pulls.listFiles({ owner, repo: name, pull_number: pullNumber, per_page: 100, page });
+      files.push(...res.data.map((file) => file.filename));
+      if (res.data.length < 100) break;
+    }
+    return files;
+  };
+  if (!headSha) return load();
+  return changedFilesCache(`${repo}#${pullNumber}@${headSha}`, load);
 }
 
 // --- WS5 --- Post a comment on a PR (best-effort; never throws into the caller). Uses the
@@ -166,6 +238,46 @@ export async function commentOnPullRequest(repo: string, prNumber: number, body:
   } catch (err) {
     console.warn(`[github] comment on ${repo}#${prNumber} failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;
+  }
+}
+
+/**
+ * Re-request review from everyone whose latest review was CHANGES_REQUESTED and who is not already
+ * on the pending-reviewer list. GitHub keeps `reviewDecision: CHANGES_REQUESTED` until the same
+ * reviewer submits a NEW review, and a fixed PR does not re-enter their queue on its own — so
+ * without this a green PR whose feedback Hermes already addressed waits forever. Returns the logins
+ * we re-pinged. Fail-open: never throws.
+ */
+export async function requestReReviewFromChangeRequesters(repo: string, prNumber: number): Promise<string[]> {
+  try {
+    const { octokit } = await getInstallationAuth(repo);
+    const { owner, name } = splitRepo(repo);
+    const pr = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber });
+    const alreadyPending = new Set(
+      (pr.data.requested_reviewers ?? []).map((r) => String((r as { login?: string }).login ?? '').toLowerCase())
+    );
+
+    const reviews = await octokit.paginate(octokit.pulls.listReviews, { owner, repo: name, pull_number: prNumber, per_page: 100 });
+    // Latest review per human reviewer wins — an author who requested changes then approved is done.
+    const latest = new Map<string, string>();
+    for (const review of reviews) {
+      const login = review.user?.login;
+      const state = String(review.state ?? '').toUpperCase();
+      if (!login || review.user?.type === 'Bot') continue;
+      if (state === 'COMMENTED') continue; // a plain comment does not change a reviewer's decision
+      latest.set(login, state);
+    }
+
+    const reviewers = [...latest.entries()]
+      .filter(([login, state]) => state === 'CHANGES_REQUESTED' && !alreadyPending.has(login.toLowerCase()))
+      .map(([login]) => login);
+    if (!reviewers.length) return [];
+
+    await octokit.pulls.requestReviewers({ owner, repo: name, pull_number: prNumber, reviewers });
+    return reviewers;
+  } catch (err) {
+    console.warn(`[github] re-request review on ${repo}#${prNumber} failed: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
   }
 }
 
@@ -244,19 +356,23 @@ async function checkRunSignals(octokit: Octokit, repo: string, headSha: string):
   const pending = runs.some((r) => r.status !== 'completed');
   const signals: PrSignal[] = [];
   for (const run of failing.slice(0, 8)) {
-    const annotations = await octokit
-      .request('GET /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations', {
-        owner,
-        repo: name,
-        check_run_id: run.id,
-        per_page: 10,
-      })
-      .then((r) => r.data)
-      .catch(() => []);
-    const annotationText = annotations
-      .slice(0, 5)
-      .map((a) => `  - ${a.path}:${a.start_line ?? '?'} ${compactText(a.message, 240)}`)
-      .join('\n');
+    // A completed check run's annotations never change, so cache them by run id — this used to be up
+    // to 8 REST calls per failing PR on every single reconcile tick.
+    const annotationText = await annotationsCache(`${repo}:${run.id}`, async () => {
+      const annotations = await octokit
+        .request('GET /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations', {
+          owner,
+          repo: name,
+          check_run_id: run.id,
+          per_page: 10,
+        })
+        .then((r) => r.data)
+        .catch(() => []);
+      return annotations
+        .slice(0, 5)
+        .map((a) => `  - ${a.path}:${a.start_line ?? '?'} ${compactText(a.message, 240)}`)
+        .join('\n');
+    });
     signals.push({
       id: `ci:${headSha}:check:${run.id}:${run.conclusion}`,
       kind: 'ci_failed',

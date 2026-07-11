@@ -32,7 +32,9 @@ export async function computeOverlaps(repo: string, prNumber: number, changedFil
   const overlaps: PrOverlap[] = [];
   for (const peer of peers) {
     try {
-      const theirFiles = await listPullRequestChangedFiles(peer.repo, peer.prNumber);
+      // peer.headSha keys the immutable file-list cache — without it this loop re-lists every peer's
+      // files on every reconcile, which is O(open PRs²) REST calls per tick.
+      const theirFiles = await listPullRequestChangedFiles(peer.repo, peer.prNumber, peer.headSha);
       const sharedFiles = theirFiles.filter((f) => mine.has(f));
       if (sharedFiles.length) {
         overlaps.push({

@@ -11,11 +11,14 @@ import {
   commentOnPullRequest,
   ensurePullRequestLabels,
   isHermesCommit,
+  isRateLimitError,
   latestSuccessfulWorkflowSignalContainingCommit,
   latestWorkflowSignalForCommit,
   listPullRequestChangedFiles,
   listRepositoryPaths,
   rebasePullRequestBranch,
+  remainingRestBudget,
+  requestReReviewFromChangeRequesters,
   signalFromPrCommentWebhook,
   signalFromReviewWebhook,
   verifyGitHubSignature,
@@ -33,6 +36,7 @@ import {
   markWatchBlocked,
   markWatchQaQueued,
   markWatchReady,
+  markReviewPinged,
   rememberGitHubDelivery,
   tryStartFix,
   unblockWatch,
@@ -48,12 +52,25 @@ import { fetchIssueContext, getIssueAssigneeAccountId } from './jira.js';
 import { loadQaScenarioCatalog } from './qaConfluence.js';
 import { buildQaProofPlan, buildQaReadinessPlan, summarizeQaPlan, type QaProofPlan } from './qaPlanner.js';
 
-// Per-PR cap on distinct automated fix rounds. Note fixAttemptCount only increments on NEW,
-// de-duplicated signals (a given CI failure / review is addressed once), so this is effectively
-// a budget of distinct problems, not retries of the same one. Raised 4→8 so active PRs that
-// accumulate several rounds of CI/review feedback aren't prematurely benched.
+// Per-PR cap on automated fix rounds — of distinct problems AND of retries of a problem a previous
+// attempt failed to resolve (see RETRY_UNRESOLVED_SIGNALS). Reaching it blocks the watch, which is
+// visible and actionable; running out of retries silently is not.
 const MAX_FIX_ATTEMPTS = Number(process.env.PR_MONITOR_MAX_FIX_ATTEMPTS ?? 8);
 const STALE_FIX_SECONDS = Number(process.env.PR_MONITOR_STALE_FIX_SECONDS ?? 45 * 60);
+// How long a fix job may sit *queued* (waiting for a worker slot) before we treat it as lost. Must
+// exceed the worst-case queue wait, which is (queue depth ÷ workers) × job duration.
+const QUEUED_FIX_GRACE_SECONDS = Number(process.env.PR_MONITOR_QUEUED_FIX_GRACE_SECONDS ?? 4 * 60 * 60);
+// Retry a self-clearing signal (CI failure / merge conflict) that a previous attempt did not fix.
+// See dedupeNewSignals. Off → the pre-existing "address each signal exactly once" behavior.
+const RETRY_UNRESOLVED_SIGNALS = !/^(0|false|no|off)$/i.test(process.env.PR_MONITOR_RETRY_UNRESOLVED ?? 'true');
+// Minimum gap between fix attempts on one PR, so a check that fails within seconds of a push cannot
+// spin the fixer at the reconcile interval.
+const FIX_RETRY_COOLDOWN_SECONDS = Number(process.env.PR_MONITOR_FIX_RETRY_COOLDOWN_SECONDS ?? 10 * 60);
+// Re-request human review on a green PR whose reviewer left CHANGES_REQUESTED (once per head sha).
+const REVIEW_REPING_ENABLED = !/^(0|false|no|off)$/i.test(process.env.PR_MONITOR_REVIEW_REPING ?? 'true');
+// Do not start a poll sweep with less than this much of the 5,000/hr installation REST budget left —
+// webhook-driven reconciles and the fix jobs' own pushes/comments need headroom.
+const RECONCILE_BUDGET_RESERVE = Number(process.env.PR_MONITOR_BUDGET_RESERVE ?? 500);
 const FRONTEND_DEPLOY_LABEL = 'deploy-dev';
 const BACKEND_DEPLOY_WORKFLOW_ID = process.env.BE_DEPLOY_WORKFLOW_ID || '208630294';
 const FRONTEND_BUILD_WORKFLOW_ID = process.env.QA_BUILD_WORKFLOW_ID || 'staging.yml';
@@ -83,14 +100,59 @@ function formatSignals(signals: PrSignal[], maxDetails = 900): string {
     .join('\n');
 }
 
-function dedupeNewSignals(watch: PrWatch, signals: PrSignal[]): PrSignal[] {
+/**
+ * A CI failure or a merge conflict is *self-clearing*: it vanishes from the snapshot the moment it
+ * is actually fixed. Review feedback is not — a review thread stays unresolved, and `reviewDecision`
+ * stays CHANGES_REQUESTED, until a human acts, so re-firing it would loop forever.
+ */
+const SELF_CLEARING: ReadonlySet<PrSignal['kind']> = new Set(['ci_failed', 'merge_conflict']);
+
+/**
+ * Which signals warrant a fix job right now.
+ *
+ * `handledSignalIds` is written when a fix job is *enqueued*, not when it succeeds — so a handled id
+ * means "we tried", not "it's fixed". A CI signal's id embeds the head sha, so when an attempt fails
+ * or produces no commit the head never moves and the still-failing check keeps producing the exact
+ * same id — which is now permanently handled. That silently starved PRs of any further attempt (red,
+ * `watching`, fix count far below the cap, untouched for days). So: a self-clearing signal that is
+ * still present was, by definition, not resolved — retry it (bounded by the cooldown and the attempt
+ * cap). Non-self-clearing signals keep the address-once semantics.
+ */
+export function dedupeNewSignals(watch: PrWatch, signals: PrSignal[]): PrSignal[] {
   const handled = new Set(watch.handledSignalIds ?? []);
+  const cooling = ageSeconds(watch.lastFixAt) < FIX_RETRY_COOLDOWN_SECONDS;
   const seen = new Set<string>();
   return signals.filter((signal) => {
-    if (handled.has(signal.id) || seen.has(signal.id)) return false;
+    if (seen.has(signal.id)) return false;
+    if (handled.has(signal.id)) {
+      if (!RETRY_UNRESOLVED_SIGNALS || !SELF_CLEARING.has(signal.kind) || cooling) return false;
+    }
     seen.add(signal.id);
     return true;
   });
+}
+
+/** True when we are re-attempting a signal an earlier fix job already claimed to have handled. */
+export function isRetryOfHandledSignal(watch: PrWatch, signals: PrSignal[]): boolean {
+  const handled = new Set(watch.handledSignalIds ?? []);
+  return signals.some((signal) => handled.has(signal.id));
+}
+
+/**
+ * Tell the agent that its previous attempt did not work, and why. Without this a retry tends to
+ * repeat the same reasoning that produced no changes last time.
+ */
+async function retryContext(watch: PrWatch): Promise<string> {
+  const previous = watch.lastFixJobId ? await getJob(watch.lastFixJobId).catch(() => null) : null;
+  const outcome = String(previous?.error ?? '').trim();
+  return [
+    '--- THIS IS A RETRY — THE PREVIOUS FIX ATTEMPT DID NOT RESOLVE THIS ---',
+    `A previous Hermes attempt (fix ${watch.fixAttemptCount ?? 0}/${MAX_FIX_ATTEMPTS}) already tried to address the feedback below and the check is STILL failing at the current head.`,
+    outcome ? `That attempt ended: ${compact(outcome, 300)}` : 'That attempt ended without pushing a commit.',
+    'Do not repeat that approach, and do not conclude that no change is needed — the failing check is',
+    'objective proof that a change IS needed. Reproduce the failure locally, fix the underlying cause,',
+    'and make sure you actually modify files and leave them staged for commit.',
+  ].join('\n');
 }
 
 function followupKind(signals: PrSignal[]): { kind: JobKind; jiraState: JiraState } {
@@ -165,7 +227,7 @@ function openApiRemediation(feedbackSummary: string): string {
   ].join('\n');
 }
 
-function buildFollowupPrompt(watch: PrWatch, _signals: PrSignal[], feedbackSummary: string): string {
+function buildFollowupPrompt(watch: PrWatch, _signals: PrSignal[], feedbackSummary: string, retry = ''): string {
   return [
     `You are updating an existing Hermes PR branch, not starting a new task.`,
     '',
@@ -181,6 +243,7 @@ function buildFollowupPrompt(watch: PrWatch, _signals: PrSignal[], feedbackSumma
     'Address ONLY the new CI/review/merge-conflict feedback below. Keep the fix scoped, preserve unrelated code, and do not broaden the original PR.',
     '',
     feedbackSummary,
+    retry,
     openApiRemediation(feedbackSummary),
     '',
     'Before finishing, run the narrowest relevant local validation you can infer from the changed files. If validation cannot run locally, mention that in your final message.',
@@ -256,6 +319,8 @@ async function startFollowupJob(watch: PrWatch, signals: PrSignal[]): Promise<vo
   const signalIds = signals.map((s) => s.id);
   const { kind, jiraState } = followupKind(signals);
   const feedbackSummary = formatSignals(signals);
+  // Read the previous attempt's outcome before tryStartFix overwrites lastFixJobId with this one.
+  const retry = isRetryOfHandledSignal(watch, signals) ? await retryContext(watch) : '';
   const fixJobId = randomUUID();
   const reserved = await tryStartFix(watch, fixJobId, jiraState, nextAttempt);
   if (!reserved) return;
@@ -277,7 +342,7 @@ async function startFollowupJob(watch: PrWatch, signals: PrSignal[]): Promise<vo
       threadTs: watch.threadTs,
       feedbackSummary,
       source: `github:${watch.repo}#${watch.prNumber}`,
-      prompt: buildFollowupPrompt(watch, signals, feedbackSummary),
+      prompt: buildFollowupPrompt(watch, signals, feedbackSummary, retry),
     });
     await appendHandledSignals(watch, signalIds);
     const message = [
@@ -315,7 +380,13 @@ async function recoverStaleActiveFix(watch: PrWatch, log: FastifyBaseLogger): Pr
   const job = await getJob(fixJobId);
   const jobAgeSeconds = job ? ageSeconds(jobUpdatedAt(job)) : Number.POSITIVE_INFINITY;
   const terminal = job?.status === 'done' || job?.status === 'failed';
-  const stale = !job || terminal || jobAgeSeconds >= STALE_FIX_SECONDS;
+  // A `queued` job has not been picked up yet, so it has no heartbeat to go stale — its age is just
+  // how long it has waited for a free worker. Reaping it on the heartbeat window killed real work
+  // that was still going to run (and, before signals could re-fire, permanently froze the PR). Only
+  // a job that actually STARTED is judged on its heartbeat; a queued one gets a long grace period so
+  // a genuinely lost message is still eventually recovered.
+  const staleWindow = job?.status === 'queued' ? QUEUED_FIX_GRACE_SECONDS : STALE_FIX_SECONDS;
+  const stale = !job || terminal || jobAgeSeconds >= staleWindow;
 
   if (!stale) {
     log.info(
@@ -329,7 +400,9 @@ async function recoverStaleActiveFix(watch: PrWatch, log: FastifyBaseLogger): Pr
     ? 'active fix job row is missing'
     : terminal
       ? `active fix job is already ${job.status}`
-      : `active fix job heartbeat is stale (${jobAgeSeconds}s old)`;
+      : job.status === 'queued'
+        ? `active fix job was never picked up by a worker (${jobAgeSeconds}s queued)`
+        : `active fix job heartbeat is stale (${jobAgeSeconds}s old)`;
 
   log.warn({ repo: watch.repo, prNumber: watch.prNumber, activeFixJobId: fixJobId, reason }, 'recovering stale active PR fix job');
 
@@ -705,7 +778,9 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
   const activeWatch: PrWatch = { ...currentWatch, headSha: snapshot.headSha, headBranch: snapshot.headBranch, prUrl: snapshot.prUrl };
   await postChecklistOnce(activeWatch, log);
   if (OVERLAP_COORDINATION_ENABLED) {
-    const changedFiles = await listPullRequestChangedFiles(currentWatch.repo, currentWatch.prNumber).catch(() => [] as string[]);
+    const changedFiles = await listPullRequestChangedFiles(currentWatch.repo, currentWatch.prNumber, snapshot.headSha).catch(
+      () => [] as string[]
+    );
     await coordinateOverlaps(activeWatch, changedFiles, log);
   }
 
@@ -715,14 +790,9 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
     return;
   }
 
-  const persistentMergeConflicts = snapshot.signals.filter((signal) => signal.kind === 'merge_conflict');
-  if (persistentMergeConflicts.length) {
-    await startFollowupJob(
-      { ...currentWatch, headSha: snapshot.headSha, headBranch: snapshot.headBranch, prUrl: snapshot.prUrl },
-      persistentMergeConflicts
-    );
-    return;
-  }
+  // (An unresolved merge conflict used to be re-fired here, bypassing the handled-id dedupe. It is
+  // now a self-clearing signal like any other, so dedupeNewSignals above re-fires it — under the
+  // retry cooldown, which this bypassed.)
 
   if (snapshot.ciState === 'passing') {
     // --- WS5.3 + WS5.4 --- Additive readiness gate: even with green CI, hold the PR in code review
@@ -731,6 +801,21 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
     if (!(await readinessGatesSatisfied(currentWatch, log))) {
       return;
     }
+    // CI is green and Hermes has addressed every review thread — but GitHub keeps the PR at
+    // reviewDecision CHANGES_REQUESTED until that reviewer submits a NEW review, and a fixed PR does
+    // not re-enter their queue by itself. Put it back there, once per head sha.
+    if (REVIEW_REPING_ENABLED && (await markReviewPinged(currentWatch, snapshot.headSha))) {
+      const pinged = await requestReReviewFromChangeRequesters(currentWatch.repo, currentWatch.prNumber);
+      if (pinged.length) {
+        log.info({ repo: currentWatch.repo, prNumber: currentWatch.prNumber, pinged }, 're-requested review on a green PR');
+        await commentOnPullRequest(
+          currentWatch.repo,
+          currentWatch.prNumber,
+          `♻️ CI is green and the requested changes have been addressed — re-requesting review from ${pinged.map((l) => `@${l}`).join(', ')}.`
+        ).catch(() => {});
+      }
+    }
+
     const marked = await markWatchReady(currentWatch, snapshot.headSha);
     if (marked) {
       if (currentWatch.issueKey) {
@@ -782,9 +867,26 @@ export async function handleGitHubWebhook(
 export async function reconcileOpenPrs(log: FastifyBaseLogger): Promise<void> {
   const [active, blocked] = await Promise.all([listActivePrWatches(), listBlockedPrWatches()]);
   const watches = [...active, ...blocked.filter(isRecoverableDeploymentBlock)];
+  if (!watches.length) return;
+
+  // Leave headroom for webhook-driven reconciles and for the fix jobs themselves (which push, label
+  // and comment). A sweep started on an empty budget just 403s its way through every watch.
+  const remaining = await remainingRestBudget(watches[0].repo);
+  if (remaining < RECONCILE_BUDGET_RESERVE) {
+    log.warn({ remaining, reserve: RECONCILE_BUDGET_RESERVE, watches: watches.length }, 'skipping PR reconcile sweep — GitHub REST budget too low');
+    return;
+  }
+
   for (const watch of watches) {
-    await reconcilePrWatch(watch, log).catch((err) =>
-      log.error({ err, repo: watch.repo, prNumber: watch.prNumber }, 'PR reconciliation failed')
-    );
+    try {
+      await reconcilePrWatch(watch, log);
+    } catch (err) {
+      if (isRateLimitError(err)) {
+        // Every remaining watch would fail the same way; stop and let the next tick retry.
+        log.error({ err, repo: watch.repo, prNumber: watch.prNumber }, 'GitHub rate limit hit — aborting reconcile sweep');
+        return;
+      }
+      log.error({ err, repo: watch.repo, prNumber: watch.prNumber }, 'PR reconciliation failed');
+    }
   }
 }

@@ -70,6 +70,12 @@ export interface PrWatch {
   blockReason?: string;
   deployRunUrl?: string;
   handledSignalIds?: string[];
+  /** When the most recent fix job was started — throttles retries of a still-unresolved signal. */
+  lastFixAt?: string;
+  /** The most recent fix job, kept after it clears so a retry can read why the last attempt failed. */
+  lastFixJobId?: string;
+  /** Head sha we last re-requested human review at, so a green PR is only re-pinged once per head. */
+  lastReviewPingSha?: string;
   createdAt: string;
   updatedAt: string;
   expiresAt: number;
@@ -194,7 +200,7 @@ export async function tryStartFix(
         TableName: TABLE,
         Key: { jobId: watch.jobId },
         UpdateExpression:
-          'SET #s = :fixing, jiraState = :jiraState, activeFixJobId = :fixJobId, fixAttemptCount = :nextAttempt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+          'SET #s = :fixing, jiraState = :jiraState, activeFixJobId = :fixJobId, lastFixJobId = :fixJobId, lastFixAt = :updatedAt, fixAttemptCount = :nextAttempt, updatedAt = :updatedAt, expiresAt = :expiresAt',
         ConditionExpression: '#s = :watching AND (attribute_not_exists(activeFixJobId) OR activeFixJobId = :emptyActive)',
         ExpressionAttributeNames: { '#s': 'status' },
         ExpressionAttributeValues: {
@@ -216,7 +222,13 @@ export async function tryStartFix(
 }
 
 export async function appendHandledSignals(watch: PrWatch, signalIds: string[]): Promise<void> {
-  if (!signalIds.length) return;
+  // Only append ids we have not already recorded. Without this the list grows without bound (the
+  // same `overlap:<peer>` / `checklist-posted` markers get re-appended on every reconcile whenever a
+  // caller works from a slightly stale watch), and a long-lived watch eventually hits the 400KB
+  // DynamoDB item limit.
+  const known = new Set(watch.handledSignalIds ?? []);
+  const fresh = [...new Set(signalIds)].filter((id) => !known.has(id));
+  if (!fresh.length) return;
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE,
@@ -225,11 +237,33 @@ export async function appendHandledSignals(watch: PrWatch, signalIds: string[]):
         'SET handledSignalIds = list_append(if_not_exists(handledSignalIds, :empty), :signalIds), updatedAt = :updatedAt',
       ExpressionAttributeValues: {
         ':empty': [],
-        ':signalIds': signalIds,
+        ':signalIds': fresh,
         ':updatedAt': new Date().toISOString(),
       },
     })
   );
+}
+
+/**
+ * Record that we re-requested human review at `headSha`, so a green PR whose reviewer left
+ * CHANGES_REQUESTED is re-pinged exactly once per head instead of on every reconcile.
+ * Returns false if this head was already pinged.
+ */
+export async function markReviewPinged(watch: PrWatch, headSha: string): Promise<boolean> {
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        UpdateExpression: 'SET lastReviewPingSha = :headSha, updatedAt = :updatedAt',
+        ConditionExpression: 'attribute_not_exists(lastReviewPingSha) OR lastReviewPingSha <> :headSha',
+        ExpressionAttributeValues: { ':headSha': headSha, ':updatedAt': new Date().toISOString() },
+      })
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function markWatchReady(watch: PrWatch, headSha: string): Promise<boolean> {
