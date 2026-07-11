@@ -795,15 +795,13 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
   // retry cooldown, which this bypassed.)
 
   if (snapshot.ciState === 'passing') {
-    // --- WS5.3 + WS5.4 --- Additive readiness gate: even with green CI, hold the PR in code review
-    // until the ticket checklist is satisfied and any staging-record evidence is documented. Gate
-    // fails open, so a gate error can never keep a green PR out of review.
-    if (!(await readinessGatesSatisfied(currentWatch, log))) {
-      return;
-    }
     // CI is green and Hermes has addressed every review thread — but GitHub keeps the PR at
     // reviewDecision CHANGES_REQUESTED until that reviewer submits a NEW review, and a fixed PR does
     // not re-enter their queue by itself. Put it back there, once per head sha.
+    //
+    // This runs BEFORE the readiness gate on purpose. The gate governs whether Hermes advances the
+    // *ticket* to Ready for review; it must not also withhold a re-review from a human who already
+    // engaged with this PR and is now waiting on changes they asked for.
     if (REVIEW_REPING_ENABLED && (await markReviewPinged(currentWatch, snapshot.headSha))) {
       const pinged = await requestReReviewFromChangeRequesters(currentWatch.repo, currentWatch.prNumber);
       if (pinged.length) {
@@ -814,6 +812,13 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
           `♻️ CI is green and the requested changes have been addressed — re-requesting review from ${pinged.map((l) => `@${l}`).join(', ')}.`
         ).catch(() => {});
       }
+    }
+
+    // --- WS5.3 + WS5.4 --- Additive readiness gate: even with green CI, hold the PR in code review
+    // until the ticket checklist is satisfied and any staging-record evidence is documented. Gate
+    // fails open, so a gate error can never keep a green PR out of review.
+    if (!(await readinessGatesSatisfied(currentWatch, log))) {
+      return;
     }
 
     const marked = await markWatchReady(currentWatch, snapshot.headSha);
