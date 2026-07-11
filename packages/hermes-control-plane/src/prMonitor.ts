@@ -71,6 +71,9 @@ const REVIEW_REPING_ENABLED = !/^(0|false|no|off)$/i.test(process.env.PR_MONITOR
 // Do not start a poll sweep with less than this much of the 5,000/hr installation REST budget left —
 // webhook-driven reconciles and the fix jobs' own pushes/comments need headroom.
 const RECONCILE_BUDGET_RESERVE = Number(process.env.PR_MONITOR_BUDGET_RESERVE ?? 500);
+// Collapse a burst of check_run/workflow_run webhooks for one PR into a single reconcile.
+const WEBHOOK_COALESCE_SECONDS = Number(process.env.PR_MONITOR_WEBHOOK_COALESCE_SECONDS ?? 45);
+const recentWebhookReconciles = new Map<string, number>();
 const FRONTEND_DEPLOY_LABEL = 'deploy-dev';
 const BACKEND_DEPLOY_WORKFLOW_ID = process.env.BE_DEPLOY_WORKFLOW_ID || '208630294';
 const FRONTEND_BUILD_WORKFLOW_ID = process.env.QA_BUILD_WORKFLOW_ID || 'staging.yml';
@@ -863,6 +866,24 @@ export async function handleGitHubWebhook(
 
   const { repo, prNumber, extraSignals } = payloadRepoAndPr(body);
   if (!repo || !prNumber) return { ok: true, ignored: 'not a watched PR event' };
+
+  // A CI run on a PR with ~27 checks emits ~54 check_run events, and each one used to drive a full
+  // PR snapshot. Only a *completed* check can change our view of CI, and a burst of them says the
+  // same thing repeatedly — so drop the rest. The 5-minute poll is the backstop for anything a
+  // coalesced burst misses; the cost of not doing this is exhausting the hourly REST budget, which
+  // stops the monitor completely.
+  const isCheckEvent = Boolean(body.check_run || body.check_suite || body.workflow_run);
+  if (isCheckEvent && !extraSignals.length) {
+    const action = String(body.action ?? '');
+    if (action && action !== 'completed') return { ok: true, ignored: `check event not completed (${action})` };
+    const key = `${repo}#${prNumber}`;
+    const last = recentWebhookReconciles.get(key) ?? 0;
+    if (Date.now() - last < WEBHOOK_COALESCE_SECONDS * 1000) {
+      return { ok: true, ignored: 'coalesced into a recent reconcile' };
+    }
+    recentWebhookReconciles.set(key, Date.now());
+  }
+
   const watch = await getPrWatch(repo, prNumber);
   if (!watch) return { ok: true, ignored: 'PR is not watched by Hermes' };
   await reconcilePrWatch(watch, log, extraSignals);
