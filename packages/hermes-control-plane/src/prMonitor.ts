@@ -34,6 +34,7 @@ import {
   listActivePrWatches,
   listBlockedPrWatches,
   markWatchBlocked,
+  acquireReconcileLease,
   markWatchQaQueued,
   markWatchReady,
   markReviewPinged,
@@ -74,6 +75,9 @@ const RECONCILE_BUDGET_RESERVE = Number(process.env.PR_MONITOR_BUDGET_RESERVE ??
 // Collapse a burst of check_run/workflow_run webhooks for one PR into a single reconcile.
 const WEBHOOK_COALESCE_SECONDS = Number(process.env.PR_MONITOR_WEBHOOK_COALESCE_SECONDS ?? 45);
 const recentWebhookReconciles = new Map<string, number>();
+// Minimum gap between periodic sweeps across the whole control-plane fleet. Slightly under the timer
+// interval so a little clock skew between replicas cannot skip a tick outright.
+const RECONCILE_LEASE_SECONDS = Number(process.env.PR_MONITOR_RECONCILE_LEASE_SECONDS ?? 240);
 const FRONTEND_DEPLOY_LABEL = 'deploy-dev';
 const BACKEND_DEPLOY_WORKFLOW_ID = process.env.BE_DEPLOY_WORKFLOW_ID || '208630294';
 const FRONTEND_BUILD_WORKFLOW_ID = process.env.QA_BUILD_WORKFLOW_ID || 'staging.yml';
@@ -890,7 +894,13 @@ export async function handleGitHubWebhook(
   return { ok: true };
 }
 
-export async function reconcileOpenPrs(log: FastifyBaseLogger): Promise<void> {
+export async function reconcileOpenPrs(log: FastifyBaseLogger, opts: { periodic?: boolean } = {}): Promise<void> {
+  // Only one replica sweeps per tick (an explicit POST /github/reconcile always runs).
+  if (opts.periodic && !(await acquireReconcileLease(RECONCILE_LEASE_SECONDS))) {
+    log.debug('another control-plane replica holds the reconcile lease this tick');
+    return;
+  }
+
   const [active, blocked] = await Promise.all([listActivePrWatches(), listBlockedPrWatches()]);
   const watches = [...active, ...blocked.filter(isRecoverableDeploymentBlock)];
   if (!watches.length) return;

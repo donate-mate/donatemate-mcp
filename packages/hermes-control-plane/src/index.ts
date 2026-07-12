@@ -476,7 +476,8 @@ app.get('/jobs/:id', async (req, reply) => {
 });
 
 if (PR_RECONCILE_SECONDS > 0) {
-  const run = () => reconcileOpenPrs(app.log).catch((err) => app.log.error({ err }, 'periodic PR reconciliation failed'));
+  const run = () =>
+    reconcileOpenPrs(app.log, { periodic: true }).catch((err) => app.log.error({ err }, 'periodic PR reconciliation failed'));
   setInterval(run, PR_RECONCILE_SECONDS * 1000).unref();
   setTimeout(run, 30_000).unref();
 }

@@ -122,6 +122,38 @@ export async function listBlockedPrWatches(): Promise<PrWatch[]> {
   return (res.Items ?? []) as PrWatch[];
 }
 
+/**
+ * Claim the right to run the periodic reconcile sweep. Every control-plane replica runs the same
+ * timer, so without this the whole fleet sweeps on every tick — duplicate GitHub reads that buy
+ * nothing (the replicas already race harmlessly on conditional writes) and that helped exhaust the
+ * hourly REST budget. Whoever wins the conditional update sweeps; the rest skip this tick.
+ * Fail-open: on any unexpected error we sweep, because a missed sweep is worse than a duplicate one.
+ */
+export async function acquireReconcileLease(minIntervalSeconds: number): Promise<boolean> {
+  const now = Date.now();
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: 'reconcile-lease' },
+        UpdateExpression: 'SET leaseAt = :now, #s = :s, expiresAt = :ttl',
+        ConditionExpression: 'attribute_not_exists(leaseAt) OR leaseAt < :cutoff',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':now': now,
+          ':cutoff': now - minIntervalSeconds * 1000,
+          ':s': 'lease',
+          ':ttl': Math.floor(now / 1000) + 24 * 3600,
+        },
+      })
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    return true;
+  }
+}
+
 export async function markWatchQaQueued(watch: PrWatch, qaJobId: string, headSha: string): Promise<boolean> {
   try {
     await ddb.send(
