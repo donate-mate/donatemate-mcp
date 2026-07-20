@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   HERMES_REVIEW_REPLY_MARKER_PREFIX,
   signalFromReviewThreadNode,
+  signalFromPrCommentWebhook,
 } from './github.js';
 
 const root = {
@@ -78,5 +79,38 @@ describe('signalFromReviewThreadNode', () => {
   it('ignores resolved and outdated threads', () => {
     expect(signalFromReviewThreadNode(thread([root], { isResolved: true }))).toBeNull();
     expect(signalFromReviewThreadNode(thread([root], { isOutdated: true }))).toBeNull();
+  });
+});
+
+describe('signalFromPrCommentWebhook', () => {
+  it('ignores Hermes GitHub App comments that mention itself', () => {
+    expect(
+      signalFromPrCommentWebhook({
+        comment: {
+          id: 5_028_133_600,
+          body: '⚠️ Hermes overlap warning — this PR overlaps another Hermes PR.',
+          created_at: '2026-07-20T23:09:37Z',
+          user: { login: 'donatemate-hermes[bot]', type: 'Bot' },
+        },
+      })
+    ).toBeNull();
+  });
+
+  it('keeps a human comment explicitly asking Hermes to address feedback', () => {
+    expect(
+      signalFromPrCommentWebhook({
+        comment: {
+          id: 123,
+          body: '@hermes please fix the null handling.',
+          html_url: 'https://github.com/example/repo/pull/1#issuecomment-123',
+          created_at: '2026-07-20T23:10:00Z',
+          user: { login: 'reviewer', type: 'User' },
+        },
+      })
+    ).toMatchObject({
+      id: 'pr-comment:123:2026-07-20T23:10:00Z',
+      kind: 'review_feedback',
+      summary: 'Top-level PR comment by reviewer',
+    });
   });
 });

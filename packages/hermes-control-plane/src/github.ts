@@ -707,12 +707,17 @@ export function signalFromReviewWebhook(body: Record<string, any>): PrSignal | n
 export function signalFromPrCommentWebhook(body: Record<string, any>): PrSignal | null {
   const comment = body.comment;
   if (!comment?.body) return null;
+  const authorLogin = String(comment.user?.login ?? '');
+  // Issue-comment webhooks include comments created by the GitHub App itself. Several normal
+  // Hermes notices contain the word "Hermes" (for example overlap warnings), so without this
+  // guard the bot treats its own status message as human review feedback and queues a repair job.
+  if (/(^|\/)donatemate-hermes(?:\[bot\])?$/i.test(authorLogin)) return null;
   const text = String(comment.body);
   if (!/(^|\s)(@?hermes|\/hermes|please fix|can you address)/i.test(text)) return null;
   return {
     id: `pr-comment:${comment.id}:${comment.updated_at ?? comment.created_at}`,
     kind: 'review_feedback',
-    summary: `Top-level PR comment by ${comment.user?.login ?? 'reviewer'}`,
+    summary: `Top-level PR comment by ${authorLogin || 'reviewer'}`,
     details: compactText(text, 1500),
     url: comment.html_url,
     createdAt: comment.created_at ?? new Date().toISOString(),
