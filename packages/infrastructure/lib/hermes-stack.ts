@@ -159,6 +159,11 @@ export class HermesStack extends cdk.Stack {
         // assignee-change events as a DynamoDB-deduped intake safety net.
         JIRA_ASSIGNMENT_RECONCILE_SECONDS: '300',
         JIRA_ASSIGNMENT_LOOKBACK_DAYS: '7',
+        // Direct Jira REST fast lane keeps assignments and `/go`/refinement comments responsive
+        // when Jira Automation's delivery queue is delayed. Durable event claims dedupe both paths.
+        JIRA_FAST_POLL_SECONDS: '10',
+        JIRA_FAST_LOOKBACK_MINUTES: '15',
+        JIRA_FAST_CONCURRENCY: '4',
         QA_BUILD_WORKFLOW_ID: 'staging.yml',
         QA_AUTOMATION_ENABLED: 'false',
         BE_DEPLOY_WORKFLOW_ID: '208630294', // donate-mate/donatemate "Deploy to Staging"

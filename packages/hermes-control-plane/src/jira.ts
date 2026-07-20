@@ -13,7 +13,7 @@ export function findIssueKey(text: string): string | null {
   return m ? m[1] : null;
 }
 
-function adfText(node: unknown): string {
+export function adfText(node: unknown): string {
   if (!node || typeof node !== 'object') return '';
   const n = node as { type?: string; text?: string; content?: unknown[] };
   if (n.type === 'text' && typeof n.text === 'string') return n.text;
@@ -37,10 +37,32 @@ export interface JiraAssignmentEvent {
   assignedAt: string;
 }
 
+export interface JiraActivityCandidate {
+  issueKey: string;
+  updatedAt: string;
+}
+
+export interface JiraCommentEvent {
+  issueKey: string;
+  eventId: string;
+  createdAt: string;
+  authorAccountId: string;
+  text: string;
+  phase: 'confirm' | 'comment';
+}
+
 interface JiraChangelogHistory {
   id?: string;
   created?: string;
   items?: Array<{ field?: string; to?: string | null }>;
+}
+
+interface JiraCommentRecord {
+  id?: string;
+  created?: string;
+  updated?: string;
+  author?: { accountId?: string };
+  body?: unknown;
 }
 
 function jqlString(value: string): string {
@@ -56,6 +78,46 @@ export function recentHermesAssignmentsJql(accountId: string, lookbackDays: numb
   const days = Math.max(1, Math.floor(lookbackDays));
   const account = jqlString(accountId);
   return `assignee = ${account} AND assignee CHANGED TO ${account} AFTER "-${days}d" ORDER BY updated DESC`;
+}
+
+/**
+ * Narrow fast-lane query for any Jira activity on tickets currently assigned to Hermes.
+ * Assignment changes update the issue too, so one inexpensive query feeds both assignment and
+ * comment reconciliation. A wider five-minute safety sweep remains responsible for old outages.
+ */
+export function recentHermesActivityJql(accountId: string, lookbackMinutes: number): string {
+  const minutes = Math.max(1, Math.floor(lookbackMinutes));
+  return `assignee = ${jqlString(accountId)} AND updated >= "-${minutes}m" ORDER BY updated DESC`;
+}
+
+export function jiraCommentEventsFromRecords(
+  issueKey: string,
+  botAccountId: string,
+  comments: JiraCommentRecord[],
+  createdAfterMs = 0
+): JiraCommentEvent[] {
+  return comments
+    .filter(
+      (comment) =>
+        comment.id &&
+        comment.created &&
+        comment.author?.accountId &&
+        comment.author.accountId !== botAccountId &&
+        Date.parse(comment.created) >= createdAfterMs
+    )
+    .map((comment) => {
+      const text = adfText(comment.body).trim();
+      return {
+        issueKey: issueKey.toUpperCase(),
+        eventId: comment.id!,
+        createdAt: comment.created!,
+        authorAccountId: comment.author!.accountId!,
+        text,
+        phase: /^\/go(?:\s|$)/i.test(text) ? ('confirm' as const) : ('comment' as const),
+      };
+    })
+    .filter((event) => Boolean(event.text))
+    .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
 }
 
 /** Select the newest changelog entry that assigned an issue to the Hermes account. */
@@ -151,6 +213,89 @@ export async function fetchRecentHermesAssignmentEvents(
     if (event) events.push(event);
   }
   return events;
+}
+
+/** One cheap JQL request per fast-poll tick; detailed reads happen only when an issue changed. */
+export async function fetchRecentHermesActivityCandidates(
+  accountId: string,
+  lookbackMinutes: number
+): Promise<JiraActivityCandidate[]> {
+  const c = await jiraCredentials();
+  if (!c) throw new Error('Jira credentials are not configured for fast activity reconciliation');
+
+  const candidates: JiraActivityCandidate[] = [];
+  let nextPageToken: string | undefined;
+  do {
+    const url = new URL(`${c.host}/rest/api/3/search/jql`);
+    url.searchParams.set('jql', recentHermesActivityJql(accountId, lookbackMinutes));
+    url.searchParams.set('fields', 'updated');
+    url.searchParams.set('maxResults', '100');
+    if (nextPageToken) url.searchParams.set('nextPageToken', nextPageToken);
+    const page = await jiraJson<{
+      issues?: Array<{ key?: string; fields?: { updated?: string } }>;
+      nextPageToken?: string;
+    }>(url, c.auth, 'Searching recent Hermes activity');
+    for (const issue of page.issues ?? []) {
+      if (issue.key && issue.fields?.updated) {
+        candidates.push({ issueKey: issue.key.toUpperCase(), updatedAt: issue.fields.updated });
+      }
+    }
+    nextPageToken = page.nextPageToken;
+  } while (nextPageToken);
+  return candidates;
+}
+
+/** Fetch recent human comments newest-first from Jira, then return them in processing order. */
+export async function fetchRecentJiraCommentEvents(
+  issueKey: string,
+  botAccountId: string,
+  lookbackMinutes: number
+): Promise<JiraCommentEvent[]> {
+  const c = await jiraCredentials();
+  if (!c) throw new Error('Jira credentials are not configured for comment reconciliation');
+
+  const cutoff = Date.now() - Math.max(1, Math.floor(lookbackMinutes)) * 60_000;
+  const comments: JiraCommentRecord[] = [];
+  let startAt = 0;
+  for (;;) {
+    const url = new URL(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`);
+    url.searchParams.set('startAt', String(startAt));
+    url.searchParams.set('maxResults', '100');
+    url.searchParams.set('orderBy', '-created');
+    const page = await jiraJson<{ comments?: JiraCommentRecord[]; total?: number }>(
+      url,
+      c.auth,
+      `Reading recent ${issueKey} comments`
+    );
+    const batch = page.comments ?? [];
+    comments.push(...batch);
+    const oldest = batch.reduce(
+      (value, comment) => Math.min(value, comment.created ? Date.parse(comment.created) : Number.POSITIVE_INFINITY),
+      Number.POSITIVE_INFINITY
+    );
+    startAt += batch.length;
+    if (!batch.length || startAt >= (page.total ?? startAt) || oldest < cutoff) break;
+  }
+  return jiraCommentEventsFromRecords(issueKey, botAccountId, comments, cutoff);
+}
+
+/** Resolve an Automation callback to its concrete Jira comment id for cross-path deduplication. */
+export async function fetchMatchingJiraCommentEvent(
+  issueKey: string,
+  botAccountId: string,
+  phase: 'confirm' | 'comment',
+  authorAccountId?: string,
+  text?: string
+): Promise<JiraCommentEvent | undefined> {
+  const events = await fetchRecentJiraCommentEvents(issueKey, botAccountId, 24 * 60);
+  const clean = (text ?? '').trim();
+  const phaseMatches = events.filter(
+    (event) => event.phase === phase && (phase === 'confirm' || !clean || event.text === clean)
+  );
+  const authorMatch = authorAccountId
+    ? phaseMatches.filter((event) => event.authorAccountId === authorAccountId).at(-1)
+    : undefined;
+  return authorMatch ?? phaseMatches.at(-1);
 }
 
 /**

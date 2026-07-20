@@ -19,7 +19,12 @@ import {
   fetchIssueContext,
   fetchIssue,
   fetchLatestHermesAssignmentEvent,
+  fetchMatchingJiraCommentEvent,
+  fetchRecentHermesActivityCandidates,
   fetchRecentHermesAssignmentEvents,
+  fetchRecentJiraCommentEvents,
+  type JiraAssignmentEvent,
+  type JiraCommentEvent,
   type JiraIssue,
 } from './jira.js';
 import { getFlow, setFlow, type JiraFlow } from './jiraflow.js';
@@ -32,11 +37,17 @@ import {
   tryClaimJiraAssignment,
 } from './jiraAssignmentClaims.js';
 import { processJiraAssignmentEvent, reconcileJiraAssignmentEvents } from './jiraAssignmentReconciler.js';
+import { completeJiraCommentClaim, releaseJiraCommentClaim, tryClaimJiraComment } from './jiraCommentClaims.js';
+import { processJiraCommentEvent, reconcileJiraCommentEvents } from './jiraCommentReconciler.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const PR_RECONCILE_SECONDS = Number(process.env.PR_RECONCILE_SECONDS ?? 300);
 const JIRA_ASSIGNMENT_RECONCILE_SECONDS = Number(process.env.JIRA_ASSIGNMENT_RECONCILE_SECONDS ?? 300);
 const JIRA_ASSIGNMENT_LOOKBACK_DAYS = Number(process.env.JIRA_ASSIGNMENT_LOOKBACK_DAYS ?? 7);
+const JIRA_FAST_POLL_SECONDS = Number(process.env.JIRA_FAST_POLL_SECONDS ?? 10);
+const JIRA_FAST_LOOKBACK_MINUTES = Number(process.env.JIRA_FAST_LOOKBACK_MINUTES ?? 15);
+const JIRA_FAST_CONCURRENCY = Number(process.env.JIRA_FAST_CONCURRENCY ?? 4);
+const PROCESS_STARTED_AT = Date.now();
 // --- WS5 --- Ticket-checklist extraction gate (default on; fail-open).
 const CHECKLIST_ENABLED = !/^(0|false|no|off)$/i.test(process.env.CHECKLIST_ENABLED ?? 'true');
 
@@ -271,12 +282,10 @@ app.post('/jira/webhook', async (req, reply) => {
   // Ack fast (Jira Automation has its own timeout); plan/queue asynchronously.
   reply.send({ ok: true });
   const work =
-    phase === 'confirm'
-      ? handleJiraConfirm(issueKey, body.author)
-      : phase === 'comment'
-        ? handleJiraComment(issueKey, body.text, body.author)
-        : phase === 'done'
-          ? handleJiraDone(issueKey, body.author)
+    phase === 'confirm' || phase === 'comment'
+      ? processJiraWebhookComment(issueKey, phase, body.text, body.author)
+      : phase === 'done'
+        ? handleJiraDone(issueKey, body.author)
         : processJiraAssignment(issueKey);
   work.catch((err) => app.log.error({ err, issueKey, phase }, 'jira webhook handler failed'));
 });
@@ -312,10 +321,162 @@ const JIRA_CHANNEL = 'jira';
 
 const assignmentProcessor = {
   tryClaim: tryClaimJiraAssignment,
-  process: (event: { issueKey: string; assignedAt: string }) => handleJiraAssigned(event.issueKey, event.assignedAt),
+  process: async (event: JiraAssignmentEvent) => {
+    await handleJiraAssigned(event.issueKey, event.assignedAt);
+    app.log.info(
+      { issueKey: event.issueKey, assignmentEventId: event.eventId, latencyMs: Date.now() - Date.parse(event.assignedAt) },
+      'Jira assignment handled'
+    );
+  },
   complete: completeJiraAssignmentClaim,
   release: releaseJiraAssignmentClaim,
 };
+
+const commentProcessor = {
+  tryClaim: tryClaimJiraComment,
+  process: async (event: JiraCommentEvent) => {
+    const flow = await getFlow(event.issueKey);
+    // An assignment can be claimed by the other control-plane replica while its plan is still
+    // being generated. Release this comment claim and retry on the next fast tick instead of
+    // consuming a `/go` before the flow exists.
+    if (!flow) throw new Error(`Jira flow for ${event.issueKey} is not ready`);
+    if (flow.status !== 'awaiting_confirm') return;
+
+    // On the first deploy of comment polling, avoid replaying a refinement already handled by the
+    // old Automation-only path. New events are protected by their durable comment-id claim.
+    if (event.phase === 'comment' && Date.parse(event.createdAt) < PROCESS_STARTED_AT) {
+      const history = await getConversation(JIRA_CHANNEL, event.issueKey);
+      if (history.some((message) => message.role === 'user' && message.content.trim() === event.text.trim())) return;
+    }
+
+    if (event.phase === 'confirm') await handleJiraConfirm(event.issueKey, event.authorAccountId);
+    else await handleJiraComment(event.issueKey, event.text, event.authorAccountId);
+    app.log.info(
+      {
+        issueKey: event.issueKey,
+        commentId: event.eventId,
+        phase: event.phase,
+        latencyMs: Date.now() - Date.parse(event.createdAt),
+      },
+      'Jira comment handled'
+    );
+  },
+  complete: completeJiraCommentClaim,
+  release: releaseJiraCommentClaim,
+};
+
+async function processJiraWebhookComment(
+  issueKey: string,
+  phase: 'confirm' | 'comment',
+  text?: string,
+  author?: string
+): Promise<void> {
+  const normalizedPhase = /^\/go(?:\s|$)/i.test((text ?? '').trim()) ? 'confirm' : phase;
+  const botAccountId = await getBotAccountId();
+  if (botAccountId) {
+    const event = await fetchMatchingJiraCommentEvent(issueKey, botAccountId, normalizedPhase, author, text);
+    if (event) {
+      await processJiraCommentEvent(event, commentProcessor);
+      return;
+    }
+  }
+  app.log.warn({ issueKey, phase: normalizedPhase }, 'Jira webhook comment id unavailable; processing without event dedupe');
+  if (normalizedPhase === 'confirm') await handleJiraConfirm(issueKey, author);
+  else await handleJiraComment(issueKey, text, author);
+}
+
+interface JiraActivitySnapshot {
+  updatedAt: string;
+  assignment?: JiraAssignmentEvent;
+  comments: JiraCommentEvent[];
+}
+
+const jiraActivityCache = new Map<string, JiraActivitySnapshot>();
+
+async function forEachWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  visit: (item: T) => Promise<void>
+): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      await visit(items[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(items.length, Math.max(1, concurrency)) }, worker));
+}
+
+let jiraFastSweepRunning = false;
+async function reconcileFastJiraActivity(): Promise<void> {
+  if (jiraFastSweepRunning) return;
+  jiraFastSweepRunning = true;
+  const startedAt = Date.now();
+  try {
+    const botAccountId = await getBotAccountId();
+    if (!botAccountId) throw new Error('Jira bot accountId is not configured');
+    const candidates = await fetchRecentHermesActivityCandidates(botAccountId, JIRA_FAST_LOOKBACK_MINUTES);
+    const activeKeys = new Set(candidates.map((candidate) => candidate.issueKey));
+    for (const key of jiraActivityCache.keys()) {
+      if (!activeKeys.has(key)) jiraActivityCache.delete(key);
+    }
+
+    let processed = 0;
+    let failed = 0;
+    await forEachWithConcurrency(candidates, JIRA_FAST_CONCURRENCY, async (candidate) => {
+      try {
+        let snapshot = jiraActivityCache.get(candidate.issueKey);
+        if (!snapshot || snapshot.updatedAt !== candidate.updatedAt) {
+          let fetchFailed = false;
+          const [assignment, comments] = await Promise.all([
+            fetchLatestHermesAssignmentEvent(candidate.issueKey, botAccountId).catch((err) => {
+              fetchFailed = true;
+              app.log.error({ err, issueKey: candidate.issueKey }, 'Fast Jira assignment read failed');
+              return undefined;
+            }),
+            fetchRecentJiraCommentEvents(candidate.issueKey, botAccountId, JIRA_FAST_LOOKBACK_MINUTES).catch((err) => {
+              fetchFailed = true;
+              app.log.error({ err, issueKey: candidate.issueKey }, 'Fast Jira comment read failed');
+              return [] as JiraCommentEvent[];
+            }),
+          ]);
+          snapshot = { updatedAt: candidate.updatedAt, assignment, comments };
+          if (!fetchFailed) jiraActivityCache.set(candidate.issueKey, snapshot);
+        }
+
+        if (snapshot.assignment) {
+          if (await processJiraAssignmentEvent(snapshot.assignment, assignmentProcessor)) processed++;
+        }
+
+        // Process assignment before comments for each issue. If the other replica owns planning,
+        // leave comments unclaimed until its flow is visible on a later tick.
+        const flow = await getFlow(candidate.issueKey);
+        if (!flow) return;
+        const comments = snapshot.comments.filter(
+          (event) => !snapshot!.assignment || Date.parse(event.createdAt) >= Date.parse(snapshot!.assignment.assignedAt)
+        );
+        const result = await reconcileJiraCommentEvents(comments, commentProcessor, (event, err) =>
+          app.log.error({ err, issueKey: event.issueKey, commentId: event.eventId }, 'Fast Jira comment processing failed')
+        );
+        processed += result.processed;
+        failed += result.failed;
+      } catch (err) {
+        failed++;
+        app.log.error({ err, issueKey: candidate.issueKey }, 'Fast Jira activity processing failed');
+      }
+    });
+    if (processed || failed) {
+      app.log.info(
+        { candidates: candidates.length, processed, failed, durationMs: Date.now() - startedAt },
+        'Fast Jira activity reconciliation completed'
+      );
+    }
+  } finally {
+    jiraFastSweepRunning = false;
+  }
+}
 
 /**
  * Run the webhook path through the same distributed changelog-event claim as the polling fallback.
@@ -400,10 +561,13 @@ async function handleJiraAssigned(issueKey: string, assignedAt?: string): Promis
     return;
   }
 
-  const plan = await planIssue(issue.context);
+  // Planning and checklist extraction are independent model calls. Running them together removes
+  // several seconds from the assignment-to-plan critical path.
+  const [plan, checklist] = await Promise.all([
+    planIssue(issue.context),
+    CHECKLIST_ENABLED ? extractChecklist(issue.context).catch(() => [] as string[]) : Promise.resolve(undefined),
+  ]);
   const taskPrompt = `Implement Jira issue ${issueKey}: ${issue.summary}\n\nPlanned approach:\n${plan}`;
-  // --- WS5 --- Derive a readiness checklist from the ticket (env-gated, fail-open).
-  const checklist = CHECKLIST_ENABLED ? await extractChecklist(issue.context).catch(() => [] as string[]) : undefined;
   await setFlow(issueKey, { status: 'awaiting_confirm', taskPrompt, repo, type, plan, checklist });
 
   // Seed a FRESH per-ticket conversation so follow-up comments refine this plan (Slack-thread
@@ -498,11 +662,13 @@ async function handleJiraConfirm(issueKey: string, author?: string): Promise<voi
     source: `jira:${issueKey}`,
   });
   await setFlow(issueKey, { ...routedFlow, status: 'running', jobId: job.jobId });
-  await transitionIssue(issueKey, COLUMN.inProgress);
-  await commentOnIssue(
-    issueKey,
-    `🛠️ Starting implementation — job \`${job.jobId}\` against \`${routedFlow.repo}\`. I'll comment with the PR when it's ready.`
-  );
+  await Promise.all([
+    transitionIssue(issueKey, COLUMN.inProgress),
+    commentOnIssue(
+      issueKey,
+      `🛠️ Starting implementation — job \`${job.jobId}\` against \`${routedFlow.repo}\`. I'll comment with the PR when it's ready.`
+    ),
+  ]);
 }
 
 async function handleJiraDone(issueKey: string, _author?: string): Promise<void> {
@@ -555,6 +721,14 @@ if (PR_RECONCILE_SECONDS > 0) {
     reconcileOpenPrs(app.log, { periodic: true }).catch((err) => app.log.error({ err }, 'periodic PR reconciliation failed'));
   setInterval(run, PR_RECONCILE_SECONDS * 1000).unref();
   setTimeout(run, 30_000).unref();
+}
+
+if (JIRA_FAST_POLL_SECONDS > 0) {
+  const run = () =>
+    reconcileFastJiraActivity().catch((err) => app.log.error({ err }, 'Fast Jira activity reconciliation failed'));
+  setInterval(run, JIRA_FAST_POLL_SECONDS * 1000).unref();
+  // Pick up commands that accumulated while a task was rolling before it joins the ALB.
+  setTimeout(run, 1_000).unref();
 }
 
 if (JIRA_ASSIGNMENT_RECONCILE_SECONDS > 0) {
