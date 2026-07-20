@@ -155,6 +155,10 @@ export class HermesStack extends cdk.Stack {
         SECRET_JIRA_BOT: secJiraBot.secretName, // write-backs (plan/progress comments + transitions) as Hermes
         MCP_ENDPOINT: props.mcpEndpoint ?? 'https://mcp.donate-mate.com/mcp',
         PR_RECONCILE_SECONDS: '300',
+        // Jira Automation can delay or suspend rule execution independently of Hermes. Poll
+        // assignee-change events as a DynamoDB-deduped intake safety net.
+        JIRA_ASSIGNMENT_RECONCILE_SECONDS: '300',
+        JIRA_ASSIGNMENT_LOOKBACK_DAYS: '7',
         QA_BUILD_WORKFLOW_ID: 'staging.yml',
         QA_AUTOMATION_ENABLED: 'false',
         BE_DEPLOY_WORKFLOW_ID: '208630294', // donate-mate/donatemate "Deploy to Staging"

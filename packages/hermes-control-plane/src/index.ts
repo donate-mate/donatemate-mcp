@@ -14,14 +14,29 @@ import { verifySlackSignature, postSlackMessage, stripMention } from './slack.js
 import { getSecretJson } from './secrets.js';
 import { converse, conversationToTask, planIssue, extractChecklist } from './converse.js';
 import { appendMessage, getConversation, resetConversation, setActivePointer, getActivePointer } from './convo.js';
-import { findIssueKey, fetchIssueContext, fetchIssue, type JiraIssue } from './jira.js';
+import {
+  findIssueKey,
+  fetchIssueContext,
+  fetchIssue,
+  fetchLatestHermesAssignmentEvent,
+  fetchRecentHermesAssignmentEvents,
+  type JiraIssue,
+} from './jira.js';
 import { getFlow, setFlow, type JiraFlow } from './jiraflow.js';
 import { commentOnIssue, transitionIssue, getBotAccountId, COLUMN } from './jiraBot.js';
 import { handleGitHubWebhook, reconcileOpenPrs } from './prMonitor.js';
 import { captureQaScenarioForDone } from './qaCapture.js';
+import {
+  completeJiraAssignmentClaim,
+  releaseJiraAssignmentClaim,
+  tryClaimJiraAssignment,
+} from './jiraAssignmentClaims.js';
+import { processJiraAssignmentEvent, reconcileJiraAssignmentEvents } from './jiraAssignmentReconciler.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const PR_RECONCILE_SECONDS = Number(process.env.PR_RECONCILE_SECONDS ?? 300);
+const JIRA_ASSIGNMENT_RECONCILE_SECONDS = Number(process.env.JIRA_ASSIGNMENT_RECONCILE_SECONDS ?? 300);
+const JIRA_ASSIGNMENT_LOOKBACK_DAYS = Number(process.env.JIRA_ASSIGNMENT_LOOKBACK_DAYS ?? 7);
 // --- WS5 --- Ticket-checklist extraction gate (default on; fail-open).
 const CHECKLIST_ENABLED = !/^(0|false|no|off)$/i.test(process.env.CHECKLIST_ENABLED ?? 'true');
 
@@ -262,7 +277,7 @@ app.post('/jira/webhook', async (req, reply) => {
         ? handleJiraComment(issueKey, body.text, body.author)
         : phase === 'done'
           ? handleJiraDone(issueKey, body.author)
-        : handleJiraAssigned(issueKey);
+        : processJiraAssignment(issueKey);
   work.catch((err) => app.log.error({ err, issueKey, phase }, 'jira webhook handler failed'));
 });
 
@@ -295,14 +310,74 @@ app.post('/github/reconcile', async (req, reply) => {
 // Conversation thread key for a Jira ticket (mirrors Slack's convo store, channel "jira").
 const JIRA_CHANNEL = 'jira';
 
+const assignmentProcessor = {
+  tryClaim: tryClaimJiraAssignment,
+  process: (event: { issueKey: string; assignedAt: string }) => handleJiraAssigned(event.issueKey, event.assignedAt),
+  complete: completeJiraAssignmentClaim,
+  release: releaseJiraAssignmentClaim,
+};
+
+/**
+ * Run the webhook path through the same distributed changelog-event claim as the polling fallback.
+ * This prevents a normal webhook and a safety-net sweep (or two control-plane replicas) from
+ * planning/commenting the same assignment twice.
+ */
+async function processJiraAssignment(issueKey: string): Promise<void> {
+  const botAccountId = await getBotAccountId();
+  if (!botAccountId) {
+    app.log.warn({ issueKey }, 'Jira bot accountId unavailable; processing assignment without event dedupe');
+    await handleJiraAssigned(issueKey);
+    return;
+  }
+
+  const event = await fetchLatestHermesAssignmentEvent(issueKey, botAccountId);
+  if (!event) {
+    // Jira's issue event normally follows the persisted changelog write. Fail open if eventual
+    // consistency or an older webhook prevents us from resolving the concrete event.
+    app.log.warn({ issueKey }, 'Jira assignment changelog event unavailable; processing without event dedupe');
+    await handleJiraAssigned(issueKey);
+    return;
+  }
+  await processJiraAssignmentEvent(event, assignmentProcessor);
+}
+
+let jiraAssignmentSweepRunning = false;
+async function reconcileMissedJiraAssignments(): Promise<void> {
+  if (jiraAssignmentSweepRunning) return;
+  jiraAssignmentSweepRunning = true;
+  try {
+    const botAccountId = await getBotAccountId();
+    if (!botAccountId) throw new Error('Jira bot accountId is not configured');
+    const events = await fetchRecentHermesAssignmentEvents(botAccountId, JIRA_ASSIGNMENT_LOOKBACK_DAYS);
+    const result = await reconcileJiraAssignmentEvents(events, assignmentProcessor, (event, err) =>
+      app.log.error({ err, issueKey: event.issueKey, assignmentEventId: event.eventId }, 'Jira assignment reconciliation failed')
+    );
+    if (result.processed || result.failed) {
+      app.log.info(result, 'Jira assignment reconciliation completed');
+    }
+  } finally {
+    jiraAssignmentSweepRunning = false;
+  }
+}
+
 // Ticket assigned to Hermes → derive a plan, store it, and comment for confirmation. Does NOT
 // run the agent yet. Idempotent: a re-assignment while running is a no-op.
-async function handleJiraAssigned(issueKey: string): Promise<void> {
+async function handleJiraAssigned(issueKey: string, assignedAt?: string): Promise<void> {
   const existing = await getFlow(issueKey);
+  // A webhook can arrive after the polling safety net (or vice versa). If this exact assignment
+  // already produced newer flow state, only finish its event marker; do not post a duplicate plan.
+  if (
+    assignedAt &&
+    existing?.updatedAt &&
+    Number.isFinite(Date.parse(assignedAt)) &&
+    Date.parse(existing.updatedAt) >= Date.parse(assignedAt)
+  ) {
+    return;
+  }
   const issue = await fetchIssue(issueKey);
   if (!issue) {
     await commentOnIssue(issueKey, "⚠️ I couldn't read this ticket's details — check my Jira access.");
-    return;
+    throw new Error(`Unable to read Jira issue ${issueKey}`);
   }
 
   const { type, repo, isDesign } = routeIntentFromJira(issue);
@@ -480,6 +555,14 @@ if (PR_RECONCILE_SECONDS > 0) {
     reconcileOpenPrs(app.log, { periodic: true }).catch((err) => app.log.error({ err }, 'periodic PR reconciliation failed'));
   setInterval(run, PR_RECONCILE_SECONDS * 1000).unref();
   setTimeout(run, 30_000).unref();
+}
+
+if (JIRA_ASSIGNMENT_RECONCILE_SECONDS > 0) {
+  const run = () =>
+    reconcileMissedJiraAssignments().catch((err) => app.log.error({ err }, 'periodic Jira assignment reconciliation failed'));
+  setInterval(run, JIRA_ASSIGNMENT_RECONCILE_SECONDS * 1000).unref();
+  // Start promptly on deploy so assignments missed during an Automation outage are replayed.
+  setTimeout(run, 10_000).unref();
 }
 
 app

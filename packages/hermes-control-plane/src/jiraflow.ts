@@ -24,6 +24,7 @@ export interface JiraFlow {
   type: WorkerType;
   plan: string;
   jobId?: string;
+  updatedAt?: string;
   // --- WS5 --- Acceptance/defect checklist derived from the ticket, used for readiness gating.
   checklist?: string[];
 }
@@ -33,9 +34,9 @@ const flowKey = (issueKey: string) => `jiraflow:${issueKey.toUpperCase()}`;
 export async function getFlow(issueKey: string): Promise<JiraFlow | undefined> {
   const r = await ddb.send(new GetCommand({ TableName: TABLE, Key: { jobId: flowKey(issueKey) } }));
   if (!r.Item) return undefined;
-  const { status, taskPrompt, repo, type, plan, flowJobId, checklist } = r.Item as Record<string, unknown>;
+  const { status, taskPrompt, repo, type, plan, flowJobId, checklist, updatedAt } = r.Item as Record<string, unknown>;
   // --- WS5 --- surface the persisted checklist (may be absent on older flow rows).
-  return { status, taskPrompt, repo, type, plan, jobId: flowJobId, checklist } as JiraFlow;
+  return { status, taskPrompt, repo, type, plan, jobId: flowJobId, checklist, updatedAt } as JiraFlow;
 }
 
 export async function setFlow(issueKey: string, flow: JiraFlow): Promise<void> {

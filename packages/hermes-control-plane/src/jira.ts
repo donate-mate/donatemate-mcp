@@ -31,6 +31,128 @@ export interface JiraIssue {
   context: string; // human-readable block (summary + type + description + recent comments)
 }
 
+export interface JiraAssignmentEvent {
+  issueKey: string;
+  eventId: string;
+  assignedAt: string;
+}
+
+interface JiraChangelogHistory {
+  id?: string;
+  created?: string;
+  items?: Array<{ field?: string; to?: string | null }>;
+}
+
+function jqlString(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * JQL used by the control-plane safety-net poller. Jira Automation can delay or suspend rule
+ * execution independently of Hermes; polling recent assignee changes keeps intake operational
+ * without repeatedly scanning the whole project.
+ */
+export function recentHermesAssignmentsJql(accountId: string, lookbackDays: number): string {
+  const days = Math.max(1, Math.floor(lookbackDays));
+  const account = jqlString(accountId);
+  return `assignee = ${account} AND assignee CHANGED TO ${account} AFTER "-${days}d" ORDER BY updated DESC`;
+}
+
+/** Select the newest changelog entry that assigned an issue to the Hermes account. */
+export function latestHermesAssignmentEvent(
+  issueKey: string,
+  accountId: string,
+  histories: JiraChangelogHistory[]
+): JiraAssignmentEvent | undefined {
+  return histories
+    .filter(
+      (history) =>
+        history.id &&
+        history.created &&
+        history.items?.some((item) => item.field === 'assignee' && item.to === accountId)
+    )
+    .map((history) => ({ issueKey: issueKey.toUpperCase(), eventId: history.id!, assignedAt: history.created! }))
+    .sort((a, b) => Date.parse(b.assignedAt) - Date.parse(a.assignedAt))[0];
+}
+
+async function jiraCredentials(): Promise<{ host: string; auth: string } | null> {
+  if (!SECRET_JIRA) return null;
+  const { host, email, token } = await getSecretJson(SECRET_JIRA);
+  if (!host || !email || !token) return null;
+  return { host: host.replace(/\/$/, ''), auth: Buffer.from(`${email}:${token}`).toString('base64') };
+}
+
+async function jiraJson<T>(url: URL, auth: string, operation: string): Promise<T> {
+  const res = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+  if (!res.ok) {
+    const detail = (await res.text()).slice(0, 300);
+    throw new Error(`${operation} failed: Jira HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
+  }
+  return (await res.json()) as T;
+}
+
+/** Fetch the latest concrete assignee-change event for one issue. */
+export async function fetchLatestHermesAssignmentEvent(
+  issueKey: string,
+  accountId: string
+): Promise<JiraAssignmentEvent | undefined> {
+  const c = await jiraCredentials();
+  if (!c) throw new Error('Jira credentials are not configured for assignment reconciliation');
+
+  const url = new URL(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/changelog`);
+  url.searchParams.set('maxResults', '100');
+  let page = await jiraJson<{ total?: number; values?: JiraChangelogHistory[] }>(url, c.auth, `Reading ${issueKey} changelog`);
+  let histories = page.values ?? [];
+
+  // Changelogs are returned oldest-first. Fetch the final page when an issue has more than 100
+  // history entries so a recent reassignment cannot be hidden beyond the first page.
+  const total = page.total ?? histories.length;
+  if (total > histories.length) {
+    url.searchParams.set('startAt', String(Math.max(0, total - 100)));
+    page = await jiraJson(url, c.auth, `Reading latest ${issueKey} changelog page`);
+    histories = page.values ?? [];
+  }
+  return latestHermesAssignmentEvent(issueKey, accountId, histories);
+}
+
+/**
+ * Find recent, currently-active assignments to Hermes and resolve each to a stable Jira changelog
+ * id. The id is used as the distributed dedupe key across both control-plane replicas.
+ */
+export async function fetchRecentHermesAssignmentEvents(
+  accountId: string,
+  lookbackDays: number
+): Promise<JiraAssignmentEvent[]> {
+  const c = await jiraCredentials();
+  if (!c) throw new Error('Jira credentials are not configured for assignment reconciliation');
+
+  const issueKeys: string[] = [];
+  let nextPageToken: string | undefined;
+  do {
+    const url = new URL(`${c.host}/rest/api/3/search/jql`);
+    url.searchParams.set('jql', recentHermesAssignmentsJql(accountId, lookbackDays));
+    url.searchParams.set('fields', 'key');
+    url.searchParams.set('maxResults', '100');
+    if (nextPageToken) url.searchParams.set('nextPageToken', nextPageToken);
+    const page = await jiraJson<{ issues?: Array<{ key?: string }>; nextPageToken?: string }>(
+      url,
+      c.auth,
+      'Searching recent Hermes assignments'
+    );
+    issueKeys.push(...(page.issues ?? []).map((issue) => issue.key).filter((key): key is string => Boolean(key)));
+    nextPageToken = page.nextPageToken;
+  } while (nextPageToken);
+
+  const events: JiraAssignmentEvent[] = [];
+  // Keep this sequential: assignment volume is low, and it avoids creating a Jira API burst when
+  // a human assigns a backlog batch at once.
+  for (const issueKey of [...new Set(issueKeys)]) {
+    const event = await fetchLatestHermesAssignmentEvent(issueKey, accountId);
+    if (event) events.push(event);
+  }
+  return events;
+}
+
 /**
  * The accountId of the issue's current assignee. Distinguishes:
  *   - `undefined` → could NOT determine (unconfigured / Jira unreachable) → callers should fail open.
