@@ -26,6 +26,14 @@ export type JobKind =
   | 'deploy_verification'
   | 'qa_proof';
 
+/** The exact inline review thread/comment a follow-up job must acknowledge after pushing its fix. */
+export interface ReviewReplyTarget {
+  threadId: string;
+  feedbackCommentId: string;
+  rootCommentId: number;
+  url?: string;
+}
+
 // Default branch each worker type targets when a job doesn't specify one. The FE app's `main`
 // is a deploy-test skeleton — real code lives on `staging` — so FE/QA default there.
 const DEFAULT_BASE_BRANCH: Record<WorkerType, string> = {
@@ -53,6 +61,7 @@ export interface HermesJob {
   headSha?: string;
   issueKey?: string;
   feedbackSummary?: string;
+  reviewReplyTargets?: ReviewReplyTarget[];
   qaPlanUri?: string;
   createdAt: string;
   updatedAt?: string;
@@ -78,6 +87,7 @@ export interface CreateJobInput {
   headSha?: string;
   issueKey?: string;
   feedbackSummary?: string;
+  reviewReplyTargets?: ReviewReplyTarget[];
   qaPlanUri?: string;
 }
 
@@ -103,6 +113,7 @@ export async function createJob(input: CreateJobInput): Promise<HermesJob> {
     headSha: input.headSha,
     issueKey: input.issueKey,
     feedbackSummary: input.feedbackSummary,
+    reviewReplyTargets: input.reviewReplyTargets,
     qaPlanUri: input.qaPlanUri,
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),

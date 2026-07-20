@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { rm } from 'node:fs/promises';
 import { getSecretJson } from './secrets.js';
+import type { ReviewReplyTarget } from './jobs.js';
 
 const exec = promisify(execFile);
 const SECRET_GITHUB_APP = process.env.SECRET_GITHUB_APP!;
@@ -343,6 +344,110 @@ export async function commentOnPullRequest(octokit: Octokit, repo: string, prNum
   } catch (err) {
     console.warn(`[github] failed to comment on ${repo}#${prNumber}:`, err instanceof Error ? err.message : String(err));
   }
+}
+
+export const HERMES_REVIEW_REPLY_MARKER_PREFIX = '<!-- hermes-review-addressed:';
+
+export function reviewReplyMarker(feedbackCommentId: string): string {
+  // GraphQL node ids are opaque but currently URL-safe. Restrict the value before placing it in an
+  // HTML comment so corrupted job data cannot alter the visible reply.
+  const safeId = String(feedbackCommentId).replace(/[^A-Za-z0-9_:-]/g, '').slice(0, 180);
+  if (!safeId) throw new Error('review reply target is missing a valid feedback comment id');
+  return `${HERMES_REVIEW_REPLY_MARKER_PREFIX}${safeId} -->`;
+}
+
+export function addressedReviewReplyBody(feedbackCommentId: string, headSha: string): string {
+  return [
+    `🤖 Addressed this feedback in commit \`${headSha.slice(0, 7)}\`.`,
+    '',
+    'CI is rerunning; please re-review after it passes.',
+    reviewReplyMarker(feedbackCommentId),
+  ].join('\n');
+}
+
+async function createReviewCommentReply(
+  octokit: Octokit,
+  repo: string,
+  prNumber: number,
+  target: ReviewReplyTarget,
+  body: string
+): Promise<void> {
+  const { owner, name } = splitRepo(repo);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      // GitHub requires the numeric id of the thread's top-level comment; replies-to-replies are
+      // rejected. The control plane captures that root id when it reads the GraphQL thread.
+      await octokit.request('POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies', {
+        owner,
+        repo: name,
+        pull_number: prNumber,
+        comment_id: target.rootCommentId,
+        body,
+      });
+      return;
+    } catch (err) {
+      lastError = err;
+      const status = Number((err as { status?: number })?.status ?? 0);
+      const message = err instanceof Error ? err.message : String(err);
+      const retryable =
+        status === 0 ||
+        status === 408 ||
+        status === 429 ||
+        status >= 500 ||
+        (status === 403 && /rate limit|secondary rate/i.test(message));
+      if (!retryable || attempt === 3) break;
+      await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+    }
+  }
+  throw lastError;
+}
+
+export interface ReviewReplyResult {
+  posted: number;
+  alreadyPresent: number;
+}
+
+/**
+ * Reply directly to every inline review thread addressed by a follow-up commit.
+ *
+ * The hidden per-feedback marker makes the operation idempotent: if a worker retries after a
+ * partial write, already-posted acknowledgements are discovered and skipped.
+ */
+export async function replyToAddressedReviewComments(
+  octokit: Octokit,
+  repo: string,
+  prNumber: number,
+  targets: ReviewReplyTarget[],
+  headSha: string
+): Promise<ReviewReplyResult> {
+  if (!targets.length) return { posted: 0, alreadyPresent: 0 };
+
+  const { owner, name } = splitRepo(repo);
+  const comments = await octokit.paginate(octokit.pulls.listReviewComments, {
+    owner,
+    repo: name,
+    pull_number: prNumber,
+    per_page: 100,
+  });
+  const bodies = comments.map((comment) => String(comment.body ?? ''));
+  const uniqueTargets = [...new Map(targets.map((target) => [target.feedbackCommentId, target])).values()];
+  let posted = 0;
+  let alreadyPresent = 0;
+
+  for (const target of uniqueTargets) {
+    const marker = reviewReplyMarker(target.feedbackCommentId);
+    if (bodies.some((body) => body.includes(marker))) {
+      alreadyPresent++;
+      continue;
+    }
+    const body = addressedReviewReplyBody(target.feedbackCommentId, headSha);
+    await createReviewCommentReply(octokit, repo, prNumber, target, body);
+    bodies.push(body);
+    posted++;
+  }
+
+  return { posted, alreadyPresent };
 }
 
 async function ensureRepositoryLabel(octokit: Octokit, repo: string, label: string): Promise<void> {

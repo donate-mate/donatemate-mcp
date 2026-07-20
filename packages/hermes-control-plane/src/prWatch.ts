@@ -45,6 +45,12 @@ export interface PrSignal {
   details?: string;
   url?: string;
   headSha?: string;
+  /** GraphQL node id for an inline review thread. Present only for thread feedback. */
+  reviewThreadId?: string;
+  /** GraphQL node id for the reviewer comment that made this feedback actionable. */
+  reviewCommentId?: string;
+  /** REST database id of the thread's top-level comment, required by GitHub's reply endpoint. */
+  reviewRootCommentId?: number;
   createdAt: string;
 }
 

@@ -16,6 +16,7 @@ import { join as joinPath } from 'node:path';
 import {
   getInstallationAuth,
   commentOnPullRequest,
+  replyToAddressedReviewComments,
   cloneRepo,
   createBranch,
   getHeadSha,
@@ -295,6 +296,12 @@ async function completeFollowupJob(input: {
     transcript,
   });
   const headSha = await getHeadSha(dir);
+  if (job.reviewReplyTargets?.length) {
+    const replies = await replyToAddressedReviewComments(octokit, job.repo, job.prNumber, job.reviewReplyTargets, headSha);
+    console.log(
+      `[${jobId}] acknowledged addressed review feedback (${replies.posted} posted, ${replies.alreadyPresent} already present)`
+    );
+  }
   await updateJob(jobId, 'done', { prUrl: job.prUrl, transcriptUri, headSha });
   await markPrWatchWaiting(job.repo, job.prNumber, headSha);
   await notify(job, `:white_check_mark: ${message} Waiting for CI.`);
@@ -524,6 +531,12 @@ async function processJob(jobId: string): Promise<void> {
           console.warn(`[${jobId}] failed to apply requested labels:`, e instanceof Error ? e.message : String(e))
         );
         console.log(`[${jobId}] applied agent-requested labels: ${requestedLabels.join(', ')}`);
+      }
+      if (job.reviewReplyTargets?.length) {
+        const replies = await replyToAddressedReviewComments(octokit, job.repo, job.prNumber, job.reviewReplyTargets, headSha);
+        console.log(
+          `[${jobId}] acknowledged addressed review feedback (${replies.posted} posted, ${replies.alreadyPresent} already present)`
+        );
       }
       await putMetric('HermesCiFixAttempts', 1, { type: job.type }); // WS2 — post-open auto-repair round
       await updateJob(jobId, 'done', { prUrl: job.prUrl, transcriptUri, headSha });

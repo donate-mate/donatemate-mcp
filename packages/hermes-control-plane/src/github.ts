@@ -41,6 +41,11 @@ function immutableCache<T>(maxEntries: number) {
 const changedFilesCache = immutableCache<string[]>(500);
 const annotationsCache = immutableCache<string>(1000);
 
+// Worker replies include this hidden marker. When it is the newest message in an unresolved
+// thread, the feedback has already been handled and must not become a new signal merely because
+// Hermes's own reply changed the thread's last-comment id.
+export const HERMES_REVIEW_REPLY_MARKER_PREFIX = '<!-- hermes-review-addressed:';
+
 /** A rate-limit 403/429 from GitHub, as opposed to a permissions 403. */
 export function isRateLimitError(err: unknown): boolean {
   const e = err as { status?: number; message?: string };
@@ -511,6 +516,40 @@ export async function latestSuccessfulWorkflowSignalContainingCommit(
   return null;
 }
 
+export function signalFromReviewThreadNode(thread: any): PrSignal | null {
+  if (thread?.isResolved || thread?.isOutdated) return null;
+
+  const comments = (thread?.comments?.nodes ?? []) as any[];
+  const root = comments[0];
+  const last = comments[comments.length - 1];
+  if (!last?.id) return null;
+
+  // An unresolved GitHub thread remains open until a reviewer resolves it. A Hermes reply should
+  // acknowledge the fix without causing another fix job. If a reviewer replies after our marker,
+  // their comment becomes `last` and produces a fresh signal as expected.
+  if (String(last.body ?? '').includes(HERMES_REVIEW_REPLY_MARKER_PREFIX)) return null;
+
+  const rootCommentId = Number(root?.databaseId);
+  const body = comments
+    .map((comment: any) => {
+      const text = String(comment.body ?? '').replace(/<!-- hermes-review-addressed:[^>]*-->/g, '');
+      return `${comment.author?.login ?? 'reviewer'}: ${compactText(text, 500)}`;
+    })
+    .join('\n');
+
+  return {
+    id: `review:${thread.id}:${last.id}`,
+    kind: 'review_feedback',
+    summary: `Unresolved review thread on ${thread.path ?? 'unknown file'}${thread.line ? `:${thread.line}` : ''}`,
+    details: body,
+    url: last.url,
+    reviewThreadId: thread.id,
+    reviewCommentId: last.id,
+    reviewRootCommentId: Number.isSafeInteger(rootCommentId) && rootCommentId > 0 ? rootCommentId : undefined,
+    createdAt: last.createdAt ?? new Date().toISOString(),
+  };
+}
+
 async function reviewThreadSignals(token: string, repo: string, prNumber: number): Promise<PrSignal[]> {
   const { owner, name } = splitRepo(repo);
   const query = `
@@ -524,9 +563,10 @@ async function reviewThreadSignals(token: string, repo: string, prNumber: number
               isOutdated
               path
               line
-              comments(first: 20) {
+              comments(first: 100) {
                 nodes {
                   id
+                  databaseId
                   body
                   url
                   createdAt
@@ -546,23 +586,7 @@ async function reviewThreadSignals(token: string, repo: string, prNumber: number
   if (!res.ok) throw new Error(`GitHub GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = (await res.json()) as any;
   const threads = data.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
-  return threads
-    .filter((t: any) => !t.isResolved && !t.isOutdated)
-    .map((t: any) => {
-      const comments = t.comments?.nodes ?? [];
-      const last = comments[comments.length - 1] ?? {};
-      const body = comments
-        .map((c: any) => `${c.author?.login ?? 'reviewer'}: ${compactText(c.body, 500)}`)
-        .join('\n');
-      return {
-        id: `review:${t.id}:${last.id ?? 'none'}`,
-        kind: 'review_feedback',
-        summary: `Unresolved review thread on ${t.path ?? 'unknown file'}${t.line ? `:${t.line}` : ''}`,
-        details: body,
-        url: last.url,
-        createdAt: last.createdAt ?? new Date().toISOString(),
-      } as PrSignal;
-    });
+  return threads.map(signalFromReviewThreadNode).filter((signal: PrSignal | null): signal is PrSignal => Boolean(signal));
 }
 
 async function reviewDecisionSignals(token: string, repo: string, prNumber: number): Promise<PrSignal[]> {

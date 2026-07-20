@@ -11,7 +11,7 @@ process.env.JOBS_TABLE ??= 'test-table';
 process.env.AWS_REGION ??= 'us-east-2';
 
 import { describe, expect, it } from 'vitest';
-import { dedupeNewSignals, isRetryOfHandledSignal } from './prMonitor.js';
+import { dedupeNewSignals, isRetryOfHandledSignal, reviewReplyTargetsForSignals } from './prMonitor.js';
 import type { PrSignal, PrWatch } from './prWatch.js';
 
 const HEAD = 'd726d96c4c1cf8055825279bd75c622aca98e504';
@@ -113,5 +113,26 @@ describe('isRetryOfHandledSignal', () => {
 
   it('does not flag a first attempt', () => {
     expect(isRetryOfHandledSignal(watch({ handledSignalIds: [] }), [ciSignal()])).toBe(false);
+  });
+});
+
+describe('reviewReplyTargetsForSignals', () => {
+  it('keeps only fully-addressable inline review signals', () => {
+    const inline: PrSignal = {
+      ...reviewSignal(),
+      reviewThreadId: 'PRRT_thread',
+      reviewCommentId: 'PRRC_feedback',
+      reviewRootCommentId: 3_553_703_498,
+      url: 'https://github.com/example/repo/pull/1#discussion_r3553703498',
+    };
+
+    expect(reviewReplyTargetsForSignals([inline, reviewSignal('review-state:123')])).toEqual([
+      {
+        threadId: 'PRRT_thread',
+        feedbackCommentId: 'PRRC_feedback',
+        rootCommentId: 3_553_703_498,
+        url: inline.url,
+      },
+    ]);
   });
 });

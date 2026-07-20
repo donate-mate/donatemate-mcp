@@ -23,6 +23,13 @@ export type JobKind =
   | 'deploy_verification'
   | 'qa_proof';
 
+export interface ReviewReplyTarget {
+  threadId: string;
+  feedbackCommentId: string;
+  rootCommentId: number;
+  url?: string;
+}
+
 export interface HermesJob {
   jobId: string;
   kind?: JobKind;
@@ -41,6 +48,7 @@ export interface HermesJob {
   headSha?: string;
   issueKey?: string;
   feedbackSummary?: string;
+  reviewReplyTargets?: ReviewReplyTarget[];
   qaPlanUri?: string;
   updatedAt?: string;
 }

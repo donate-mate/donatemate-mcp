@@ -4,7 +4,14 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { FastifyBaseLogger } from 'fastify';
-import { createJob, getJob, updateJob, type HermesJob, type JobKind } from './jobs.js';
+import {
+  createJob,
+  getJob,
+  updateJob,
+  type HermesJob,
+  type JobKind,
+  type ReviewReplyTarget,
+} from './jobs.js';
 import {
   collectPrBodyAndComments,
   collectPrSnapshot,
@@ -105,6 +112,29 @@ function formatSignals(signals: PrSignal[], maxDetails = 900): string {
       return `- [${label}] ${s.summary}${details}${url}`;
     })
     .join('\n');
+}
+
+/** Preserve exact inline-review locations through DynamoDB/SQS so the worker can reply in-thread. */
+export function reviewReplyTargetsForSignals(signals: PrSignal[]): ReviewReplyTarget[] {
+  const targets = new Map<string, ReviewReplyTarget>();
+  for (const signal of signals) {
+    if (
+      signal.kind !== 'review_feedback' ||
+      !signal.reviewThreadId ||
+      !signal.reviewCommentId ||
+      !Number.isSafeInteger(signal.reviewRootCommentId) ||
+      Number(signal.reviewRootCommentId) <= 0
+    ) {
+      continue;
+    }
+    targets.set(signal.reviewCommentId, {
+      threadId: signal.reviewThreadId,
+      feedbackCommentId: signal.reviewCommentId,
+      rootCommentId: Number(signal.reviewRootCommentId),
+      url: signal.url,
+    });
+  }
+  return [...targets.values()];
 }
 
 /**
@@ -326,6 +356,7 @@ async function startFollowupJob(watch: PrWatch, signals: PrSignal[]): Promise<vo
   const signalIds = signals.map((s) => s.id);
   const { kind, jiraState } = followupKind(signals);
   const feedbackSummary = formatSignals(signals);
+  const reviewReplyTargets = reviewReplyTargetsForSignals(signals);
   // Read the previous attempt's outcome before tryStartFix overwrites lastFixJobId with this one.
   const retry = isRetryOfHandledSignal(watch, signals) ? await retryContext(watch) : '';
   const fixJobId = randomUUID();
@@ -348,6 +379,7 @@ async function startFollowupJob(watch: PrWatch, signals: PrSignal[]): Promise<vo
       channel: watch.channel,
       threadTs: watch.threadTs,
       feedbackSummary,
+      reviewReplyTargets: reviewReplyTargets.length ? reviewReplyTargets : undefined,
       source: `github:${watch.repo}#${watch.prNumber}`,
       prompt: buildFollowupPrompt(watch, signals, feedbackSummary, retry),
     });
