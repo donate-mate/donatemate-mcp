@@ -289,13 +289,17 @@ export async function fetchMatchingJiraCommentEvent(
 ): Promise<JiraCommentEvent | undefined> {
   const events = await fetchRecentJiraCommentEvents(issueKey, botAccountId, 24 * 60);
   const clean = (text ?? '').trim();
-  const phaseMatches = events.filter(
-    (event) => event.phase === phase && (phase === 'confirm' || !clean || event.text === clean)
-  );
+  const phaseMatches = events.filter((event) => event.phase === phase);
+  const exactMatches = phaseMatches.filter((event) => phase === 'confirm' || !clean || event.text === clean);
+  // Automation's {{comment.body}} can render differently from the ADF text returned by REST.
+  // Prefer exact text, then the latest same-author event, then the latest event of this phase.
+  const exactAuthorMatch = authorAccountId
+    ? exactMatches.filter((event) => event.authorAccountId === authorAccountId).at(-1)
+    : undefined;
   const authorMatch = authorAccountId
     ? phaseMatches.filter((event) => event.authorAccountId === authorAccountId).at(-1)
     : undefined;
-  return authorMatch ?? phaseMatches.at(-1);
+  return exactAuthorMatch ?? authorMatch ?? exactMatches.at(-1) ?? phaseMatches.at(-1);
 }
 
 /**

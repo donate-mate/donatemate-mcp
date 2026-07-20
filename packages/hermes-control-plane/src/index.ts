@@ -380,6 +380,10 @@ async function processJiraWebhookComment(
       return;
     }
   }
+  if (JIRA_FAST_POLL_SECONDS > 0) {
+    app.log.warn({ issueKey, phase: normalizedPhase }, 'Jira webhook event unresolved; deferred to fast poll');
+    return;
+  }
   app.log.warn({ issueKey, phase: normalizedPhase }, 'Jira webhook comment id unavailable; processing without event dedupe');
   if (normalizedPhase === 'confirm') await handleJiraConfirm(issueKey, author);
   else await handleJiraComment(issueKey, text, author);
