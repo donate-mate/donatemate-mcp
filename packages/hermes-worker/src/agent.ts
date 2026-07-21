@@ -79,11 +79,12 @@ function codexLogin(apiKey: string, env: NodeJS.ProcessEnv): Promise<void> {
   });
 }
 
-// Run codex with stdin set to /dev/null. `codex exec` treats a piped/open stdin as appended
-// input and blocks waiting for EOF — under execFile that pipe never closes, hanging the job.
-function runCodex(args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
+// Keep prompts off argv. Linux limits each argument to roughly 128 KiB, which large pre-open
+// review diffs can exceed. `codex exec -` reads the prompt from stdin; explicitly ending the pipe
+// supplies EOF so Codex does not wait for more input.
+function runCodex(args: string[], prompt: string, cwd: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('codex', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('codex', args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -101,6 +102,16 @@ function runCodex(args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<
       clearTimeout(timer);
       reject(e);
     });
+    // A fast CLI failure can close stdin before the buffered prompt is flushed. The process exit
+    // and stderr are the useful result in that case, so prevent EPIPE from becoming an unhandled
+    // stream error.
+    child.stdin.on('error', (e: NodeJS.ErrnoException) => {
+      if (e.code !== 'EPIPE') {
+        clearTimeout(timer);
+        reject(e);
+      }
+    });
+    child.stdin.end(prompt);
     child.on('close', (code) => {
       clearTimeout(timer);
       resolve({ stdout, stderr, code: code ?? 0, timedOut });
@@ -127,6 +138,39 @@ AWS observability is available through the task role and the \`aws\` CLI. For ba
 
 `;
 
+export interface CodexExecInvocation {
+  args: string[];
+  stdin: string;
+}
+
+/** Build a size-safe invocation: prompt content is streamed, never included in process argv. */
+export function buildCodexExecInvocation(input: {
+  dir: string;
+  lastMsgFile: string;
+  model: string;
+  effort: string;
+  prompt: string;
+}): CodexExecInvocation {
+  return {
+    args: [
+      'exec',
+      '--model',
+      input.model,
+      '-c',
+      `model_reasoning_effort=${input.effort}`, // WS3.1
+      '--dangerously-bypass-approvals-and-sandbox', // the Fargate container is the sandbox
+      '--ephemeral', // don't persist session files
+      '--skip-git-repo-check',
+      '-C',
+      input.dir,
+      '-o',
+      input.lastMsgFile,
+      '-', // read the complete prompt from stdin
+    ],
+    stdin: input.prompt,
+  };
+}
+
 export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOptions = {}): Promise<AgentResult> {
   const { apiKey } = await getSecretJson(SECRET_OPENAI);
   if (!apiKey) throw new Error('OpenAI API key not configured in Secrets Manager');
@@ -140,21 +184,7 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
   const outDir = await mkdtemp(join(tmpdir(), 'hermes-codex-'));
   const lastMsgFile = join(outDir, 'last.txt');
 
-  const args = [
-    'exec',
-    '--model',
-    model,
-    '-c',
-    `model_reasoning_effort=${effort}`, // WS3.1
-    '--dangerously-bypass-approvals-and-sandbox', // the Fargate container is the sandbox
-    '--ephemeral', // don't persist session files
-    '--skip-git-repo-check',
-    '-C',
-    dir,
-    '-o',
-    lastMsgFile,
-    prompt,
-  ];
+  const invocation = buildCodexExecInvocation({ dir, lastMsgFile, model, effort, prompt });
 
   const readFinalMessage = async (): Promise<string | undefined> => {
     try {
@@ -168,7 +198,7 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
   try {
     const env = { ...process.env, OPENAI_API_KEY: apiKey };
     await codexLogin(apiKey, env); // write ~/.codex/auth.json so `codex exec` can authenticate
-    const { stdout, stderr, code, timedOut } = await runCodex(args, dir, env);
+    const { stdout, stderr, code, timedOut } = await runCodex(invocation.args, invocation.stdin, dir, env);
     if (timedOut) throw new Error(`Agent timed out after ${JOB_TIMEOUT_MS / 1000}s`);
     // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides based
     // on whether the working tree changed.
