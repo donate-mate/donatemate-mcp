@@ -149,7 +149,9 @@ export class HermesStack extends cdk.Stack {
           passwordLength: 40,
           excludePunctuation: true,
         },
-        removalPolicy: cdk.RemovalPolicy.RETAIN,
+        // Preserve an established credential on stack deletion/replacement, but clean up a brand-new
+        // secret if its first deployment rolls back so a corrected deployment can recreate the name.
+        removalPolicy: cdk.RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE,
       });
 
       const dbSecurityGroup = ec2.SecurityGroup.fromSecurityGroupId(
