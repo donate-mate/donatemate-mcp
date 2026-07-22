@@ -27,7 +27,11 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as appscaling from 'aws-cdk-lib/aws-applicationautoscaling';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as lambdaNodejs from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as customResources from 'aws-cdk-lib/custom-resources';
 import { Construct } from 'constructs';
+import * as path from 'node:path';
 
 export type Environment = 'staging' | 'production';
 
@@ -112,6 +116,130 @@ export class HermesStack extends cdk.Stack {
 
     const cpRepo = ecr.Repository.fromRepositoryName(this, 'CpRepo', 'donatemate-hermes-control-plane');
     const workerRepo = ecr.Repository.fromRepositoryName(this, 'WorkerRepo', 'donatemate-hermes-worker');
+
+    // ========================================================================
+    // Staging database investigation gateway (backend workers only)
+    // ========================================================================
+    // Keep the worker out of the database VPC and never expose application credentials to it.
+    // Instead it may invoke one IAM-scoped Lambda in the staging VPC. A custom resource provisions
+    // a dedicated PostgreSQL login with pg_read_all_data + default_transaction_read_only; the query
+    // handler adds statement/row limits and a second read-only transaction boundary.
+    let stagingDbQueryFunction: lambdaNodejs.NodejsFunction | undefined;
+    if (!isProd) {
+      const stagingDataVpc = ec2.Vpc.fromLookup(this, 'StagingDataVpc', {
+        tags: { Name: 'donatemate-staging-vpc' },
+      });
+      const dbHost = ssm.StringParameter.valueForStringParameter(this, '/donatemate/staging/data/rds-endpoint');
+      const dbPort = ssm.StringParameter.valueForStringParameter(this, '/donatemate/staging/data/rds-port');
+      const dbName = ssm.StringParameter.valueForStringParameter(this, '/donatemate/staging/data/rds-database-name');
+      const dbSecurityGroupId = ssm.StringParameter.valueForStringParameter(this, '/donatemate/staging/network/rds-sg-id');
+      const masterSecretArn = ssm.StringParameter.valueForStringParameter(this, '/donatemate/staging/data/rds-secret-arn');
+      const masterSecret = secretsmanager.Secret.fromSecretCompleteArn(this, 'StagingDbMasterSecret', masterSecretArn);
+      const readerSecret = new secretsmanager.Secret(this, 'StagingDbReaderSecret', {
+        secretName: 'donatemate/staging/hermes/db-reader',
+        description: 'Database-enforced read-only PostgreSQL credentials for the Hermes staging query gateway',
+        generateSecretString: {
+          secretStringTemplate: this.toJsonString({
+            host: dbHost,
+            port: dbPort,
+            dbname: dbName,
+            username: 'hermes_staging_reader',
+          }),
+          generateStringKey: 'password',
+          passwordLength: 40,
+          excludePunctuation: true,
+        },
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+      });
+
+      const dbSecurityGroup = ec2.SecurityGroup.fromSecurityGroupId(
+        this,
+        'StagingDatabaseSecurityGroup',
+        dbSecurityGroupId,
+        { mutable: true }
+      );
+      const querySecurityGroup = new ec2.SecurityGroup(this, 'StagingDbQuerySecurityGroup', {
+        vpc: stagingDataVpc,
+        description: 'Hermes staging read-only DB query Lambda',
+        allowAllOutbound: false,
+      });
+      querySecurityGroup.addEgressRule(dbSecurityGroup, ec2.Port.tcp(5432), 'Read-only PostgreSQL queries');
+      querySecurityGroup.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'Secrets Manager through NAT');
+      querySecurityGroup.addEgressRule(
+        ec2.Peer.ipv4(stagingDataVpc.vpcCidrBlock),
+        ec2.Port.udp(53),
+        'VPC DNS resolution'
+      );
+      querySecurityGroup.addEgressRule(
+        ec2.Peer.ipv4(stagingDataVpc.vpcCidrBlock),
+        ec2.Port.tcp(53),
+        'VPC DNS resolution fallback'
+      );
+      dbSecurityGroup.addIngressRule(querySecurityGroup, ec2.Port.tcp(5432), 'Hermes staging read-only query Lambda');
+
+      const handlerRoot = path.join(__dirname, '..', '..', 'lambda-handlers', 'hermes-db-query', 'src');
+      const lambdaDefaults: Partial<lambdaNodejs.NodejsFunctionProps> = {
+        runtime: lambda.Runtime.NODEJS_20_X,
+        architecture: lambda.Architecture.ARM_64,
+        vpc: stagingDataVpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        securityGroups: [querySecurityGroup],
+        memorySize: 256,
+        bundling: {
+          minify: true,
+          sourceMap: true,
+          target: 'node20',
+          format: lambdaNodejs.OutputFormat.ESM,
+          mainFields: ['module', 'main'],
+          externalModules: ['@aws-sdk/*'],
+        },
+      };
+      const readerInit = new lambdaNodejs.NodejsFunction(this, 'StagingDbReaderInit', {
+        ...lambdaDefaults,
+        functionName: 'donatemate-staging-hermes-db-reader-init',
+        entry: path.join(handlerRoot, 'init.ts'),
+        handler: 'handler',
+        timeout: cdk.Duration.minutes(1),
+        description: 'Provisions the database-enforced Hermes staging read-only login',
+        environment: {
+          MASTER_SECRET_ARN: masterSecret.secretArn,
+          READER_SECRET_ARN: readerSecret.secretArn,
+        },
+      });
+      masterSecret.grantRead(readerInit);
+      readerSecret.grantRead(readerInit);
+      const readerInitProvider = new customResources.Provider(this, 'StagingDbReaderInitProvider', {
+        onEventHandler: readerInit,
+        logRetention: logs.RetentionDays.ONE_MONTH,
+      });
+      const readerRole = new cdk.CustomResource(this, 'StagingDbReaderRole', {
+        serviceToken: readerInitProvider.serviceToken,
+        properties: { PolicyVersion: '1', ReaderSecretArn: readerSecret.secretArn },
+      });
+
+      stagingDbQueryFunction = new lambdaNodejs.NodejsFunction(this, 'StagingDbQueryFunction', {
+        ...lambdaDefaults,
+        functionName: 'donatemate-staging-hermes-db-query',
+        entry: path.join(handlerRoot, 'index.ts'),
+        handler: 'handler',
+        timeout: cdk.Duration.seconds(20),
+        reservedConcurrentExecutions: 2,
+        description: 'IAM-only, database-enforced read-only staging PostgreSQL query gateway for Hermes',
+        environment: {
+          READER_SECRET_ARN: readerSecret.secretArn,
+          STATEMENT_TIMEOUT_MS: '10000',
+          DEFAULT_MAX_ROWS: '100',
+          HARD_MAX_ROWS: '200',
+          MAX_RESPONSE_BYTES: '750000',
+        },
+      });
+      readerSecret.grantRead(stagingDbQueryFunction);
+      stagingDbQueryFunction.node.addDependency(readerRole);
+      new cdk.CfnOutput(this, 'HermesStagingDbQueryFunctionName', {
+        value: stagingDbQueryFunction.functionName,
+        description: 'IAM-only read-only staging database query function used by Hermes backend workers',
+      });
+    }
 
     // ========================================================================
     // ECS cluster
@@ -299,6 +427,7 @@ export class HermesStack extends cdk.Stack {
         BE_QA_ASSIGNEE_EMAIL: 'andrew.sheehy@donate-mate.com',
         // Slack mentions require a member ID token such as <@U123>; display names do not notify.
         BE_QA_SLACK_MENTION: '',
+        HERMES_STAGING_DB_QUERY_FUNCTION: stagingDbQueryFunction?.functionName ?? '',
       },
     });
 
@@ -320,6 +449,7 @@ export class HermesStack extends cdk.Stack {
     secJiraBot.grantRead(workerTaskDef.taskRole);
     secSlack.grantRead(workerTaskDef.taskRole);
     secDmMcp.grantRead(workerTaskDef.taskRole);
+    stagingDbQueryFunction?.grantInvoke(workerTaskDef.taskRole);
 
     // WS2 — publish Hermes PR-pipeline metrics (DonateMate/Hermes namespace). PutMetricData has no
     // resource-level scoping, so it is granted broadly (constrained to the namespace at call time).

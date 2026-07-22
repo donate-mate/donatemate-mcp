@@ -53,6 +53,7 @@ import { findIssueKey, fetchIssueContext } from './jira.js';
 import { commentOnIssue, transitionIssue, COLUMN, jiraIssueKey } from './jiraBot.js';
 import { processQaProofJob } from './qaRunner.js';
 import { processDeploymentVerificationJob } from './deployVerifier.js';
+import { stagingDatabasePromptBlock } from './stagingDatabase.js';
 
 const sqs = new SQSClient({});
 const QUEUE = process.env.JOBS_QUEUE_URL!;
@@ -550,12 +551,15 @@ async function processJob(jobId: string): Promise<void> {
 
     // WS6 — prepend "previously flagged patterns in this area" from the knowledge base (fail-open).
     const kbBlock = await knowledgePromptBlock(`${job.prompt} ${jiraContext ?? ''}`, [job.repo, job.type]);
+    const stagingDbBlock = stagingDatabasePromptBlock(job.type, issueKey ?? undefined);
     // WS3.3 — ask for the six-section outcome report up front (initial PRs only) to avoid an extra round.
     const reportInstruction = isPrFollowup
       ? ''
       : '\n\n--- OUTCOME REPORT ---\nWhen the change is complete, ALSO write an outcome report to a file named HERMES_REPORT.md at the repo root, with a level-2 Markdown heading for EACH section: Root cause, Evidence, Verification, Blast radius, Data repair, Deferred. The harness reads this into the PR description. Do not commit or push it.';
     const agentPrompt =
-      [contract ? contractPromptBlock(contract) : undefined, kbBlock || undefined, prompt].filter(Boolean).join('\n\n') +
+      [contract ? contractPromptBlock(contract) : undefined, kbBlock || undefined, stagingDbBlock || undefined, prompt]
+        .filter(Boolean)
+        .join('\n\n') +
       reportInstruction;
 
     const agentRun = await runAgent(dir, agentPrompt);
