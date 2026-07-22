@@ -138,6 +138,8 @@ export async function getHeadSha(dir: string): Promise<string> {
 
 export interface MergeConflictPreparation {
   status: 'already_up_to_date' | 'merged_cleanly' | 'conflicted';
+  /** Current base-branch head. Validation compares the resolved PR tree to this, not the old PR head. */
+  baseSha: string;
   output: string;
   conflicts: string[];
 }
@@ -187,6 +189,8 @@ export async function prepareMergeConflictResolution(dir: string, baseBranch: st
   await exec('git', ['-C', dir, 'fetch', '--no-tags', 'origin', `refs/heads/${baseBranch}:${remoteBaseRef}`], {
     maxBuffer: 4 * 1024 * 1024,
   });
+  const { stdout: baseShaOut } = await exec('git', ['-C', dir, 'rev-parse', remoteBaseRef]);
+  const baseSha = baseShaOut.trim();
   try {
     const { stdout, stderr } = await exec('git', ['-C', dir, 'merge', '--no-edit', remoteBaseRef], {
       maxBuffer: 4 * 1024 * 1024,
@@ -194,6 +198,7 @@ export async function prepareMergeConflictResolution(dir: string, baseBranch: st
     const output = `${stdout}${stderr}`.trim();
     return {
       status: /already up to date/i.test(output) ? 'already_up_to_date' : 'merged_cleanly',
+      baseSha,
       output,
       conflicts: [],
     };
@@ -201,7 +206,7 @@ export async function prepareMergeConflictResolution(dir: string, baseBranch: st
     const output = [err?.stdout, err?.stderr, err?.message].filter(Boolean).join('\n').slice(0, 4000);
     const conflicts = await listUnmergedFiles(dir);
     if (conflicts.length || /\bCONFLICT \(|Automatic merge failed|fix conflicts/i.test(output)) {
-      return { status: 'conflicted', output, conflicts };
+      return { status: 'conflicted', baseSha, output, conflicts };
     }
     throw err;
   }

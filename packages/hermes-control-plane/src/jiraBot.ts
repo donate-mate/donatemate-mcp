@@ -9,6 +9,11 @@ import { getSecretJson } from './secrets.js';
 import { markdownToAdf } from './markdownAdf.js';
 
 const SECRET = process.env.SECRET_JIRA_BOT || process.env.SECRET_JIRA;
+const JIRA_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.JIRA_REQUEST_TIMEOUT_MS ?? 10_000));
+
+function jiraFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, { ...init, signal: init.signal ?? AbortSignal.timeout(JIRA_REQUEST_TIMEOUT_MS) });
+}
 
 async function creds(): Promise<{ host: string; auth: string } | null> {
   if (!SECRET) return null;
@@ -37,7 +42,7 @@ export async function commentOnIssue(issueKey: string, markdown: string): Promis
   const c = await creds();
   if (!c) return;
   try {
-    const res = await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
+    const res = await jiraFetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
       method: 'POST',
       headers: { Authorization: `Basic ${c.auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ body: markdownToAdf(markdown) }),
@@ -61,7 +66,7 @@ export async function transitionIssue(issueKey: string, candidates: string[]): P
   if (!c) return false;
   try {
     const want = candidates.map((s) => s.toLowerCase());
-    const res = await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
+    const res = await jiraFetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
       headers: { Authorization: `Basic ${c.auth}`, Accept: 'application/json' },
     });
     if (!res.ok) return false;
@@ -70,7 +75,7 @@ export async function transitionIssue(issueKey: string, candidates: string[]): P
       (t) => want.includes((t.to?.name || '').toLowerCase()) || want.includes((t.name || '').toLowerCase())
     );
     if (!match) return false;
-    await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
+    await jiraFetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
       method: 'POST',
       headers: { Authorization: `Basic ${c.auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ transition: { id: match.id } }),

@@ -36,6 +36,7 @@ import { announceOverlaps, computeOverlaps } from './overlap.js';
 import { evaluateChecklist, evaluateEvidence, extractEvidenceIds, renderChecklist } from './readiness.js';
 import {
   clearActiveFix,
+  clearWatchAssignmentPause,
   appendHandledSignals,
   getPrWatch,
   listActivePrWatches,
@@ -45,6 +46,7 @@ import {
   markWatchQaQueued,
   markWatchReady,
   markReviewPinged,
+  markWatchAssignmentPaused,
   rememberGitHubDelivery,
   tryStartFix,
   unblockWatch,
@@ -295,6 +297,29 @@ async function markFlowDoneIfPresent(issueKey: string, extra: Partial<{ prUrl: s
   await setFlow(issueKey, { ...flow, status: 'done', ...extra });
 }
 
+async function markFlowPausedIfPresent(issueKey: string, prUrl: string): Promise<void> {
+  const flow = await getFlow(issueKey);
+  if (!flow || flow.status === 'paused') return;
+  await setFlow(issueKey, {
+    ...flow,
+    status: 'paused',
+    prUrl,
+    pauseReason: 'Ticket is not assigned to Hermes; automated PR fixes are paused.',
+  });
+}
+
+async function markFlowRunningIfPresent(issueKey: string, prUrl: string, fixJobId?: string): Promise<void> {
+  const flow = await getFlow(issueKey);
+  if (!flow) return;
+  await setFlow(issueKey, {
+    ...flow,
+    status: 'running',
+    prUrl,
+    ...(fixJobId ? { lastFixJobId: fixJobId } : {}),
+    pauseReason: undefined,
+  });
+}
+
 async function notifyThread(watch: PrWatch, text: string): Promise<void> {
   if (watch.channel) await postSlackMessage(watch.channel, text, watch.threadTs);
 }
@@ -337,14 +362,31 @@ async function startFollowupJob(watch: PrWatch, signals: PrSignal[]): Promise<vo
   // over / parked it). Post a one-time note and stop — reassigning to Hermes resumes it naturally.
   if (ASSIGNEE_GUARD_ENABLED && watch.issueKey && !(await isAssignedToHermes(watch.issueKey))) {
     console.warn(`[prmonitor] ${watch.repo}#${watch.prNumber}: ticket ${watch.issueKey} not assigned to Hermes — skipping follow-up commit`);
-    if (!(watch.handledSignalIds ?? []).includes('unassigned-paused')) {
+    const firstPause = await markWatchAssignmentPaused(watch);
+    await markFlowPausedIfPresent(watch.issueKey, watch.prUrl).catch(() => {});
+    if (firstPause) {
       await commentOnIssue(
         watch.issueKey,
         `⏸️ Hermes paused automated fixes for ${watch.prUrl} — this ticket is no longer assigned to Hermes. Reassign it to Hermes to resume.`
       ).catch(() => {});
-      await appendHandledSignals(watch, ['unassigned-paused']).catch(() => {});
     }
     return;
+  }
+
+  const wasAssignmentPaused = Boolean(
+    watch.assignmentPausedAt || (watch.handledSignalIds ?? []).includes('unassigned-paused')
+  );
+  if (wasAssignmentPaused) {
+    const firstResume = await clearWatchAssignmentPause(watch);
+    if (watch.issueKey) {
+      await markFlowRunningIfPresent(watch.issueKey, watch.prUrl).catch(() => {});
+      if (firstResume) {
+        await commentOnIssue(
+          watch.issueKey,
+          `▶️ Hermes resumed automated fixes for ${watch.prUrl} after the ticket was reassigned.`
+        ).catch(() => {});
+      }
+    }
   }
 
   const nextAttempt = (watch.fixAttemptCount ?? 0) + 1;
@@ -384,6 +426,9 @@ async function startFollowupJob(watch: PrWatch, signals: PrSignal[]): Promise<vo
       prompt: buildFollowupPrompt(watch, signals, feedbackSummary, retry),
     });
     await appendHandledSignals(watch, signalIds);
+    if (watch.issueKey) {
+      await markFlowRunningIfPresent(watch.issueKey, watch.prUrl, job.jobId).catch(() => {});
+    }
     const message = [
       `Hermes detected new PR feedback on ${watch.prUrl}.`,
       '',

@@ -7,6 +7,11 @@ import { getSecretJson } from './secrets.js';
 
 const SECRET_JIRA = process.env.SECRET_JIRA;
 const KEY_RE = /\b([A-Z][A-Z0-9]+-\d+)\b/;
+const JIRA_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.JIRA_REQUEST_TIMEOUT_MS ?? 10_000));
+
+function jiraFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, { ...init, signal: init.signal ?? AbortSignal.timeout(JIRA_REQUEST_TIMEOUT_MS) });
+}
 
 export function findIssueKey(text: string): string | null {
   const m = (text || '').match(KEY_RE);
@@ -145,7 +150,7 @@ async function jiraCredentials(): Promise<{ host: string; auth: string } | null>
 }
 
 async function jiraJson<T>(url: URL, auth: string, operation: string): Promise<T> {
-  const res = await fetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+  const res = await jiraFetch(url, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
   if (!res.ok) {
     const detail = (await res.text()).slice(0, 300);
     throw new Error(`${operation} failed: Jira HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
@@ -315,7 +320,7 @@ export async function getIssueAssigneeAccountId(issueKey: string): Promise<strin
     const { host, email, token } = await getSecretJson(SECRET_JIRA);
     if (!host || !email || !token) return undefined;
     const auth = Buffer.from(`${email}:${token}`).toString('base64');
-    const res = await fetch(`${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=assignee`, {
+    const res = await jiraFetch(`${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=assignee`, {
       headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
     });
     if (!res.ok) return undefined;
@@ -333,7 +338,7 @@ export async function fetchIssue(issueKey: string): Promise<JiraIssue | null> {
     const { host, email, token } = await getSecretJson(SECRET_JIRA);
     if (!host || !email || !token) return null;
     const auth = Buffer.from(`${email}:${token}`).toString('base64');
-    const res = await fetch(
+    const res = await jiraFetch(
       `${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=summary,description,status,issuetype,labels,parent,comment`,
       { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } }
     );

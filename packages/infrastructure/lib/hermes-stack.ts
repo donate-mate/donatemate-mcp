@@ -426,19 +426,39 @@ export class HermesStack extends cdk.Stack {
       })
     );
 
-    // Autoscale FE worker on queue depth: scale OUT on backlog, scale IN to the warm floor
-    // when the queue is empty (busy tasks are protected, so scale-in only removes idle ones).
+    // Autoscale the shared worker fleet to the TOTAL outstanding work (queued + in flight). Using
+    // only visible messages made the alarm drop as soon as a worker received a job, and the default
+    // five-minute SQS period made burst response much slower than the Jira interaction target.
+    // Exact-capacity steps avoid repeatedly adding workers while the alarm remains active: N jobs
+    // asks for N workers, bounded by the configured warm floor and maximum.
     const scaling = feWorker.autoScaleTaskCount({ minCapacity: workerDesired, maxCapacity: workerMax });
-    scaling.scaleOnMetric('FeWorkerQueueScaling', {
-      metric: jobsQueue.metricApproximateNumberOfMessagesVisible(),
-      adjustmentType: appscaling.AdjustmentType.CHANGE_IN_CAPACITY,
-      cooldown: cdk.Duration.seconds(120),
-      scalingSteps: [
-        { upper: 0, change: -1 },
-        { lower: 1, change: +1 },
-        { lower: 5, change: +2 },
-      ],
-    });
+    if (workerMax > workerDesired) {
+      const queuePeriod = cdk.Duration.minutes(1);
+      const outstandingJobs = new cloudwatch.MathExpression({
+        expression: 'FILL(visible, 0) + FILL(inFlight, 0)',
+        usingMetrics: {
+          visible: jobsQueue.metricApproximateNumberOfMessagesVisible({ period: queuePeriod, statistic: 'Maximum' }),
+          inFlight: jobsQueue.metricApproximateNumberOfMessagesNotVisible({ period: queuePeriod, statistic: 'Maximum' }),
+        },
+        period: queuePeriod,
+        label: 'Hermes outstanding jobs',
+      });
+      const scalingSteps: appscaling.ScalingInterval[] = [
+        { upper: workerDesired + 1, change: workerDesired },
+        ...Array.from({ length: Math.max(0, workerMax - workerDesired - 1) }, (_, index) => {
+          const capacity = workerDesired + index + 1;
+          return { lower: capacity, upper: capacity + 1, change: capacity };
+        }),
+        { lower: workerMax, change: workerMax },
+      ];
+      scaling.scaleOnMetric('FeWorkerOutstandingWorkScaling', {
+        metric: outstandingJobs,
+        adjustmentType: appscaling.AdjustmentType.EXACT_CAPACITY,
+        cooldown: cdk.Duration.seconds(30),
+        evaluationPeriods: 1,
+        scalingSteps,
+      });
+    }
 
     // ========================================================================
     // CloudWatch dashboard for the PR-process enhancement metrics (deliverable #6).

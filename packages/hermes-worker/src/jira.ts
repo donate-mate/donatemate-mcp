@@ -8,6 +8,7 @@ import { getSecretJson } from './secrets.js';
 
 const SECRET_JIRA = process.env.SECRET_JIRA;
 const KEY_RE = /\b([A-Z][A-Z0-9]+-\d+)\b/;
+const JIRA_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.JIRA_REQUEST_TIMEOUT_MS ?? 10_000));
 
 export function findIssueKey(text: string): string | null {
   const m = (text || '').match(KEY_RE);
@@ -30,7 +31,10 @@ export async function fetchIssueContext(issueKey: string): Promise<string | null
     const auth = Buffer.from(`${email}:${token}`).toString('base64');
     const res = await fetch(
       `${host}/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=summary,description,status,issuetype,labels,parent,comment`,
-      { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } }
+      {
+        headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(JIRA_REQUEST_TIMEOUT_MS),
+      }
     );
     if (!res.ok) return null;
     const d = (await res.json()) as any;

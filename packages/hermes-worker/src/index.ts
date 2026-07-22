@@ -7,7 +7,7 @@
  *
  * Run: `tsx src/index.ts` (containerized; image includes git + the `codex` CLI).
  */
-import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from '@aws-sdk/client-sqs';
+import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand, ChangeMessageVisibilityCommand } from '@aws-sdk/client-sqs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -48,7 +48,7 @@ import {
   recordPrWatch,
 } from './jobs.js';
 import { notify } from './notify.js';
-import { setScaleInProtection } from './taskprotection.js';
+import { startScaleInProtectionRenewal } from './taskprotection.js';
 import { findIssueKey, fetchIssueContext } from './jira.js';
 import { commentOnIssue, transitionIssue, COLUMN, jiraIssueKey } from './jiraBot.js';
 import { processQaProofJob } from './qaRunner.js';
@@ -59,6 +59,12 @@ const QUEUE = process.env.JOBS_QUEUE_URL!;
 const WORKER_TYPE = process.env.WORKER_TYPE ?? 'fe';
 const FRONTEND_DEPLOY_LABEL = 'deploy-dev';
 const JOB_HEARTBEAT_SECONDS = Number(process.env.JOB_HEARTBEAT_SECONDS ?? 60);
+const MESSAGE_VISIBILITY_SECONDS = Math.max(120, Number(process.env.MESSAGE_VISIBILITY_SECONDS ?? 15 * 60));
+const MESSAGE_VISIBILITY_RENEW_SECONDS = Math.max(
+  30,
+  Math.min(Number(process.env.MESSAGE_VISIBILITY_RENEW_SECONDS ?? 5 * 60), Math.floor(MESSAGE_VISIBILITY_SECONDS / 2))
+);
+const JIRA_PROGRESS_HEARTBEAT_SECONDS = Math.max(60, Number(process.env.JIRA_PROGRESS_HEARTBEAT_SECONDS ?? 10 * 60));
 const PRECOMMIT_REPAIR_ATTEMPTS = Number(process.env.PRECOMMIT_REPAIR_ATTEMPTS ?? 2);
 const GATE_MAX_RETRIES = Number(process.env.GATE_MAX_RETRIES ?? 3); // WS2
 const FAILURE_COMMENT_MAX = 2400;
@@ -71,6 +77,35 @@ function startJobHeartbeat(jobId: string): () => void {
   }, JOB_HEARTBEAT_SECONDS * 1000);
   interval.unref();
   return () => clearInterval(interval);
+}
+
+/** Keep the SQS lease alive while a long coding/validation job is making progress. */
+function startMessageVisibilityHeartbeat(receiptHandle: string): () => void {
+  let stopped = false;
+  let renewing = false;
+  const interval = setInterval(() => {
+    if (stopped || renewing) return;
+    renewing = true;
+    sqs
+      .send(
+        new ChangeMessageVisibilityCommand({
+          QueueUrl: QUEUE,
+          ReceiptHandle: receiptHandle,
+          VisibilityTimeout: MESSAGE_VISIBILITY_SECONDS,
+        })
+      )
+      .catch((err) =>
+        console.warn('[sqs] failed to renew job visibility:', err instanceof Error ? err.message : String(err))
+      )
+      .finally(() => {
+        renewing = false;
+      });
+  }, MESSAGE_VISIBILITY_RENEW_SECONDS * 1000);
+  interval.unref();
+  return () => {
+    stopped = true;
+    clearInterval(interval);
+  };
 }
 
 function mergeConflictPrompt(jobBaseBranch: string, prep: MergeConflictPreparation): string {
@@ -214,23 +249,58 @@ async function runGateLoop(input: {
   baseSha: string;
   installOk: boolean;
   type?: string;
+  ticket?: string;
   onTranscript: (chunk: string) => void;
 }): Promise<GateResult> {
-  let gate = await runGate(input.dir, input.baseSha, input.installOk);
-  let cycles = 0;
-  while (!gate.ok && cycles < GATE_MAX_RETRIES) {
-    cycles++;
-    console.warn(`[${input.jobId}] gate failed (${gateSummary(gate)}); repair round ${cycles}/${GATE_MAX_RETRIES}`);
-    const repair = await runAgent(input.dir, ['The pre-commit gate is failing on the packages you changed.', '', gate.report].join('\n'));
-    input.onTranscript(`\n--- Gate repair round ${cycles} ---\n${repair.transcript || `(exit ${repair.exitCode})`}`);
-    gate = await runGate(input.dir, input.baseSha, input.installOk);
+  let phase = 'starting scoped validation';
+  let jiraHeartbeatPending = false;
+  const progress = async (message: string) => {
+    phase = message.slice(0, 500);
+    console.log(`[${input.jobId}] gate: ${message}`);
+    await updateJob(input.jobId, 'running', { phase: `validation: ${message}`.slice(0, 500) }).catch((err) =>
+      console.warn(`[${input.jobId}] failed to persist gate progress:`, err instanceof Error ? err.message : String(err))
+    );
+  };
+
+  if (input.ticket) {
+    await commentOnIssue(
+      input.ticket,
+      `🧪 Code changes are complete for job \`${input.jobId}\`. I’m running scoped formatting, lint, build, and test validation now. Long checks will receive progress heartbeats here.`
+    );
   }
-  await putMetric('HermesGateCycles', cycles, { type: input.type });
-  if (!gate.ok) {
-    await putMetric('HermesGateFailShipped', 1, { type: input.type });
-    console.warn(`[${input.jobId}] gate still failing after ${cycles} rounds; opening PR fail-open`);
+  const jiraHeartbeat = input.ticket
+    ? setInterval(() => {
+        if (jiraHeartbeatPending) return;
+        jiraHeartbeatPending = true;
+        commentOnIssue(input.ticket!, `⏳ Validation is still active for job \`${input.jobId}\`: ${phase}.`)
+          .catch(() => {})
+          .finally(() => {
+            jiraHeartbeatPending = false;
+          });
+      }, JIRA_PROGRESS_HEARTBEAT_SECONDS * 1000)
+    : undefined;
+  jiraHeartbeat?.unref();
+
+  try {
+    let gate = await runGate(input.dir, input.baseSha, input.installOk, progress);
+    let cycles = 0;
+    while (!gate.ok && cycles < GATE_MAX_RETRIES) {
+      cycles++;
+      phase = `repairing validation failures (round ${cycles}/${GATE_MAX_RETRIES})`;
+      console.warn(`[${input.jobId}] gate failed (${gateSummary(gate)}); repair round ${cycles}/${GATE_MAX_RETRIES}`);
+      const repair = await runAgent(input.dir, ['The pre-commit gate is failing on the packages you changed.', '', gate.report].join('\n'));
+      input.onTranscript(`\n--- Gate repair round ${cycles} ---\n${repair.transcript || `(exit ${repair.exitCode})`}`);
+      gate = await runGate(input.dir, input.baseSha, input.installOk, progress);
+    }
+    await putMetric('HermesGateCycles', cycles, { type: input.type });
+    if (!gate.ok) {
+      await putMetric('HermesGateFailShipped', 1, { type: input.type });
+      console.warn(`[${input.jobId}] gate still failing after ${cycles} rounds; opening PR fail-open`);
+    }
+    return gate;
+  } finally {
+    if (jiraHeartbeat) clearInterval(jiraHeartbeat);
   }
-  return gate;
 }
 
 /** Assemble the initial-PR body: task, outcome report, gate + review sections, warnings. */
@@ -353,7 +423,7 @@ async function processJob(jobId: string): Promise<void> {
     console.log(`[${jobId}] processing deployment verification for ${job.repo}@${job.headSha ?? job.baseBranch}`);
     await updateJob(jobId, 'running');
     const stopHeartbeat = startJobHeartbeat(jobId);
-    await setScaleInProtection(true);
+    const stopProtection = await startScaleInProtectionRenewal();
     try {
       await processDeploymentVerificationJob(job);
     } catch (err) {
@@ -370,7 +440,7 @@ async function processJob(jobId: string): Promise<void> {
       throw err;
     } finally {
       stopHeartbeat();
-      await setScaleInProtection(false);
+      await stopProtection();
     }
     return;
   }
@@ -378,7 +448,7 @@ async function processJob(jobId: string): Promise<void> {
     console.log(`[${jobId}] processing QA proof against ${job.repo}@${job.headSha ?? job.baseBranch}`);
     await updateJob(jobId, 'running');
     const stopHeartbeat = startJobHeartbeat(jobId);
-    await setScaleInProtection(true);
+    const stopProtection = await startScaleInProtectionRenewal();
     try {
       await processQaProofJob(job);
     } catch (err) {
@@ -395,7 +465,7 @@ async function processJob(jobId: string): Promise<void> {
       throw err;
     } finally {
       stopHeartbeat();
-      await setScaleInProtection(false);
+      await stopProtection();
     }
     return;
   }
@@ -406,7 +476,7 @@ async function processJob(jobId: string): Promise<void> {
   const ticket = job.issueKey ?? jiraIssueKey(job.source); // non-null → write progress back to this Jira issue
   await updateJob(jobId, 'running');
   const stopHeartbeat = startJobHeartbeat(jobId);
-  await setScaleInProtection(true); // don't let the autoscaler kill us mid-job
+  const stopProtection = await startScaleInProtectionRenewal(); // don't let the autoscaler kill us mid-job
 
   const dir = await mkdtemp(join(tmpdir(), `hermes-${jobId}-`));
   try {
@@ -416,10 +486,14 @@ async function processJob(jobId: string): Promise<void> {
     await cloneRepo(token, job.repo, isPrFollowup ? branch : job.baseBranch, dir);
     if (!isPrFollowup) await createBranch(dir, branch);
     const baseSha = await getHeadSha(dir); // baseline to detect agent commits, not just dirty tree
+    let gateBaseSha = baseSha;
 
     let mergePrep: MergeConflictPreparation | undefined;
     if (isMergeConflictFollowup) {
       mergePrep = await prepareMergeConflictResolution(dir, job.baseBranch);
+      // Validate the resolved PR tree against the current base branch. Using the old PR head here
+      // includes every incoming base-branch file in the gate and caused backend-wide rebuilds.
+      gateBaseSha = mergePrep.baseSha;
       const transcript = [
         `Merge-conflict preparation for ${job.prUrl ?? job.repo}.`,
         `Base branch: ${job.baseBranch}`,
@@ -514,7 +588,15 @@ async function processJob(jobId: string): Promise<void> {
     // WS2 — pre-commit gate: lint/format/tests on the changed packages, repairing via Codex up to
     // GATE_MAX_RETRIES. Fail-open: after the retries, still open the PR (with a loud warning).
     const installOk = install.skipped || install.ok;
-    const gate = await runGateLoop({ jobId, dir, baseSha, installOk, type: job.type, onTranscript: (c) => (transcript += c) });
+    const gate = await runGateLoop({
+      jobId,
+      dir,
+      baseSha: gateBaseSha,
+      installOk,
+      type: job.type,
+      ticket: ticket ?? undefined,
+      onTranscript: (c) => (transcript += c),
+    });
     transcriptUri = await storeTranscript(jobId, transcript);
 
     if (isPrFollowup) {
@@ -580,7 +662,15 @@ async function processJob(jobId: string): Promise<void> {
       if (blocking.length) {
         const fix = await runAgent(dir, buildReviewFixPrompt(review.findings));
         transcript += `\n--- Pre-open review fix round ---\n${fix.transcript || `(exit ${fix.exitCode})`}`;
-        await runGateLoop({ jobId, dir, baseSha, installOk, type: job.type, onTranscript: (c) => (transcript += c) });
+        await runGateLoop({
+          jobId,
+          dir,
+          baseSha: gateBaseSha,
+          installOk,
+          type: job.type,
+          ticket: ticket ?? undefined,
+          onTranscript: (c) => (transcript += c),
+        });
         if (await hasChanges(dir, await getHeadSha(dir))) {
           await commitLocal(dir, `[hermes] address pre-open review (${jobId.slice(0, 8)})`);
           fixed = blocking.length;
@@ -673,8 +763,11 @@ async function processJob(jobId: string): Promise<void> {
     throw err; // do not delete the SQS message → redelivery, then DLQ
   } finally {
     stopHeartbeat();
-    await rm(dir, { recursive: true, force: true });
-    await setScaleInProtection(false); // idle again — allow scale-in
+    try {
+      await rm(dir, { recursive: true, force: true });
+    } finally {
+      await stopProtection(); // idle again — allow scale-in even if temp cleanup fails
+    }
   }
 }
 
@@ -686,17 +779,23 @@ async function loop(): Promise<void> {
         QueueUrl: QUEUE,
         MaxNumberOfMessages: 1,
         WaitTimeSeconds: 20,
-        VisibilityTimeout: 3600,
+        VisibilityTimeout: MESSAGE_VISIBILITY_SECONDS,
       })
     );
     for (const m of res.Messages ?? []) {
+      const stopVisibilityHeartbeat = m.ReceiptHandle
+        ? startMessageVisibilityHeartbeat(m.ReceiptHandle)
+        : () => {};
       try {
         const { jobId } = JSON.parse(m.Body || '{}') as { jobId?: string };
         if (jobId) await processJob(jobId);
+        stopVisibilityHeartbeat();
         await sqs.send(new DeleteMessageCommand({ QueueUrl: QUEUE, ReceiptHandle: m.ReceiptHandle! }));
       } catch (err) {
         // Leave the message un-deleted → SQS redelivers up to maxReceiveCount, then DLQ.
         console.error('job processing error (will retry / DLQ):', err);
+      } finally {
+        stopVisibilityHeartbeat();
       }
     }
   }

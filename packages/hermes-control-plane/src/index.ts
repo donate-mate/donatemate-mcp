@@ -565,6 +565,19 @@ async function handleJiraAssigned(issueKey: string, assignedAt?: string): Promis
     return;
   }
 
+  // An unassignment pauses the existing PR lifecycle instead of leaving its flow permanently
+  // `running`. Reassignment resumes that lifecycle; it must not create a second implementation PR.
+  if (existing?.status === 'paused' && existing.type === type && existing.repo === repo) {
+    await setFlow(issueKey, { ...existing, status: 'running', pauseReason: undefined });
+    await commentOnIssue(
+      issueKey,
+      existing.prUrl
+        ? `▶️ Hermes resumed monitoring and automated fixes for ${existing.prUrl}.`
+        : '▶️ Hermes resumed the existing PR workflow.'
+    );
+    return;
+  }
+
   // Planning and checklist extraction are independent model calls. Running them together removes
   // several seconds from the assignment-to-plan critical path.
   const [plan, checklist] = await Promise.all([
@@ -643,6 +656,10 @@ async function handleJiraConfirm(issueKey: string, author?: string): Promise<voi
   }
   if (flow.status === 'done') {
     await commentOnIssue(issueKey, 'ℹ️ My last run for this ticket already finished. Re-assign me to start a fresh run.');
+    return;
+  }
+  if (flow.status === 'paused') {
+    await commentOnIssue(issueKey, '⏸️ The existing PR workflow is paused because this ticket was unassigned. Reassign it to Hermes to resume.');
     return;
   }
 

@@ -15,7 +15,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 });
 const TABLE = process.env.JOBS_TABLE!;
 
-export type FlowStatus = 'awaiting_confirm' | 'running' | 'done';
+export type FlowStatus = 'awaiting_confirm' | 'running' | 'paused' | 'done';
 
 export interface JiraFlow {
   status: FlowStatus;
@@ -25,6 +25,10 @@ export interface JiraFlow {
   plan: string;
   jobId?: string;
   updatedAt?: string;
+  prUrl?: string;
+  lastFixJobId?: string;
+  flowError?: string;
+  pauseReason?: string;
   // --- WS5 --- Acceptance/defect checklist derived from the ticket, used for readiness gating.
   checklist?: string[];
 }
@@ -34,9 +38,23 @@ const flowKey = (issueKey: string) => `jiraflow:${issueKey.toUpperCase()}`;
 export async function getFlow(issueKey: string): Promise<JiraFlow | undefined> {
   const r = await ddb.send(new GetCommand({ TableName: TABLE, Key: { jobId: flowKey(issueKey) } }));
   if (!r.Item) return undefined;
-  const { status, taskPrompt, repo, type, plan, flowJobId, checklist, updatedAt } = r.Item as Record<string, unknown>;
+  const { status, taskPrompt, repo, type, plan, flowJobId, checklist, updatedAt, prUrl, lastFixJobId, flowError, pauseReason } =
+    r.Item as Record<string, unknown>;
   // --- WS5 --- surface the persisted checklist (may be absent on older flow rows).
-  return { status, taskPrompt, repo, type, plan, jobId: flowJobId, checklist, updatedAt } as JiraFlow;
+  return {
+    status,
+    taskPrompt,
+    repo,
+    type,
+    plan,
+    jobId: flowJobId,
+    checklist,
+    updatedAt,
+    prUrl,
+    lastFixJobId,
+    flowError,
+    pauseReason,
+  } as JiraFlow;
 }
 
 export async function setFlow(issueKey: string, flow: JiraFlow): Promise<void> {
@@ -52,6 +70,10 @@ export async function setFlow(issueKey: string, flow: JiraFlow): Promise<void> {
         plan: flow.plan,
         flowJobId: flow.jobId,
         checklist: flow.checklist, // --- WS5 ---
+        prUrl: flow.prUrl,
+        lastFixJobId: flow.lastFixJobId,
+        flowError: flow.flowError,
+        pauseReason: flow.pauseReason,
         updatedAt: new Date().toISOString(),
         expiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 3600,
       },

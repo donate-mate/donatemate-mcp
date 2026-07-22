@@ -11,6 +11,11 @@ import { markdownToAdf } from './markdownAdf.js';
 const DEFAULT_SECRET = process.env.SECRET_JIRA_BOT || process.env.SECRET_JIRA;
 const PRIVILEGED_SECRET = process.env.SECRET_JIRA;
 const MAX_COMMENT_CHARS = Number(process.env.JIRA_COMMENT_MAX_CHARS ?? 9000);
+const JIRA_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.JIRA_REQUEST_TIMEOUT_MS ?? 10_000));
+
+function jiraFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, { ...init, signal: init.signal ?? AbortSignal.timeout(JIRA_REQUEST_TIMEOUT_MS) });
+}
 
 async function creds(secretName = DEFAULT_SECRET): Promise<{ host: string; auth: string } | null> {
   if (!secretName) return null;
@@ -26,7 +31,7 @@ async function creds(secretName = DEFAULT_SECRET): Promise<{ host: string; auth:
 async function jiraRequest(path: string, init: RequestInit = {}, secretName = DEFAULT_SECRET): Promise<Response | null> {
   const c = await creds(secretName);
   if (!c) return null;
-  return fetch(`${c.host}${path}`, {
+  return jiraFetch(`${c.host}${path}`, {
     ...init,
     headers: {
       Authorization: `Basic ${c.auth}`,
@@ -46,7 +51,7 @@ export async function commentOnIssue(issueKey: string, markdown: string): Promis
       ? `${markdown.slice(0, MAX_COMMENT_CHARS)}\n\n...truncated by Hermes; see the linked transcript/artifact for full details.`
       : markdown;
   try {
-    const res = await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
+    const res = await jiraFetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
       method: 'POST',
       headers: { Authorization: `Basic ${c.auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ body: markdownToAdf(body) }),
@@ -64,7 +69,7 @@ export async function transitionIssue(issueKey: string, candidates: string[]): P
   if (!c) return false;
   try {
     const want = candidates.map((s) => s.toLowerCase());
-    const res = await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
+    const res = await jiraFetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
       headers: { Authorization: `Basic ${c.auth}`, Accept: 'application/json' },
     });
     if (!res.ok) return false;
@@ -73,7 +78,7 @@ export async function transitionIssue(issueKey: string, candidates: string[]): P
       (t) => want.includes((t.to?.name || '').toLowerCase()) || want.includes((t.name || '').toLowerCase())
     );
     if (!match) return false;
-    await fetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
+    await jiraFetch(`${c.host}/rest/api/3/issue/${encodeURIComponent(issueKey)}/transitions`, {
       method: 'POST',
       headers: { Authorization: `Basic ${c.auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ transition: { id: match.id } }),

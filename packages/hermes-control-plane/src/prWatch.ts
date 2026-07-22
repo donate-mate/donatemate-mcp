@@ -82,6 +82,8 @@ export interface PrWatch {
   lastFixJobId?: string;
   /** Head sha we last re-requested human review at, so a green PR is only re-pinged once per head. */
   lastReviewPingSha?: string;
+  /** Present while follow-up work is intentionally paused because Jira is not assigned to Hermes. */
+  assignmentPausedAt?: string;
   createdAt: string;
   updatedAt: string;
   expiresAt: number;
@@ -280,6 +282,55 @@ export async function appendHandledSignals(watch: PrWatch, signalIds: string[]):
       },
     })
   );
+}
+
+/** Record an assignment pause exactly once so Jira comments and flow updates are idempotent. */
+export async function markWatchAssignmentPaused(watch: PrWatch): Promise<boolean> {
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        UpdateExpression: 'SET assignmentPausedAt = :pausedAt, updatedAt = :updatedAt',
+        ConditionExpression: 'attribute_not_exists(assignmentPausedAt)',
+        ExpressionAttributeValues: {
+          ':pausedAt': new Date().toISOString(),
+          ':updatedAt': new Date().toISOString(),
+        },
+      })
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Clear the pause and remove the legacy handled-signal marker without replacing the whole list. */
+export async function clearWatchAssignmentPause(watch: PrWatch): Promise<boolean> {
+  const legacyIndex = (watch.handledSignalIds ?? []).indexOf('unassigned-paused');
+  const removes = ['assignmentPausedAt'];
+  if (legacyIndex >= 0) removes.push(`handledSignalIds[${legacyIndex}]`);
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        UpdateExpression: `SET updatedAt = :updatedAt REMOVE ${removes.join(', ')}`,
+        ConditionExpression:
+          legacyIndex >= 0
+            ? `attribute_exists(assignmentPausedAt) OR handledSignalIds[${legacyIndex}] = :legacyMarker`
+            : 'attribute_exists(assignmentPausedAt)',
+        ExpressionAttributeValues: {
+          ':updatedAt': new Date().toISOString(),
+          ...(legacyIndex >= 0 ? { ':legacyMarker': 'unassigned-paused' } : {}),
+        },
+      })
+    );
+    return true;
+  } catch {
+    // Another reconciler may have already resumed it.
+    return false;
+  }
 }
 
 /**
