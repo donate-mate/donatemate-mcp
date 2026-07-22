@@ -52,19 +52,26 @@ async function provisionReader(): Promise<void> {
 
   try {
     await sql.begin(async (tx) => {
-      const existing = await tx.unsafe<{ exists: boolean }[]>(
-        'SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1) AS exists',
+      const existing = await tx.unsafe<
+        { superuser: boolean; replication: boolean; bypassRls: boolean }[]
+      >(
+        `SELECT rolsuper AS superuser, rolreplication AS replication, rolbypassrls AS "bypassRls"
+         FROM pg_roles WHERE rolname = $1`,
         [ROLE_NAME]
       );
-      if (existing[0]?.exists) {
-        await tx.unsafe(`ALTER ROLE ${role} PASSWORD ${literal(reader.password)}`);
+      if (existing[0]) {
+        if (existing[0].superuser || existing[0].replication || existing[0].bypassRls) {
+          throw new Error('existing staging reader role has an unsafe elevated attribute');
+        }
+        await tx.unsafe(`ALTER ROLE ${role} LOGIN PASSWORD ${literal(reader.password)}`);
       } else {
         await tx.unsafe(`CREATE ROLE ${role} LOGIN PASSWORD ${literal(reader.password)}`);
       }
 
-      await tx.unsafe(
-        `ALTER ROLE ${role} NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 3`
-      );
+      // Amazon RDS master users have CREATEROLE but are not true PostgreSQL superusers. New roles
+      // already default to NOSUPERUSER, NOREPLICATION, and NOBYPASSRLS; explicitly changing those
+      // attributes is superuser-only on RDS, so verify them above and alter only permitted flags.
+      await tx.unsafe(`ALTER ROLE ${role} NOCREATEDB NOCREATEROLE INHERIT CONNECTION LIMIT 3`);
       await tx.unsafe(`ALTER ROLE ${role} SET default_transaction_read_only = on`);
       await tx.unsafe(`ALTER ROLE ${role} SET statement_timeout = '10s'`);
       await tx.unsafe(`ALTER ROLE ${role} SET lock_timeout = '1s'`);
