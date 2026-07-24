@@ -1225,8 +1225,8 @@ async function handleToolsCall(
       );
 
       const nodes = Object.entries(data.nodes).map(([id, node]) => ({
-        id,
         ...node.document,
+        id,
       }));
 
       return {
@@ -1656,14 +1656,14 @@ export async function handler(
     return { statusCode: 200, body: 'OK' };
   }
 
-  // Cast to MCP request for JSON-RPC handling
-  const request = message as McpRequest;
-
   // Validate JSON-RPC structure
-  if (request.jsonrpc !== '2.0' || !request.method) {
+  if (message.jsonrpc !== '2.0' || typeof message.method !== 'string') {
     const errorResponse: McpResponse = {
       jsonrpc: '2.0',
-      id: request.id,
+      id:
+        typeof message.id === 'string' || typeof message.id === 'number'
+          ? message.id
+          : undefined,
       error: {
         code: -32600,
         message: 'Invalid Request: missing jsonrpc or method',
@@ -1672,6 +1672,17 @@ export async function handler(
     await sendResponse(apiClient, connectionId, errorResponse);
     return { statusCode: 200, body: 'OK' };
   }
+
+  const request: McpRequest = {
+    jsonrpc: '2.0',
+    method: message.method,
+    ...(typeof message.id === 'string' || typeof message.id === 'number'
+      ? { id: message.id }
+      : {}),
+    ...(message.params && typeof message.params === 'object' && !Array.isArray(message.params)
+      ? { params: message.params as Record<string, unknown> }
+      : {}),
+  };
 
   // Process the message
   console.info('Processing MCP request', {

@@ -136,7 +136,6 @@ async function getRedis(): Promise<any | null> {
       host,
       port,
       maxRetriesPerRequest: 3,
-      retryDelayOnFailover: 100,
       lazyConnect: true,
     });
     await redisClient.connect();

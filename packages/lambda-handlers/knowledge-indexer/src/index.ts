@@ -67,6 +67,13 @@ interface ContentChunk {
   metadata: Record<string, unknown>;
 }
 
+interface GitHubFileResponse {
+  type?: string;
+  size?: number;
+  content?: string;
+  sha?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Secret Management
 // ---------------------------------------------------------------------------
@@ -141,7 +148,6 @@ async function getRedis(): Promise<any | null> {
       host,
       port,
       maxRetriesPerRequest: 3,
-      retryDelayOnFailover: 100,
       lazyConnect: true,
     });
     await redisClient.connect();
@@ -243,10 +249,16 @@ async function fetchGitHubFileContent(
       return null;
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as GitHubFileResponse;
 
     // Skip if too large or not a file
-    if (data.type !== 'file' || data.size > MAX_FILE_SIZE) {
+    if (
+      data.type !== 'file' ||
+      typeof data.size !== 'number' ||
+      data.size > MAX_FILE_SIZE ||
+      typeof data.content !== 'string' ||
+      typeof data.sha !== 'string'
+    ) {
       console.warn('File skipped - too large or not a file', {
         path: filePath,
         size: data.size,
