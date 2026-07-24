@@ -49,6 +49,10 @@ interface AuthResult {
   authMethod: 'api_key' | 'cognito_jwt';
 }
 
+type WebSocketConnectEvent = APIGatewayProxyWebsocketEventV2 & {
+  queryStringParameters?: Record<string, string | undefined>;
+};
+
 async function validateApiKey(apiKey: string): Promise<AuthResult | null> {
   const tableName = process.env.API_KEYS_TABLE_NAME;
   if (!tableName) {
@@ -100,10 +104,16 @@ async function validateCognitoJwt(token: string): Promise<AuthResult | null> {
   try {
     const verifier = getVerifier();
     const payload = await verifier.verify(token);
+    const email =
+      typeof payload.email === 'string'
+        ? payload.email
+        : typeof payload.username === 'string'
+          ? payload.username
+          : 'unknown';
 
     return {
       userId: payload.sub,
-      email: (payload.email as string) || payload.username || 'unknown',
+      email,
       authMethod: 'cognito_jwt',
     };
   } catch (error) {
@@ -115,7 +125,7 @@ async function validateCognitoJwt(token: string): Promise<AuthResult | null> {
 }
 
 export async function handler(
-  event: APIGatewayProxyWebsocketEventV2
+  event: WebSocketConnectEvent
 ): Promise<APIGatewayProxyResultV2> {
   const connectionId = event.requestContext.connectionId;
   const tableName = process.env.CONNECTIONS_TABLE_NAME;

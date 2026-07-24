@@ -49,6 +49,49 @@ interface SyncEvent {
   timestamp: string;
 }
 
+interface GitHubFileResponse {
+  type?: string;
+  size?: number;
+  content?: string;
+  sha?: string;
+}
+
+interface GitHubTreeItem {
+  path: string;
+  type: string;
+  size?: number;
+}
+
+interface GitHubCommit {
+  sha: string;
+  commit?: {
+    message?: string;
+    author?: { name?: string };
+    committer?: { date?: string };
+  };
+}
+
+interface SlackFile {
+  title?: string;
+  name?: string;
+}
+
+interface SlackAttachment {
+  text?: string;
+  title?: string;
+}
+
+interface SlackMessage {
+  ts: string;
+  user: string;
+  text?: string;
+  subtype?: string;
+  thread_ts?: string;
+  reply_count?: number;
+  files?: SlackFile[];
+  attachments?: SlackAttachment[];
+}
+
 // ---------------------------------------------------------------------------
 // Secret Management
 // ---------------------------------------------------------------------------
@@ -163,10 +206,16 @@ async function fetchGitHubFile(
       return null;
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as GitHubFileResponse;
 
     // Skip if too large or not a file
-    if (data.type !== 'file' || data.size > MAX_FILE_SIZE) {
+    if (
+      data.type !== 'file' ||
+      typeof data.size !== 'number' ||
+      data.size > MAX_FILE_SIZE ||
+      typeof data.content !== 'string' ||
+      typeof data.sha !== 'string'
+    ) {
       return null;
     }
 
@@ -198,7 +247,7 @@ async function fetchGitHubTree(
 
     if (!repoResponse.ok) return [];
 
-    const repoData = await repoResponse.json();
+    const repoData = (await repoResponse.json()) as { default_branch?: string };
     const defaultBranch = repoData.default_branch || 'main';
 
     // Get full tree
@@ -214,7 +263,7 @@ async function fetchGitHubTree(
 
     if (!treeResponse.ok) return [];
 
-    const treeData = await treeResponse.json();
+    const treeData = (await treeResponse.json()) as { tree?: GitHubTreeItem[] };
     return treeData.tree || [];
   } catch (error) {
     console.warn('GitHub tree fetch failed', { owner, repo, error });
@@ -301,7 +350,10 @@ async function syncGitHub(
         continue;
       }
 
-      const commits = await response.json();
+      const commitsPayload = (await response.json()) as unknown;
+      const commits = Array.isArray(commitsPayload)
+        ? (commitsPayload as GitHubCommit[])
+        : [];
 
       // For incremental sync, check if any commits modified doc files
       const modifiedDocFiles = new Set<string>();
@@ -321,7 +373,9 @@ async function syncGitHub(
             );
 
             if (commitResponse.ok) {
-              const commitData = await commitResponse.json();
+              const commitData = (await commitResponse.json()) as {
+                files?: Array<{ filename: string; status: string }>;
+              };
               const files = commitData.files || [];
 
               for (const file of files) {
@@ -426,7 +480,17 @@ async function syncJira(
         continue;
       }
 
-      const data = await response.json();
+      const data = (await response.json()) as {
+        issues?: Array<{
+          key: string;
+          fields?: {
+            summary?: string;
+            status?: { name?: string };
+            issuetype?: { name?: string };
+            updated?: string;
+          };
+        }>;
+      };
 
       for (const issue of data.issues || []) {
         events.push({
@@ -488,7 +552,9 @@ async function syncConfluence(
         continue;
       }
 
-      const data = await response.json();
+      const data = (await response.json()) as {
+        results?: Array<{ id: string; title?: string; type?: string }>;
+      };
 
       for (const page of data.results || []) {
         events.push({
@@ -550,7 +616,17 @@ async function syncSlack(
         },
       }
     );
-    const usersData = await usersResponse.json();
+    const usersData = (await usersResponse.json()) as {
+      ok: boolean;
+      error?: string;
+      members?: Array<{
+        id: string;
+        name?: string;
+        real_name?: string;
+        deleted?: boolean;
+        profile?: { display_name?: string };
+      }>;
+    };
     if (usersData.ok && usersData.members) {
       for (const member of usersData.members) {
         if (!member.deleted) {
@@ -581,19 +657,23 @@ async function syncSlack(
         }
       );
 
-      const channelsData = await channelsResponse.json();
+      const channelsData = (await channelsResponse.json()) as {
+        ok: boolean;
+        error?: string;
+        channels?: Array<{ id: string; is_member?: boolean }>;
+      };
       console.info('Slack conversations.list response', {
         ok: channelsData.ok,
         error: channelsData.error,
         channelCount: channelsData.channels?.length,
-        memberChannels: channelsData.channels?.filter((c: any) => c.is_member).length,
+        memberChannels: channelsData.channels?.filter(c => c.is_member).length,
       });
 
       if (channelsData.ok && channelsData.channels) {
         // Only get channels the bot is a member of
         channelIds = channelsData.channels
-          .filter((c: any) => c.is_member)
-          .map((c: any) => c.id);
+          .filter(c => c.is_member)
+          .map(c => c.id);
         console.info('Found Slack channels bot is member of', { count: channelIds.length, channelIds });
       } else if (channelsData.error) {
         console.error('Slack API error', { error: channelsData.error });
@@ -629,7 +709,12 @@ async function syncSlack(
           }
         );
 
-        const data = await response.json();
+        const data = (await response.json()) as {
+          ok: boolean;
+          error?: string;
+          messages?: SlackMessage[];
+          response_metadata?: { next_cursor?: string };
+        };
 
         if (!data.ok) {
           console.warn('Slack API error', {
@@ -651,7 +736,7 @@ async function syncSlack(
           // Extract file information if message has files
           if (message.files && Array.isArray(message.files) && message.files.length > 0) {
             const fileDescriptions = message.files
-              .map((f: any) => `[File: ${f.title || f.name || 'attachment'}]`)
+              .map(f => `[File: ${f.title || f.name || 'attachment'}]`)
               .join(' ');
             messageText = messageText ? `${messageText} ${fileDescriptions}` : fileDescriptions;
           }
@@ -713,7 +798,11 @@ async function syncSlack(
                 }
               );
 
-              const repliesData = await repliesResponse.json();
+              const repliesData = (await repliesResponse.json()) as {
+                ok: boolean;
+                error?: string;
+                messages?: SlackMessage[];
+              };
 
               if (repliesData.ok && repliesData.messages) {
                 // Skip the first message (it's the parent we already indexed)
@@ -729,7 +818,7 @@ async function syncSlack(
                   // Extract file information
                   if (reply.files && Array.isArray(reply.files) && reply.files.length > 0) {
                     const fileDescriptions = reply.files
-                      .map((f: any) => `[File: ${f.title || f.name || 'attachment'}]`)
+                      .map(f => `[File: ${f.title || f.name || 'attachment'}]`)
                       .join(' ');
                     replyText = replyText ? `${replyText} ${fileDescriptions}` : fileDescriptions;
                   }

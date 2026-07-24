@@ -189,35 +189,44 @@ export async function handler(
 ): Promise<CloudFormationCustomResourceResponse> {
   console.log('Event:', JSON.stringify(event, null, 2));
 
-  const response: CloudFormationCustomResourceResponse = {
-    Status: 'SUCCESS',
-    PhysicalResourceId: event.PhysicalResourceId || 'knowledge-db-init',
-    StackId: event.StackId,
-    RequestId: event.RequestId,
-    LogicalResourceId: event.LogicalResourceId,
-    Data: {},
-  };
+  const physicalResourceId =
+    event.RequestType === 'Create' ? 'knowledge-db-init' : event.PhysicalResourceId;
 
   try {
+    let data: Record<string, string> = {};
     switch (event.RequestType) {
       case 'Create':
-      case 'Update':
+      case 'Update': {
         const result = await runMigration();
-        response.Data = { Message: result };
+        data = { Message: result };
         break;
+      }
 
       case 'Delete':
         // Don't drop tables on delete - data should be preserved
         console.log('Delete request - no action taken (preserving data)');
-        response.Data = { Message: 'No action taken on delete' };
+        data = { Message: 'No action taken on delete' };
         break;
     }
+
+    return {
+      Status: 'SUCCESS',
+      PhysicalResourceId: physicalResourceId,
+      StackId: event.StackId,
+      RequestId: event.RequestId,
+      LogicalResourceId: event.LogicalResourceId,
+      Data: data,
+    };
   } catch (error) {
     console.error('Migration error:', error);
-    response.Status = 'FAILED';
-    response.Reason =
-      error instanceof Error ? error.message : 'Unknown error occurred';
+    return {
+      Status: 'FAILED',
+      Reason: error instanceof Error ? error.message : 'Unknown error occurred',
+      PhysicalResourceId: physicalResourceId,
+      StackId: event.StackId,
+      RequestId: event.RequestId,
+      LogicalResourceId: event.LogicalResourceId,
+      Data: {},
+    };
   }
-
-  return response;
 }
