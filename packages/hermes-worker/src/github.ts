@@ -23,6 +23,21 @@ export interface PullRequestInfo {
   url: string;
 }
 
+/**
+ * Permissions on each short-lived worker token. Keep this narrower than the app installation, but
+ * include `workflows: write`: infrastructure tickets legitimately edit `.github/workflows/*`, and
+ * GitHub rejects those pushes even when `contents: write` is present if this scope is omitted.
+ */
+export const WORKER_INSTALLATION_PERMISSIONS = {
+  contents: 'write',
+  pull_requests: 'write',
+  issues: 'write',
+  checks: 'read',
+  actions: 'write',
+  metadata: 'read',
+  workflows: 'write',
+} as const;
+
 export function splitRepo(repo: string): { owner: string; name: string } {
   const [owner, name] = repo.split('/');
   if (!owner || !name) throw new Error(`Invalid repo full name: ${repo}`);
@@ -45,14 +60,7 @@ export async function getInstallationAuth(repoFullName: string): Promise<GitHubA
   const { token } = await auth({
     type: 'installation',
     repositoryNames: repoName ? [repoName] : undefined,
-    permissions: {
-      contents: 'write',
-      pull_requests: 'write',
-      issues: 'write',
-      checks: 'read',
-      actions: 'write',
-      metadata: 'read',
-    },
+    permissions: WORKER_INSTALLATION_PERMISSIONS,
   });
   return { token, octokit: new Octokit({ auth: token }) };
 }

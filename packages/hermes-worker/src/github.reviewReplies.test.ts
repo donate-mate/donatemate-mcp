@@ -5,6 +5,7 @@ import {
   HERMES_REVIEW_REPLY_MARKER_PREFIX,
   replyToAddressedReviewComments,
   reviewReplyMarker,
+  WORKER_INSTALLATION_PERMISSIONS,
 } from './github.js';
 import type { ReviewReplyTarget } from './jobs.js';
 
@@ -85,5 +86,14 @@ describe('replyToAddressedReviewComments', () => {
     expect(reviewReplyMarker(target.feedbackCommentId)).toBe(
       `${HERMES_REVIEW_REPLY_MARKER_PREFIX}${target.feedbackCommentId} -->`
     );
+  });
+});
+
+describe('worker GitHub installation permissions', () => {
+  it('can push legitimate GitHub Actions workflow changes', () => {
+    expect(WORKER_INSTALLATION_PERMISSIONS).toMatchObject({
+      contents: 'write',
+      workflows: 'write',
+    });
   });
 });
