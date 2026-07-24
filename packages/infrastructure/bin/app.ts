@@ -10,6 +10,8 @@ import * as cdk from 'aws-cdk-lib';
 import { McpStack, Environment } from '../lib/mcp-stack.js';
 import { FigmaVmStack } from '../lib/figma-vm-stack.js';
 import { KnowledgeStack } from '../lib/knowledge-stack.js';
+import { MoltbotStack } from '../lib/moltbot-stack.js';
+import { HermesStack } from '../lib/hermes-stack.js';
 
 const app = new cdk.App();
 
@@ -47,6 +49,7 @@ if (deployFigmaVm) {
   new FigmaVmStack(app, `DonateMate-FigmaVM-${capitalize(environment)}`, {
     env: awsEnv,
     environment,
+    responseBucket: mcpStack.figmaResponseBucket,
     description: `DonateMate Figma VM - ${environment}`,
   });
 }
@@ -58,6 +61,31 @@ if (deployKnowledge) {
     env: awsEnv,
     environment,
     description: `DonateMate Knowledge Base - ${environment}`,
+    terminationProtection: environment === 'production',
+  });
+}
+
+// Create the Moltbot stack (optional, deploy with --context deploy-moltbot=true)
+// Linux EC2 running Moltbot for Slack/Telegram integration
+const deployMoltbot = app.node.tryGetContext('deploy-moltbot') === 'true';
+if (deployMoltbot) {
+  new MoltbotStack(app, `DonateMate-Moltbot-${capitalize(environment)}`, {
+    env: awsEnv,
+    environment,
+    description: `DonateMate Moltbot (Slack/Telegram bot) - ${environment}`,
+    mcpEndpoint: `https://mcp.donate-mate.com/mcp`,
+  });
+}
+
+// Create the Hermes stack (optional, deploy with --context deploy-hermes=true)
+// ECS Fargate agentic-coding control plane + worker pool.
+const deployHermes = app.node.tryGetContext('deploy-hermes') === 'true';
+if (deployHermes) {
+  new HermesStack(app, `DonateMate-Hermes-${capitalize(environment)}`, {
+    env: awsEnv,
+    environment,
+    description: `DonateMate Hermes agentic-coding platform - ${environment}`,
+    mcpEndpoint: `https://mcp.donate-mate.com/mcp`,
     terminationProtection: environment === 'production',
   });
 }
@@ -79,6 +107,7 @@ Resources:
 Optional Stacks:
   - Figma VM: --context deploy-figma-vm=true
   - Knowledge Base: --context deploy-knowledge=true
+  - Moltbot (Slack/Telegram): --context deploy-moltbot=true
 
 Prerequisites:
   - Cognito User Pool must exist in donatemate-lambdas
@@ -89,6 +118,9 @@ Deploy MCP stack:
 
 Deploy with Knowledge Base:
   npx cdk deploy --context environment=${environment} --context deploy-knowledge=true
+
+Deploy with Moltbot:
+  npx cdk deploy DonateMate-Moltbot-${capitalize(environment)} --context deploy-moltbot=true
 
 ============================================================
 `);

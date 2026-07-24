@@ -24,6 +24,7 @@ import {
   UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import Anthropic from '@anthropic-ai/sdk';
@@ -400,6 +401,39 @@ function summarizeJiraIssue(issue: any, host: string) {
     updated: issue.fields?.updated,
     url: `${host}/browse/${issue.key}`,
   };
+}
+
+// ============================================================================
+// Hermes — dispatch agentic-coding jobs to the Hermes control plane
+// ============================================================================
+
+interface HermesConfig {
+  endpoint: string; // e.g. https://hermes.donate-mate.com
+  sharedSecret: string;
+}
+let hermesConfig: HermesConfig | null = null;
+
+async function getHermesConfig(): Promise<HermesConfig> {
+  if (hermesConfig) return hermesConfig;
+  const endpoint = process.env.HERMES_ENDPOINT || 'https://hermes.donate-mate.com';
+  const secretName = `donatemate/${process.env.ENVIRONMENT || 'staging'}/hermes/jira-webhook`;
+  const res = await secretsClient.send(new GetSecretValueCommand({ SecretId: secretName }));
+  const parsed = JSON.parse(res.SecretString || '{}') as { sharedSecret?: string };
+  hermesConfig = { endpoint, sharedSecret: parsed.sharedSecret || '' };
+  return hermesConfig;
+}
+
+async function hermesRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const cfg = await getHermesConfig();
+  const response = await fetch(`${cfg.endpoint}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'x-hermes-secret': cfg.sharedSecret },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!response.ok) {
+    throw new Error(`Hermes API ${response.status}: ${await response.text()}`);
+  }
+  return response.json() as Promise<T>;
 }
 
 // ============================================================================
@@ -1352,7 +1386,7 @@ const TOOL_TIMEOUTS: Record<string, number> = {
   // Operations that may scan more nodes
   dm_figma_get_all_nodes: 20000,
   dm_figma_get_file_context: 20000,
-  dm_figma_validate_design: 25000,
+  dm_figma_validate_design: 28000,
   dm_figma_query: 20000, // Queries may traverse document
   // Mutating operations (may need more time for Figma to process)
   dm_figma_create_frame: 15000,
@@ -1363,7 +1397,7 @@ const TOOL_TIMEOUTS: Record<string, number> = {
   dm_figma_clone_node: 20000,
   dm_figma_move_node: 20000,
   dm_figma_export_node: 30000, // Exports may be slow
-  dm_figma_review: 30000, // Exports + metadata
+  dm_figma_review: 28000, // under API Gateway 30s ceiling; large responses offloaded to S3 by the relay
   dm_figma_execute: 45000, // Arbitrary code may take time
   // File management (may need to wait for Figma to open)
   dm_figma_open_file: 45000, // Opening files can take time
@@ -1373,6 +1407,68 @@ const TOOL_TIMEOUTS: Record<string, number> = {
 
 const DEFAULT_RELAY_TIMEOUT = 25000; // 25 seconds default (was 30)
 const POLL_INTERVAL_MS = 300; // Poll every 300ms (was 500ms)
+
+// Large plugin responses (e.g. dm_figma_review's exported image) exceed the API Gateway
+// WebSocket 128KB frame limit, so they can't be sent back inline. The relay uploads oversized
+// responses to S3 (via the VM instance role) and returns a small pointer { __s3Key }; we fetch
+// the full payload from S3 here.
+function getFigmaResponseBucket(): string {
+  const bucket = process.env.FIGMA_RESPONSE_BUCKET;
+  if (!bucket) {
+    throw new Error('FIGMA_RESPONSE_BUCKET not configured');
+  }
+  return bucket;
+}
+
+// Async submit→poll for heavy plugin tools that can exceed API Gateway's hard ~29s ceiling.
+// For these tools, if the plugin hasn't responded within FIGMA_ASYNC_SUBMIT_WAIT_MS we return a
+// { status:'processing', jobId } handle instead of holding the request open (which both hit the
+// timeout AND saturated Lambda concurrency). The result still lands in the connections table via
+// the `message` Lambda whenever the plugin finishes, so a later poll (same tool + jobId) retrieves
+// it — the industry-standard asynchronous request-reply pattern. Small/medium targets still return
+// inline within the fast-path window, so callers only poll for genuinely long exports.
+const FIGMA_ASYNC_TOOLS = new Set(
+  (process.env.FIGMA_ASYNC_TOOLS ?? 'dm_figma_review,dm_figma_validate_design')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+const FIGMA_ASYNC_SUBMIT_WAIT_MS = Number(process.env.FIGMA_ASYNC_SUBMIT_WAIT_MS ?? 18000);
+const FIGMA_ASYNC_JOB_TTL_SECONDS = Number(process.env.FIGMA_ASYNC_JOB_TTL_SECONDS ?? 900);
+const s3Client = new S3Client({});
+
+async function resolveRelayResult(result: unknown): Promise<unknown> {
+  const key = (result as { __s3Key?: string })?.__s3Key;
+  if (!key) return result;
+  const obj = await s3Client.send(new GetObjectCommand({ Bucket: getFigmaResponseBucket(), Key: key }));
+  const body = await obj.Body!.transformToString();
+  return JSON.parse(body);
+}
+
+// Read a relay job's current state from the connections table. Returns null if the item is gone
+// (expired). `done` distinguishes completed/error from still-pending.
+async function readRelayJob(
+  tableName: string,
+  requestId: string
+): Promise<{ done: boolean; result?: unknown; error?: string } | null> {
+  const result = await dynamoClient.send(
+    new GetItemCommand({ TableName: tableName, Key: { connectionId: { S: `http-request:${requestId}` } } })
+  );
+  if (!result.Item) return null;
+  const status = result.Item.status?.S;
+  if (status === 'completed') {
+    const responseData = result.Item.response?.S;
+    return { done: true, result: responseData ? await resolveRelayResult(JSON.parse(responseData)) : undefined };
+  }
+  if (status === 'error') return { done: true, error: result.Item.error?.S || 'Relay error' };
+  return { done: false };
+}
+
+async function deleteRelayJob(tableName: string, requestId: string): Promise<void> {
+  await dynamoClient
+    .send(new DeleteItemCommand({ TableName: tableName, Key: { connectionId: { S: `http-request:${requestId}` } } }))
+    .catch(() => {});
+}
 
 async function sendToRelayAndWait(
   tool: string,
@@ -1386,6 +1482,29 @@ async function sendToRelayAndWait(
     throw new Error('Relay not configured');
   }
 
+  const isAsyncTool = FIGMA_ASYNC_TOOLS.has(tool);
+  // A control-only `jobId` arg (poll mode) must never be forwarded to the plugin.
+  const { jobId: pollJobId, ...pluginArgs } = (args ?? {}) as Record<string, unknown> & { jobId?: string };
+
+  // ---- POLL MODE: caller is retrieving the result of a previously-submitted async job ----
+  if (typeof pollJobId === 'string' && pollJobId.length > 0) {
+    const job = await readRelayJob(tableName, pollJobId);
+    if (!job) {
+      throw new Error(`Figma job ${pollJobId} not found or expired. Re-run ${tool} to start a new one.`);
+    }
+    if (!job.done) {
+      return {
+        status: 'processing',
+        jobId: pollJobId,
+        retryAfterMs: 3000,
+        message: `Still processing. Call ${tool} again with { "jobId": "${pollJobId}" } to retrieve the result.`,
+      };
+    }
+    await deleteRelayJob(tableName, pollJobId);
+    if (job.error) throw new Error(job.error);
+    return job.result;
+  }
+
   const relayConnectionId = await getFigmaRelayConnectionId();
   if (!relayConnectionId) {
     throw new Error(
@@ -1393,13 +1512,16 @@ async function sendToRelayAndWait(
     );
   }
 
-  // Use tool-specific timeout or default
-  const effectiveTimeout = timeoutMs ?? TOOL_TIMEOUTS[tool] ?? DEFAULT_RELAY_TIMEOUT;
+  // Fast-path wait: async tools cap at FIGMA_ASYNC_SUBMIT_WAIT_MS then hand off a job handle; other
+  // tools keep their existing synchronous tool-specific timeout.
+  const submitWait = isAsyncTool ? FIGMA_ASYNC_SUBMIT_WAIT_MS : timeoutMs ?? TOOL_TIMEOUTS[tool] ?? DEFAULT_RELAY_TIMEOUT;
+  const jobTtlSeconds = isAsyncTool ? FIGMA_ASYNC_JOB_TTL_SECONDS : 120;
   const requestId = `http_${++relayRequestId}_${Date.now()}`;
+  const figmaResponseBucket = getFigmaResponseBucket();
 
-  console.info('[relay] sending request', { tool, requestId, timeoutMs: effectiveTimeout });
+  console.info('[relay] sending request', { tool, requestId, timeoutMs: submitWait, async: isAsyncTool });
 
-  // Store pending request
+  // Store pending request (longer TTL for async so the result survives until the caller polls)
   await dynamoClient.send(
     new PutItemCommand({
       TableName: tableName,
@@ -1407,7 +1529,7 @@ async function sendToRelayAndWait(
         connectionId: { S: `http-request:${requestId}` },
         status: { S: 'pending' },
         createdAt: { S: new Date().toISOString() },
-        ttl: { N: String(Math.floor(Date.now() / 1000) + 120) },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + jobTtlSeconds) },
       },
     })
   );
@@ -1424,86 +1546,61 @@ async function sendToRelayAndWait(
             type: 'FIGMA_TOOL_CALL',
             relayRequestId: requestId,
             tool,
-            args,
+            args: pluginArgs,
             httpRequest: true, // Flag so relay knows to store response
+            // Where the relay should upload an oversized (>~96KB) response instead of sending
+            // it inline over the size-limited WebSocket frame.
+            s3Bucket: figmaResponseBucket,
+            s3Key: `figma-resp/${requestId}.json`,
           })
         ),
       })
     );
   } catch (sendError) {
-    // Clean up pending request on send failure
-    await dynamoClient.send(
-      new DeleteItemCommand({
-        TableName: tableName,
-        Key: { connectionId: { S: `http-request:${requestId}` } },
-      })
-    ).catch(() => {});
+    await deleteRelayJob(tableName, requestId);
     console.error('[relay] send failed', { tool, requestId, error: sendError instanceof Error ? sendError.message : 'Unknown' });
     throw new Error('Failed to send request to Figma relay - connection may be stale');
   }
 
-  // Poll for response with adaptive backoff
+  // Poll for response
   const startTime = Date.now();
   let pollCount = 0;
 
-  while (Date.now() - startTime < effectiveTimeout) {
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+  while (Date.now() - startTime < submitWait) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     pollCount++;
 
-    const result = await dynamoClient.send(
-      new GetItemCommand({
-        TableName: tableName,
-        Key: { connectionId: { S: `http-request:${requestId}` } },
-      })
-    );
-
-    if (result.Item?.status?.S === 'completed') {
+    const job = await readRelayJob(tableName, requestId);
+    if (job?.done) {
       const duration = Date.now() - startTime;
       console.info('[relay] response received', { tool, requestId, duration, pollCount });
-
-      // Clean up
-      await dynamoClient.send(
-        new DeleteItemCommand({
-          TableName: tableName,
-          Key: { connectionId: { S: `http-request:${requestId}` } },
-        })
-      ).catch(() => {});
-
-      const responseData = result.Item.response?.S;
-      if (responseData) {
-        return JSON.parse(responseData);
-      }
-      throw new Error('Empty response from relay');
-    }
-
-    if (result.Item?.status?.S === 'error') {
-      const duration = Date.now() - startTime;
-      const errorMessage = result.Item.error?.S || 'Relay error';
-      console.error('[relay] error response', { tool, requestId, duration, error: errorMessage });
-
-      await dynamoClient.send(
-        new DeleteItemCommand({
-          TableName: tableName,
-          Key: { connectionId: { S: `http-request:${requestId}` } },
-        })
-      ).catch(() => {});
-
-      throw new Error(errorMessage);
+      await deleteRelayJob(tableName, requestId);
+      if (job.error) throw new Error(job.error);
+      return job.result;
     }
   }
 
-  // Timeout - clean up and throw
   const duration = Date.now() - startTime;
-  console.error('[relay] timeout', { tool, requestId, duration, pollCount, timeoutMs: effectiveTimeout });
 
-  await dynamoClient.send(
-    new DeleteItemCommand({
-      TableName: tableName,
-      Key: { connectionId: { S: `http-request:${requestId}` } },
-    })
-  ).catch(() => {});
+  // ASYNC hand-off: return a job handle instead of erroring. We intentionally do NOT delete the
+  // pending item — the `message` Lambda UpdateItem-upserts the completed result into this same key
+  // when the plugin finishes, and the caller retrieves it by polling with the jobId.
+  if (isAsyncTool) {
+    console.info('[relay] async hand-off', { tool, requestId, duration, pollCount });
+    return {
+      status: 'processing',
+      jobId: requestId,
+      retryAfterMs: 3000,
+      message: `${tool} is working on a large target and exceeded the ${Math.round(
+        submitWait / 1000
+      )}s fast-path. Call ${tool} again with { "jobId": "${requestId}" } and no other arguments to fetch the result; repeat every few seconds until it returns.`,
+    };
+  }
 
-  throw new Error(`Timeout waiting for Figma plugin response (${Math.round(effectiveTimeout / 1000)}s). Tool: ${tool}`);
+  // Synchronous tools: timeout is a hard failure.
+  console.error('[relay] timeout', { tool, requestId, duration, pollCount, timeoutMs: submitWait });
+  await deleteRelayJob(tableName, requestId);
+  throw new Error(`Timeout waiting for Figma plugin response (${Math.round(submitWait / 1000)}s). Tool: ${tool}`);
 }
 
 // Plugin-based tools (routed through relay)
@@ -1857,7 +1954,8 @@ async function handleToolsList(): Promise<unknown> {
     },
     {
       name: 'dm_figma_validate_design',
-      description: 'CALL AFTER CHANGES: Verify design tokens and component patterns are correct.',
+      description:
+        'CALL AFTER CHANGES: Verify design tokens and component patterns are correct. For large targets (whole page / many nodes) this may return {"status":"processing","jobId":"..."} — in that case call this tool again with ONLY {"jobId":"<that id>"} every few seconds until it returns the validation result.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1865,6 +1963,7 @@ async function handleToolsList(): Promise<unknown> {
           checkTokens: { type: 'boolean', description: 'Verify design tokens' },
           checkComponents: { type: 'boolean', description: 'Verify component usage' },
           componentPatterns: { type: 'array', items: { type: 'string' }, description: 'Expected patterns' },
+          jobId: { type: 'string', description: 'Poll: pass the jobId from a prior {"status":"processing"} response (with no other args) to retrieve the result.' },
         },
       },
     },
@@ -1909,12 +2008,14 @@ async function handleToolsList(): Promise<unknown> {
     },
     {
       name: 'dm_figma_review',
-      description: 'Export a node as PNG and get visual description. Use to see what you created and iterate.',
+      description:
+        'Export a node as PNG and get visual description. Use to see what you created and iterate. For large/complex nodes this may return {"status":"processing","jobId":"..."} — in that case call this tool again with ONLY {"jobId":"<that id>"} every few seconds until it returns the export result.',
       inputSchema: {
         type: 'object',
         properties: {
           nodeId: { type: 'string', description: 'Node ID to export (or uses current selection)' },
           scale: { type: 'number', description: 'Export scale (default: 2)' },
+          jobId: { type: 'string', description: 'Poll: pass the jobId from a prior {"status":"processing"} response (with no other args) to retrieve the result.' },
         },
       },
     },
@@ -2211,6 +2312,33 @@ async function handleToolsList(): Promise<unknown> {
           issueKeys: { type: 'array', items: { type: 'string' }, description: 'Issue keys to move into the sprint, e.g. ["DM-39","DM-50"]' },
         },
         required: ['sprintId', 'issueKeys'],
+      },
+    },
+  ];
+
+  // Hermes tools — dispatch agentic-coding jobs to the self-hosted Hermes platform
+  const hermesTools = [
+    {
+      name: 'dm_hermes_create_pr',
+      description: 'Ask the Hermes coding agent to implement a task and open a pull request. Hermes clones the repo, runs the change end to end, and opens a PR. Returns a jobId to track with dm_hermes_job_status. Asynchronous — the PR appears when the job completes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'What to implement, in plain language. Reference a Jira issue key (e.g. "implement DM-39") and Hermes will pull its context.' },
+          type: { type: 'string', enum: ['fe', 'be'], description: 'Worker type: "fe" (donatemate-app) or "be" (donatemate). Default "fe".' },
+          repo: { type: 'string', description: 'Override target repo (owner/name). Defaults to the repo for the worker type.' },
+          baseBranch: { type: 'string', description: 'Base branch to branch from (default "main").' },
+        },
+        required: ['prompt'],
+      },
+    },
+    {
+      name: 'dm_hermes_job_status',
+      description: 'Check the status of a Hermes job by id (queued | running | done | failed). When done, includes the PR URL.',
+      inputSchema: {
+        type: 'object',
+        properties: { jobId: { type: 'string', description: 'Job id returned by dm_hermes_create_pr' } },
+        required: ['jobId'],
       },
     },
   ];
@@ -2520,7 +2648,7 @@ async function handleToolsList(): Promise<unknown> {
     },
   ];
 
-  return { tools: [...tokenTools, ...figmaRestTools, ...figmaPluginTools, ...knowledgeTools, ...confluenceTools, ...jiraTools, ...gaTools, ...gaAdminTools, ...googleAdsTools] };
+  return { tools: [...tokenTools, ...figmaRestTools, ...figmaPluginTools, ...knowledgeTools, ...confluenceTools, ...jiraTools, ...hermesTools, ...gaTools, ...gaAdminTools, ...googleAdsTools] };
 }
 
 // Simple token storage
@@ -3096,6 +3224,38 @@ async function handleToolsCall(params: Record<string, unknown>): Promise<unknown
         sprintId,
         added: issueKeys,
         count: issueKeys.length,
+      }, null, 2) }] };
+      break;
+    }
+
+    // Hermes tools
+    case 'dm_hermes_create_pr': {
+      const prompt = args?.prompt as string;
+      if (!prompt) throw new Error('prompt is required');
+      const dispatch = await hermesRequest<{ ok: boolean; jobId: string }>('POST', '/dispatch', {
+        prompt,
+        type: (args?.type as string) || 'fe',
+        repo: args?.repo as string | undefined,
+        baseBranch: args?.baseBranch as string | undefined,
+      });
+      result = { content: [{ type: 'text', text: JSON.stringify({
+        jobId: dispatch.jobId,
+        status: 'queued',
+        note: 'Hermes is working on it. Poll dm_hermes_job_status with this jobId for the PR link.',
+      }, null, 2) }] };
+      break;
+    }
+
+    case 'dm_hermes_job_status': {
+      const jobId = args?.jobId as string;
+      if (!jobId) throw new Error('jobId is required');
+      const job = await hermesRequest<any>('GET', `/jobs/${encodeURIComponent(jobId)}`);
+      result = { content: [{ type: 'text', text: JSON.stringify({
+        jobId: job.jobId,
+        status: job.status,
+        repo: job.repo,
+        prUrl: job.prUrl,
+        error: job.error,
       }, null, 2) }] };
       break;
     }
@@ -3821,11 +3981,26 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
       // Check if client wants SSE (Accept: text/event-stream)
       const acceptHeader = event.headers['accept'] || '';
       if (acceptHeader.includes('text/event-stream')) {
-        // Return 405 - we don't support SSE for server-initiated messages
+        // Streamable HTTP listening channel. This server is stateless and serverless — API
+        // Gateway + buffered Lambda cannot hold a long-lived stream — so we open a VALID but
+        // immediately-completing event stream instead of returning 405. That matters: a 405 on
+        // the GET channel makes MCP connectors (claude.ai, mcporter, Claude Code) treat the
+        // connection as failed and flap (disconnect/reconnect loop). Returning 200 text/event-
+        // stream lets the listening channel connect cleanly; since we have no server-initiated
+        // messages, it carries only a keepalive comment and closes, and the client reconnects on
+        // its normal SSE cadence. Echo any session id the client supplied.
+        const sseHeaders: Record<string, string> = {
+          ...baseHeaders,
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+        };
+        const sid = event.headers['mcp-session-id'] || event.headers['Mcp-Session-Id'];
+        if (sid) sseHeaders['Mcp-Session-Id'] = sid;
         return {
-          statusCode: 405,
-          headers: { ...baseHeaders, 'Content-Type': 'application/json', 'Allow': 'POST, OPTIONS' },
-          body: JSON.stringify({ error: 'Method Not Allowed', message: 'SSE not supported. Use POST for requests.' }),
+          statusCode: 200,
+          headers: sseHeaders,
+          body: ': mcp stream open\n\n',
         };
       }
       // Browser/info request - return server info (not part of MCP protocol, but helpful)

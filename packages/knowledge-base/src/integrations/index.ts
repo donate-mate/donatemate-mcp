@@ -6,6 +6,12 @@
 export { BasePlugin } from './core/base-plugin.js';
 export { PluginRegistry } from './core/plugin-registry.js';
 export { GitHubPlugin } from './github/index.js';
+export {
+  ingestHermesPrReviewComments,
+  parseSeverity,
+  type IngestHermesPrReviewsOptions,
+  type IngestHermesPrReviewsResult,
+} from './github/pr-reviews.js';
 export { JiraPlugin } from './jira/index.js';
 export { ConfluencePlugin } from './confluence/index.js';
 export { SlackPlugin } from './slack/index.js';

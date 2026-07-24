@@ -17,6 +17,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
@@ -56,6 +57,7 @@ export class McpStack extends cdk.Stack {
   public readonly httpApi: HttpApi;
   public readonly connectionsTable: dynamodb.Table;
   public readonly apiKeysTable: dynamodb.Table;
+  public readonly figmaResponseBucket: s3.Bucket;
   public readonly oauthUserPool: cognito.UserPool;
 
   constructor(scope: Construct, id: string, props: McpStackProps) {
@@ -99,6 +101,19 @@ export class McpStack extends cdk.Stack {
         type: dynamodb.AttributeType.STRING,
       },
       projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // Oversized Figma plugin responses cannot fit in an API Gateway WebSocket
+    // frame. The relay writes them here and the HTTP handler retrieves them.
+    this.figmaResponseBucket = new s3.Bucket(this, 'FigmaResponseBucket', {
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      lifecycleRules: [{ expiration: cdk.Duration.days(1) }],
+      removalPolicy: environment === 'production'
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: environment !== 'production',
     });
 
     // ========================================================================
@@ -428,6 +443,7 @@ export class McpStack extends cdk.Stack {
       environment: {
         ...lambdaDefaults.environment,
         FIGMA_TOKEN_PARAM_NAME: figmaTokenParamName,
+        FIGMA_RESPONSE_BUCKET: this.figmaResponseBucket.bucketName,
         WEBSOCKET_URL: `wss://${this.webSocketApi.apiId}.execute-api.${this.region}.amazonaws.com/${environment}`,
         WEBSOCKET_ENDPOINT: `https://${this.webSocketApi.apiId}.execute-api.${this.region}.amazonaws.com/${environment}`,
         // OAuth configuration for MCP spec compliance
@@ -440,6 +456,7 @@ export class McpStack extends cdk.Stack {
 
     // Grant DynamoDB permissions for relay bridge
     this.connectionsTable.grantReadWriteData(httpHandler);
+    this.figmaResponseBucket.grantRead(httpHandler);
     // Grant full read/write for API keys table (includes UpdateItem for rate limit tracking)
     this.apiKeysTable.grantReadWriteData(httpHandler);
 
@@ -485,6 +502,8 @@ export class McpStack extends cdk.Stack {
           `arn:aws:secretsmanager:${this.region}:${this.account}:secret:/donatemate/${environment}/knowledge/jira*`,
           // Note: no leading slash — this secret is named donatemate/<env>/anthropic-api-key
           `arn:aws:secretsmanager:${this.region}:${this.account}:secret:donatemate/${environment}/anthropic-api-key*`,
+          // Hermes dispatch shared secret (dm_hermes_create_pr → Hermes /dispatch)
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:donatemate/${environment}/hermes/jira-webhook*`,
         ],
       })
     );
@@ -795,6 +814,11 @@ export class McpStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ConnectionsTableOutput', {
       value: this.connectionsTable.tableName,
       description: 'DynamoDB table for MCP connections',
+    });
+
+    new cdk.CfnOutput(this, 'FigmaResponseBucketOutput', {
+      value: this.figmaResponseBucket.bucketName,
+      description: 'S3 bucket for oversized Figma relay responses',
     });
 
     new cdk.CfnOutput(this, 'CustomDomainTarget', {

@@ -20,6 +20,10 @@ export {
   SlackPlugin,
   registerBuiltInPlugins,
   createPluginRegistry,
+  ingestHermesPrReviewComments,
+  parseSeverity,
+  type IngestHermesPrReviewsOptions,
+  type IngestHermesPrReviewsResult,
 } from './integrations/index.js';
 
 // Re-export commonly used types for convenience

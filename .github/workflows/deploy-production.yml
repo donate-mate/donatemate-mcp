@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_deploy:
-        description: 'Type "deploy" to confirm production deployment'
+        description: 'Type "deploy" for production or "deploy-hermes-staging" for the isolated Hermes staging rollout'
         required: true
         default: ''
 
@@ -107,6 +107,122 @@ jobs:
           name: mcp-production-outputs
           path: packages/infrastructure/mcp-outputs.json
           retention-days: 30
+
+  # This exact dispatch token provides a registered, branch-addressable rollout path while the
+  # dedicated Hermes workflow is still awaiting merge to the default branch. The production job
+  # above only accepts the exact token "deploy", so this path cannot deploy production resources.
+  hermes-staging:
+    name: Deploy Hermes to Staging
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.confirm_deploy == 'deploy-hermes-staging'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Hermes-Staging
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run focused Hermes checks
+        run: |
+          npx vitest run \
+            packages/lambda-handlers/hermes-db-query/src/index.test.ts \
+            packages/hermes-worker/src/gate.test.ts \
+            packages/hermes-worker/src/stagingDatabase.test.ts \
+            --pool=forks --poolOptions.forks.singleFork=true
+          npx tsc --noEmit -p packages/lambda-handlers/hermes-db-query/tsconfig.json
+          npx tsc --noEmit -p packages/infrastructure/tsconfig.json
+
+      - name: Preview Hermes staging infrastructure
+        working-directory: packages/infrastructure
+        run: |
+          npx cdk diff DonateMate-Hermes-Staging \
+            --context environment=staging \
+            --context deploy-hermes=true \
+            --require-approval never
+
+      - name: Deploy Hermes staging infrastructure
+        working-directory: packages/infrastructure
+        run: |
+          npx cdk deploy DonateMate-Hermes-Staging \
+            --context environment=staging \
+            --context deploy-hermes=true \
+            --require-approval never \
+            --outputs-file hermes-outputs.json
+
+      - name: Verify staging database gateway
+        run: |
+          set -euo pipefail
+          read_meta="$(aws lambda invoke \
+            --function-name donatemate-staging-hermes-db-query \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{"sql":"SELECT current_database() AS database_name, current_user AS database_user, current_setting('"'"'transaction_read_only'"'"') AS read_only","maxRows":1,"ticket":"DEPLOY-CHECK"}' \
+            /tmp/hermes-db-read.json)"
+          test "$(jq -r '.FunctionError // empty' <<<"$read_meta")" = ""
+          jq -e \
+            '.readOnly == true and .rowCount == 1 and .rows[0].database_user == "hermes_staging_reader" and .rows[0].read_only == "on"' \
+            /tmp/hermes-db-read.json >/dev/null
+
+          reject_meta="$(aws lambda invoke \
+            --function-name donatemate-staging-hermes-db-query \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{"sql":"UPDATE donations SET amount = 0","ticket":"DEPLOY-CHECK"}' \
+            /tmp/hermes-db-reject.json)"
+          test "$(jq -r '.FunctionError // empty' <<<"$reject_meta")" = "Unhandled"
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Hermes control plane
+        uses: docker/build-push-action@v6
+        with:
+          context: packages/hermes-control-plane
+          file: packages/hermes-control-plane/Dockerfile
+          push: true
+          tags: |
+            690788838096.dkr.ecr.us-east-2.amazonaws.com/donatemate-hermes-control-plane:latest
+            690788838096.dkr.ecr.us-east-2.amazonaws.com/donatemate-hermes-control-plane:${{ github.sha }}
+          cache-from: type=gha,scope=hermes-control-plane
+          cache-to: type=gha,scope=hermes-control-plane,mode=max
+
+      - name: Build and push Hermes worker
+        uses: docker/build-push-action@v6
+        with:
+          context: packages/hermes-worker
+          file: packages/hermes-worker/Dockerfile
+          push: true
+          tags: |
+            690788838096.dkr.ecr.us-east-2.amazonaws.com/donatemate-hermes-worker:latest
+            690788838096.dkr.ecr.us-east-2.amazonaws.com/donatemate-hermes-worker:${{ github.sha }}
+          cache-from: type=gha,scope=hermes-worker
+          cache-to: type=gha,scope=hermes-worker,mode=max
+
+      - name: Roll Hermes staging services
+        run: |
+          aws ecs update-service \
+            --cluster donatemate-staging-hermes \
+            --service donatemate-staging-hermes-control-plane \
+            --force-new-deployment --no-cli-pager >/dev/null
+          aws ecs update-service \
+            --cluster donatemate-staging-hermes \
+            --service donatemate-staging-hermes-fe-worker \
+            --force-new-deployment --no-cli-pager >/dev/null
 
   notify-failure:
     name: Notify on Failure
