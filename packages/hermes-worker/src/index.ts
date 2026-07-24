@@ -592,7 +592,7 @@ async function processJob(jobId: string): Promise<void> {
     // WS2 — pre-commit gate: lint/format/tests on the changed packages, repairing via Codex up to
     // GATE_MAX_RETRIES. Fail-open: after the retries, still open the PR (with a loud warning).
     const installOk = install.skipped || install.ok;
-    const gate = await runGateLoop({
+    let gate = await runGateLoop({
       jobId,
       dir,
       baseSha: gateBaseSha,
@@ -666,7 +666,7 @@ async function processJob(jobId: string): Promise<void> {
       if (blocking.length) {
         const fix = await runAgent(dir, buildReviewFixPrompt(review.findings));
         transcript += `\n--- Pre-open review fix round ---\n${fix.transcript || `(exit ${fix.exitCode})`}`;
-        await runGateLoop({
+        gate = await runGateLoop({
           jobId,
           dir,
           baseSha: gateBaseSha,
