@@ -40,11 +40,12 @@ const ADMIN_USER_POOL_IDS: Record<Environment, string> = {
   production: 'us-east-2_GXOhBd1nN',  // DonateMate-Production-AdminUsers
 };
 
-// ACM Certificate ARNs for custom domain (mcp.donate-mate.com)
-const MCP_CERTIFICATE_ARNS: Record<Environment, string> = {
-  staging: 'arn:aws:acm:us-east-2:690788838096:certificate/c84fe58a-e939-4723-85f4-a61b8a3fcb52',
-  production: 'arn:aws:acm:us-east-2:690788838096:certificate/c84fe58a-e939-4723-85f4-a61b8a3fcb52', // Same cert for now
-};
+// The existing public MCP hostname is owned by the staging stack. API Gateway
+// domain names are regional singletons, so the production stack must use its
+// generated execute-api endpoint until it has a separately certified hostname.
+const MCP_CUSTOM_DOMAIN = 'mcp.donate-mate.com';
+const MCP_CUSTOM_DOMAIN_CERTIFICATE_ARN =
+  'arn:aws:acm:us-east-2:690788838096:certificate/c84fe58a-e939-4723-85f4-a61b8a3fcb52';
 
 export interface McpStackProps extends cdk.StackProps {
   environment: Environment;
@@ -653,22 +654,25 @@ export class McpStack extends cdk.Stack {
     // Custom Domain (mcp.donate-mate.com)
     // ========================================================================
 
-    const certificate = certificatemanager.Certificate.fromCertificateArn(
-      this,
-      'McpCertificate',
-      MCP_CERTIFICATE_ARNS[environment]
-    );
+    let customDomain: DomainName | undefined;
+    if (environment === 'staging') {
+      const certificate = certificatemanager.Certificate.fromCertificateArn(
+        this,
+        'McpCertificate',
+        MCP_CUSTOM_DOMAIN_CERTIFICATE_ARN
+      );
 
-    const customDomain = new DomainName(this, 'McpDomain', {
-      domainName: 'mcp.donate-mate.com',
-      certificate,
-    });
+      customDomain = new DomainName(this, 'McpDomain', {
+        domainName: MCP_CUSTOM_DOMAIN,
+        certificate,
+      });
 
-    // Map the custom domain to the HTTP API
-    new apigatewayv2.ApiMapping(this, 'McpApiMapping', {
-      api: this.httpApi,
-      domainName: customDomain,
-    });
+      // Map the public custom domain to the stack that currently owns it.
+      new apigatewayv2.ApiMapping(this, 'McpApiMapping', {
+        api: this.httpApi,
+        domainName: customDomain,
+      });
+    }
 
     // ========================================================================
     // SSM Parameter Exports (for other services to consume)
@@ -821,15 +825,17 @@ export class McpStack extends cdk.Stack {
       description: 'S3 bucket for oversized Figma relay responses',
     });
 
-    new cdk.CfnOutput(this, 'CustomDomainTarget', {
-      value: customDomain.regionalDomainName,
-      description: 'CNAME target for mcp.donate-mate.com',
-    });
+    if (customDomain) {
+      new cdk.CfnOutput(this, 'CustomDomainTarget', {
+        value: customDomain.regionalDomainName,
+        description: `CNAME target for ${MCP_CUSTOM_DOMAIN}`,
+      });
 
-    new cdk.CfnOutput(this, 'CustomDomainUrl', {
-      value: 'https://mcp.donate-mate.com/mcp',
-      description: 'Custom domain MCP endpoint URL',
-    });
+      new cdk.CfnOutput(this, 'CustomDomainUrl', {
+        value: `https://${MCP_CUSTOM_DOMAIN}/mcp`,
+        description: 'Custom domain MCP endpoint URL',
+      });
+    }
 
     // OAuth outputs
     new cdk.CfnOutput(this, 'OAuthUserPoolIdOutput', {
