@@ -23,8 +23,11 @@ import type { ScheduledEvent } from 'aws-lambda';
 
 const secretsClient = new SecretsManagerClient({});
 
-// Target repository for Hermes review ingestion.
-const DEFAULT_REPO = 'donate-mate/donatemate';
+// Target repositories for scheduled Hermes review ingestion.
+const DEFAULT_REPOS = [
+  'donate-mate/donatemate',
+  'donate-mate/donatemate-app',
+] as const;
 
 // Direct-invocation override (for manual/on-demand runs).
 interface DirectIngestEvent {
@@ -43,7 +46,7 @@ export async function handler(
   event: ScheduledEvent | DirectIngestEvent
 ): Promise<{ ingested: number }> {
   const directEvent = event as DirectIngestEvent;
-  const repo = directEvent.repo || DEFAULT_REPO;
+  const repos = directEvent.repo ? [directEvent.repo] : DEFAULT_REPOS;
   const sinceDays = directEvent.sinceDays;
 
   const dbSecretArn = process.env.DATABASE_SECRET_ARN;
@@ -100,29 +103,36 @@ export async function handler(
   }
 
   try {
-    console.info('[hermes-review-ingest] Starting ingestion', { repo, sinceDays });
-
-    const result = await ingestHermesPrReviewComments({
-      db,
-      embedder,
-      repo,
-      token,
-      ...(sinceDays != null ? { sinceDays } : {}),
-    });
+    let ingested = 0;
+    for (const repo of repos) {
+      console.info('[hermes-review-ingest] Starting ingestion', { repo, sinceDays });
+      try {
+        const result = await ingestHermesPrReviewComments({
+          db,
+          embedder,
+          repo,
+          token,
+          ...(sinceDays != null ? { sinceDays } : {}),
+        });
+        ingested += result.ingested;
+        console.info('[hermes-review-ingest] Repository ingestion complete', {
+          repo,
+          ingested: result.ingested,
+        });
+      } catch (err) {
+        // Fail open per repository so one GitHub stream cannot suppress the other.
+        console.error('[hermes-review-ingest] Repository ingestion failed', {
+          repo,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     console.info('[hermes-review-ingest] Ingestion complete', {
-      repo,
-      ingested: result.ingested,
+      repos,
+      ingested,
     });
-
-    return result;
-  } catch (err) {
-    // Fail open: log and report zero rather than throwing (nightly best-effort).
-    console.error('[hermes-review-ingest] Ingestion failed', {
-      repo,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return { ingested: 0 };
+    return { ingested };
   } finally {
     await Promise.allSettled([db.close(), embedder.close()]);
   }

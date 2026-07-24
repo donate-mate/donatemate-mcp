@@ -49,6 +49,7 @@ if (deployFigmaVm) {
   new FigmaVmStack(app, `DonateMate-FigmaVM-${capitalize(environment)}`, {
     env: awsEnv,
     environment,
+    responseBucket: mcpStack.figmaResponseBucket,
     description: `DonateMate Figma VM - ${environment}`,
   });
 }

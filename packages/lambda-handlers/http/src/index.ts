@@ -1412,7 +1412,13 @@ const POLL_INTERVAL_MS = 300; // Poll every 300ms (was 500ms)
 // WebSocket 128KB frame limit, so they can't be sent back inline. The relay uploads oversized
 // responses to S3 (via the VM instance role) and returns a small pointer { __s3Key }; we fetch
 // the full payload from S3 here.
-const FIGMA_RESPONSE_BUCKET = process.env.FIGMA_RESPONSE_BUCKET || 'donatemate-staging-figma-responses';
+function getFigmaResponseBucket(): string {
+  const bucket = process.env.FIGMA_RESPONSE_BUCKET;
+  if (!bucket) {
+    throw new Error('FIGMA_RESPONSE_BUCKET not configured');
+  }
+  return bucket;
+}
 
 // Async submit→poll for heavy plugin tools that can exceed API Gateway's hard ~29s ceiling.
 // For these tools, if the plugin hasn't responded within FIGMA_ASYNC_SUBMIT_WAIT_MS we return a
@@ -1434,7 +1440,7 @@ const s3Client = new S3Client({});
 async function resolveRelayResult(result: unknown): Promise<unknown> {
   const key = (result as { __s3Key?: string })?.__s3Key;
   if (!key) return result;
-  const obj = await s3Client.send(new GetObjectCommand({ Bucket: FIGMA_RESPONSE_BUCKET, Key: key }));
+  const obj = await s3Client.send(new GetObjectCommand({ Bucket: getFigmaResponseBucket(), Key: key }));
   const body = await obj.Body!.transformToString();
   return JSON.parse(body);
 }
@@ -1511,6 +1517,7 @@ async function sendToRelayAndWait(
   const submitWait = isAsyncTool ? FIGMA_ASYNC_SUBMIT_WAIT_MS : timeoutMs ?? TOOL_TIMEOUTS[tool] ?? DEFAULT_RELAY_TIMEOUT;
   const jobTtlSeconds = isAsyncTool ? FIGMA_ASYNC_JOB_TTL_SECONDS : 120;
   const requestId = `http_${++relayRequestId}_${Date.now()}`;
+  const figmaResponseBucket = getFigmaResponseBucket();
 
   console.info('[relay] sending request', { tool, requestId, timeoutMs: submitWait, async: isAsyncTool });
 
@@ -1543,7 +1550,7 @@ async function sendToRelayAndWait(
             httpRequest: true, // Flag so relay knows to store response
             // Where the relay should upload an oversized (>~96KB) response instead of sending
             // it inline over the size-limited WebSocket frame.
-            s3Bucket: FIGMA_RESPONSE_BUCKET,
+            s3Bucket: figmaResponseBucket,
             s3Key: `figma-resp/${requestId}.json`,
           })
         ),
