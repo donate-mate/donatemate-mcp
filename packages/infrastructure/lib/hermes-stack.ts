@@ -401,6 +401,10 @@ export class HermesStack extends cdk.Stack {
         MCP_ENDPOINT: 'https://mcp.donate-mate.com/mcp',
         // Hard timeout is the budget guardrail for the Codex run.
         JOB_TIMEOUT_SECONDS: '2400',
+        // ECS can reject lease renewals with DEPLOYMENT_BLOCKED once a rollout starts. Keep the
+        // initial lease long enough for normal jobs, and renew it while the service permits.
+        TASK_PROTECTION_EXPIRES_MINUTES: '165',
+        TASK_PROTECTION_RENEW_SECONDS: '600',
         // --- Hermes PR-process enhancements (WS1–WS4), all env-tunable with safe fallbacks ---
         AGENT_REASONING_EFFORT: 'medium', // WS3.1 Codex model_reasoning_effort for implementation jobs
         PREOPEN_REVIEW_ENABLED: 'true', // WS4 pre-open adversarial review stage

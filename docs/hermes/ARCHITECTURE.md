@@ -288,6 +288,12 @@ CLI** in non-interactive `codex exec` mode. Key facts as-coded:
   hang the job.
 - **Timeout**: hard `JOB_TIMEOUT_SECONDS` (default 2400s) budget guardrail; on expiry the child is
   `SIGKILL`ed and the job fails as timed out. Output is capped at 16 MiB.
+- **Scale-in protection**: a worker takes an initial 165-minute ECS protection lease and renews it
+  every 10 minutes while a job is active. The lease covers the longest enabled workflow wait
+  budget (120 minutes) plus 45 minutes for setup, polling alignment, reporting, and cleanup, while
+  remaining below CloudFormation's three-hour ECS-update ceiling. ECS can return per-task
+  `DEPLOYMENT_BLOCKED` failures in an otherwise successful API response after a rollout starts, so
+  Hermes logs those failures and relies on the initial lease during a blocked deployment.
 - **`CODEX_HOME`** is left at its default under `$HOME` — Codex refuses to create helper binaries
   when `CODEX_HOME` is under `/tmp`, and each task processes one job at a time.
 
@@ -386,6 +392,8 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `AGENT_MODEL` | `gpt-5.5` (coding model) |
 | `MCP_ENDPOINT` | `https://mcp.donate-mate.com/mcp` |
 | `JOB_TIMEOUT_SECONDS` | `2400` |
+| `TASK_PROTECTION_EXPIRES_MINUTES` | `165` |
+| `TASK_PROTECTION_RENEW_SECONDS` | `600` |
 | `REVIEW_LEARNING_ENABLED` | `true` |
 | `REVIEW_LEARNING_TOP_K` | `5` |
 | `REVIEW_LEARNING_TIMEOUT_MS` | `1500` |

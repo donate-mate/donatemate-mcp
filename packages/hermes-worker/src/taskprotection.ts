@@ -6,8 +6,35 @@
 import { ECSClient, UpdateTaskProtectionCommand } from '@aws-sdk/client-ecs';
 
 const ecs = new ECSClient({});
-const PROTECTION_MINUTES = Math.max(2, Number(process.env.TASK_PROTECTION_EXPIRES_MINUTES ?? 30));
-const RENEW_SECONDS = Math.max(30, Number(process.env.TASK_PROTECTION_RENEW_SECONDS ?? 10 * 60));
+// The longest enabled workflow wait budget is 120 minutes. Keep 45 minutes for setup, polling
+// alignment, reporting, and cleanup while remaining below CloudFormation's three-hour ECS update
+// ceiling.
+const DEFAULT_PROTECTION_MINUTES = 165;
+const DEFAULT_RENEW_SECONDS = 10 * 60;
+
+export function taskProtectionConfig(env: NodeJS.ProcessEnv = process.env): {
+  protectionMinutes: number;
+  renewSeconds: number;
+} {
+  const configuredMinutes = Number(env.TASK_PROTECTION_EXPIRES_MINUTES);
+  const protectionMinutes = Number.isFinite(configuredMinutes)
+    ? Math.min(2_880, Math.max(2, Math.floor(configuredMinutes)))
+    : DEFAULT_PROTECTION_MINUTES;
+  const configuredRenewSeconds = Number(env.TASK_PROTECTION_RENEW_SECONDS);
+  const requestedRenewSeconds = Number.isFinite(configuredRenewSeconds)
+    ? Math.max(30, Math.floor(configuredRenewSeconds))
+    : DEFAULT_RENEW_SECONDS;
+
+  // Always attempt renewal well before expiry, even if an invalid deployment override is supplied.
+  const renewSeconds = Math.min(
+    requestedRenewSeconds,
+    Math.max(30, Math.floor((protectionMinutes * 60) / 2))
+  );
+  return { protectionMinutes, renewSeconds };
+}
+
+const { protectionMinutes: PROTECTION_MINUTES, renewSeconds: RENEW_SECONDS } =
+  taskProtectionConfig();
 
 async function taskIdentity(): Promise<{ cluster: string; taskArn: string } | null> {
   const base = process.env.ECS_CONTAINER_METADATA_URI_V4;
@@ -22,11 +49,14 @@ async function taskIdentity(): Promise<{ cluster: string; taskArn: string } | nu
   }
 }
 
-export async function setScaleInProtection(enabled: boolean, expiresInMinutes = 60): Promise<void> {
+export async function setScaleInProtection(
+  enabled: boolean,
+  expiresInMinutes = DEFAULT_PROTECTION_MINUTES
+): Promise<boolean> {
   const id = await taskIdentity();
-  if (!id) return; // not running on ECS
+  if (!id) return true; // not running on ECS
   try {
-    await ecs.send(
+    const result = await ecs.send(
       new UpdateTaskProtectionCommand({
         cluster: id.cluster,
         tasks: [id.taskArn],
@@ -34,10 +64,25 @@ export async function setScaleInProtection(enabled: boolean, expiresInMinutes = 
         ...(enabled ? { expiresInMinutes } : {}),
       })
     );
+    if (result.failures?.length) {
+      const failures = result.failures
+        .map(
+          (failure) =>
+            `${failure.reason ?? 'UNKNOWN'}${failure.detail ? ` (${failure.detail})` : ''}`
+        )
+        .join('; ');
+      // UpdateTaskProtection reports per-task failures in a successful API response. In
+      // particular, DEPLOYMENT_BLOCKED is not thrown, so ignoring this array silently lets the
+      // original protection lease expire during a rollout.
+      console.error(`task scale-in protection update rejected: ${failures}`);
+      return false;
+    }
+    return true;
   } catch (err) {
     // Non-fatal: worst case the autoscaler could scale this task in; the SQS message would
     // then redeliver. Log and continue.
     console.error('task scale-in protection update failed:', err instanceof Error ? err.message : String(err));
+    return false;
   }
 }
 
@@ -49,7 +94,7 @@ export async function setScaleInProtection(enabled: boolean, expiresInMinutes = 
 export async function startScaleInProtectionRenewal(): Promise<() => Promise<void>> {
   await setScaleInProtection(true, PROTECTION_MINUTES);
   let stopped = false;
-  let renewal: Promise<void> | undefined;
+  let renewal: Promise<boolean> | undefined;
   const timer = setInterval(() => {
     if (stopped || renewal) return;
     renewal = setScaleInProtection(true, PROTECTION_MINUTES).finally(() => {
