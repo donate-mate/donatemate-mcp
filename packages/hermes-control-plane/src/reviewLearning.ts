@@ -11,6 +11,8 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   BatchWriteCommand,
   DynamoDBDocumentClient,
+  PutCommand,
+  QueryCommand,
   type BatchWriteCommandInput,
 } from '@aws-sdk/lib-dynamodb';
 import type { WorkerType } from './jobs.js';
@@ -58,6 +60,14 @@ export interface RecordMergedReviewLessonsInput {
   lessons: ReviewLessonCandidate[];
 }
 
+export interface ReviewThreadResolutionEvidence {
+  repo: string;
+  prNumber: number;
+  threadId: string;
+  resolvedAt: string;
+  resolvedBy?: string;
+}
+
 function lessonKey(repo: string, sourceId: string): string {
   const digest = createHash('sha256').update(`${repo}\0${sourceId}`).digest('hex').slice(0, 40);
   return `review-memory:${digest}`;
@@ -65,6 +75,82 @@ function lessonKey(repo: string, sourceId: string): string {
 
 function feedbackHash(feedback: string): string {
   return createHash('sha256').update(feedback).digest('hex');
+}
+
+function resolutionEvidenceKey(evidence: ReviewThreadResolutionEvidence): string {
+  const digest = createHash('sha256')
+    .update(
+      `${evidence.repo}\0${evidence.prNumber}\0${evidence.threadId}\0${evidence.resolvedAt}`
+    )
+    .digest('hex')
+    .slice(0, 40);
+  return `review-resolution:${digest}`;
+}
+
+function resolutionEvidenceStatus(repo: string, prNumber: number): string {
+  return `review-resolution:${repo}#${prNumber}`;
+}
+
+/**
+ * Preserve the timestamp from GitHub's signed `pull_request_review_thread:resolved` webhook.
+ * GraphQL exposes only the thread's current `isResolved` value, so this immutable event is the
+ * evidence needed to prove that resolution happened no later than the merge.
+ */
+export async function recordReviewThreadResolutionEvidence(
+  evidence: ReviewThreadResolutionEvidence
+): Promise<boolean> {
+  if (
+    !TABLE ||
+    !evidence.repo ||
+    !Number.isSafeInteger(evidence.prNumber) ||
+    evidence.prNumber <= 0 ||
+    !evidence.threadId ||
+    !Number.isFinite(Date.parse(evidence.resolvedAt))
+  ) {
+    return false;
+  }
+
+  const recordedAt = new Date().toISOString();
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: TABLE,
+        Item: {
+          jobId: resolutionEvidenceKey(evidence),
+          status: resolutionEvidenceStatus(evidence.repo, evidence.prNumber),
+          kind: 'review_resolution_evidence',
+          ...evidence,
+          createdAt: evidence.resolvedAt,
+          updatedAt: recordedAt,
+          expiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
+        },
+        ConditionExpression: 'attribute_not_exists(jobId)',
+      })
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+export async function listReviewThreadResolutionEvidence(
+  repo: string,
+  prNumber: number
+): Promise<ReviewThreadResolutionEvidence[]> {
+  if (!TABLE || !repo || !Number.isSafeInteger(prNumber) || prNumber <= 0) return [];
+  const result = await ddb.send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'status-index',
+      KeyConditionExpression: '#status = :status',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: { ':status': resolutionEvidenceStatus(repo, prNumber) },
+      ScanIndexForward: false,
+      Limit: 200,
+    })
+  );
+  return (result.Items ?? []) as ReviewThreadResolutionEvidence[];
 }
 
 /**

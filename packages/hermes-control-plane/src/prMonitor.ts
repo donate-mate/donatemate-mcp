@@ -26,6 +26,7 @@ import {
   rebasePullRequestBranch,
   remainingRestBudget,
   requestReReviewFromChangeRequesters,
+  reviewThreadResolutionFromWebhook,
   signalFromPrCommentWebhook,
   signalFromReviewWebhook,
   verifyGitHubSignature,
@@ -61,7 +62,10 @@ import { getFlow, setFlow } from './jiraflow.js';
 import { fetchIssueContext, getIssueAssigneeAccountId } from './jira.js';
 import { loadQaScenarioCatalog } from './qaConfluence.js';
 import { buildQaProofPlan, buildQaReadinessPlan, summarizeQaPlan, type QaProofPlan } from './qaPlanner.js';
-import { recordMergedReviewLessons } from './reviewLearning.js';
+import {
+  recordMergedReviewLessons,
+  recordReviewThreadResolutionEvidence,
+} from './reviewLearning.js';
 
 // Per-PR cap on automated fix rounds — of distinct problems AND of retries of a problem a previous
 // attempt failed to resolve (see RETRY_UNRESOLVED_SIGNALS). Reaching it blocks the watch, which is
@@ -969,10 +973,25 @@ export async function handleGitHubWebhook(
 ): Promise<{ ok: true; ignored?: string }> {
   if (!(await verifyGitHubSignature(rawBody, headers))) throw new Error('invalid GitHub signature');
   const deliveryId = String(headers['x-github-delivery'] ?? '');
+  const eventName = String(headers['x-github-event'] ?? '');
+  const { repo, prNumber, extraSignals } = payloadRepoAndPr(body);
+  const resolutionEvidence = reviewThreadResolutionFromWebhook(body, eventName);
+
+  // Record signed resolution-time evidence before claiming the delivery. The evidence write is
+  // idempotent, so a transient failure can safely return 500 and let GitHub retry this delivery.
+  // This is the only reliable way to distinguish pre-merge from post-merge resolution: GraphQL's
+  // PullRequestReviewThread exposes current state but no resolution timestamp.
+  if (repo && prNumber && resolutionEvidence) {
+    await recordReviewThreadResolutionEvidence({
+      repo,
+      prNumber,
+      ...resolutionEvidence,
+    });
+  }
+
   const firstDelivery = await rememberGitHubDelivery(deliveryId);
   if (!firstDelivery) return { ok: true, ignored: 'duplicate delivery' };
 
-  const { repo, prNumber, extraSignals } = payloadRepoAndPr(body);
   if (!repo || !prNumber) return { ok: true, ignored: 'not a watched PR event' };
 
   // A CI run on a PR with ~27 checks emits ~54 check_run events, and each one used to drive a full

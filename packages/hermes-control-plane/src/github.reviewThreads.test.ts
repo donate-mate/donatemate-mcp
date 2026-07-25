@@ -5,6 +5,7 @@ import {
   HERMES_REVIEW_REPLY_MARKER_PREFIX,
   lessonFromReviewThreadNode,
   lessonsFromReviewNodes,
+  reviewThreadResolutionFromWebhook,
   signalFromReviewThreadNode,
   signalFromPrCommentWebhook,
 } from './github.js';
@@ -138,7 +139,8 @@ describe('accepted review learning', () => {
     expect(
       lessonFromReviewThreadNode(
         thread([trustedRoot, postMergeFollowup], { isResolved: true }),
-        cutoff
+        cutoff,
+        { resolvedAt: '2026-07-10T10:00:00Z', resolvedBy: 'reviewer' }
       )
     ).toMatchObject({
       feedbackCommentId: 'PRRC_root',
@@ -150,6 +152,28 @@ describe('accepted review learning', () => {
         cutoff
       )
     ).toBeNull();
+  });
+
+  it('requires timestamped pre-merge evidence for a resolved thread', () => {
+    const resolvedThread = thread([trustedRoot], { isResolved: true });
+    const cutoff = '2026-07-11T10:00:00Z';
+
+    expect(lessonFromReviewThreadNode(resolvedThread, cutoff)).toBeNull();
+    expect(
+      lessonFromReviewThreadNode(resolvedThread, cutoff, {
+        resolvedAt: '2026-07-12T10:00:00Z',
+        resolvedBy: 'reviewer',
+      })
+    ).toBeNull();
+    expect(
+      lessonFromReviewThreadNode(resolvedThread, cutoff, {
+        resolvedAt: '2026-07-10T10:00:00Z',
+        resolvedBy: 'reviewer',
+      })
+    ).toMatchObject({
+      evidence: 'thread_resolved',
+      resolvedBy: 'reviewer',
+    });
   });
 
   it('excludes feedback edited after the merge boundary', () => {
@@ -241,6 +265,32 @@ describe('accepted review learning', () => {
         '2026-07-09T20:00:00Z'
       )
     ).toEqual([]);
+  });
+});
+
+describe('reviewThreadResolutionFromWebhook', () => {
+  it('extracts immutable resolution evidence only from the matching signed event shape', () => {
+    const body = {
+      action: 'resolved',
+      thread: {
+        node_id: 'PRRT_thread',
+        updated_at: '2026-07-10T10:00:00Z',
+      },
+      sender: { login: 'reviewer' },
+    };
+
+    expect(reviewThreadResolutionFromWebhook(body, 'pull_request_review_thread')).toEqual({
+      threadId: 'PRRT_thread',
+      resolvedAt: '2026-07-10T10:00:00Z',
+      resolvedBy: 'reviewer',
+    });
+    expect(reviewThreadResolutionFromWebhook(body, 'pull_request_review_comment')).toBeNull();
+    expect(
+      reviewThreadResolutionFromWebhook(
+        { ...body, thread: { ...body.thread, updated_at: null } },
+        'pull_request_review_thread'
+      )
+    ).toBeNull();
   });
 });
 

@@ -7,7 +7,11 @@ import { createAppAuth } from '@octokit/auth-app';
 import { Octokit } from '@octokit/rest';
 import { getSecretJson } from './secrets.js';
 import type { PrSignal, PrWatch } from './prWatch.js';
-import type { ReviewLessonCandidate } from './reviewLearning.js';
+import {
+  listReviewThreadResolutionEvidence,
+  type ReviewLessonCandidate,
+  type ReviewThreadResolutionEvidence,
+} from './reviewLearning.js';
 
 const SECRET_GITHUB_APP = process.env.SECRET_GITHUB_APP!;
 
@@ -653,7 +657,8 @@ function reviewActivityAtOrBefore(activity: any, acceptedBefore?: string | null)
  */
 export function lessonFromReviewThreadNode(
   thread: any,
-  acceptedBefore?: string | null
+  acceptedBefore?: string | null,
+  resolutionEvidence?: Pick<ReviewThreadResolutionEvidence, 'resolvedAt' | 'resolvedBy'>
 ): ReviewLessonCandidate | null {
   const comments = ((thread?.comments?.nodes ?? []) as any[]).filter((comment) =>
     reviewActivityAtOrBefore(comment, acceptedBefore)
@@ -676,7 +681,14 @@ export function lessonFromReviewThreadNode(
     }
   });
   const hermesRepliedAfterFeedback = lastMarkerIndex > lastNonBotHumanIndex && lastNonBotHumanIndex >= 0;
-  if (!thread.isResolved && !hermesRepliedAfterFeedback) return null;
+  const resolvedBeforeAcceptance =
+    Boolean(thread.isResolved) &&
+    (!acceptedBefore ||
+      Boolean(
+        resolutionEvidence?.resolvedAt &&
+          reviewActivityAtOrBefore({ updatedAt: resolutionEvidence.resolvedAt }, acceptedBefore)
+      ));
+  if (!resolvedBeforeAcceptance && !hermesRepliedAfterFeedback) return null;
 
   const acceptedThroughIndex = hermesRepliedAfterFeedback ? lastMarkerIndex : comments.length - 1;
   const feedbackComments = comments
@@ -710,8 +722,11 @@ export function lessonFromReviewThreadNode(
     reviewerAssociations: associations,
     sourceUrl: String(latest.url ?? ''),
     feedbackCreatedAt: String(latest.createdAt ?? new Date().toISOString()),
-    evidence: thread.isResolved ? 'thread_resolved' : 'hermes_replied',
-    resolvedBy: thread.resolvedBy?.login ? String(thread.resolvedBy.login) : undefined,
+    evidence: resolvedBeforeAcceptance ? 'thread_resolved' : 'hermes_replied',
+    resolvedBy: resolvedBeforeAcceptance
+      ? resolutionEvidence?.resolvedBy ??
+        (thread.resolvedBy?.login ? String(thread.resolvedBy.login) : undefined)
+      : undefined,
     fixCommitSha: markerFixCommit(markerComment?.body),
   };
 }
@@ -783,6 +798,9 @@ async function collectReviewSnapshot(
   mergedAt?: string | null
 ): Promise<ReviewSnapshot> {
   const { owner, name } = splitRepo(repo);
+  const resolutionEvidencePromise = mergedAt
+    ? listReviewThreadResolutionEvidence(repo, prNumber).catch(() => [])
+    : Promise.resolve([]);
   const query = `
     query($owner: String!, $name: String!, $number: Int!, $after: String) {
       repository(owner: $owner, name: $name) {
@@ -877,9 +895,26 @@ async function collectReviewSnapshot(
           })
       : [];
   const fallbackUrl = `https://github.com/${repo}/pull/${prNumber}`;
+  const resolutionEvidence = await resolutionEvidencePromise;
+  const latestResolutionByThread = new Map<string, ReviewThreadResolutionEvidence>();
+  for (const evidence of resolutionEvidence) {
+    const current = latestResolutionByThread.get(evidence.threadId);
+    if (
+      !current ||
+      Date.parse(evidence.resolvedAt) > Date.parse(current.resolvedAt)
+    ) {
+      latestResolutionByThread.set(evidence.threadId, evidence);
+    }
+  }
   const lessons = [
     ...threads
-      .map((thread) => lessonFromReviewThreadNode(thread, mergedAt))
+      .map((thread) =>
+        lessonFromReviewThreadNode(
+          thread,
+          mergedAt,
+          latestResolutionByThread.get(String(thread.id ?? ''))
+        )
+      )
       .filter((lesson: ReviewLessonCandidate | null): lesson is ReviewLessonCandidate => Boolean(lesson)),
     ...lessonsFromReviewNodes(reviews, fallbackUrl, mergedAt),
   ];
@@ -940,6 +975,24 @@ export async function collectPrSnapshot(watch: PrWatch, extraSignals: PrSignal[]
     signals: [...checks.signals, ...reviews.signals, ...(mergeSignal ? [mergeSignal] : []), ...extraSignals],
     reviewLessons: reviews.lessons,
     labels,
+  };
+}
+
+export function reviewThreadResolutionFromWebhook(
+  body: Record<string, any>,
+  eventName: string
+): Pick<ReviewThreadResolutionEvidence, 'threadId' | 'resolvedAt' | 'resolvedBy'> | null {
+  if (eventName !== 'pull_request_review_thread' || String(body.action ?? '') !== 'resolved') {
+    return null;
+  }
+  const threadId = String(body.thread?.node_id ?? body.thread?.nodeId ?? '');
+  const resolvedAt = String(body.thread?.updated_at ?? body.thread?.updatedAt ?? '');
+  if (!threadId || !Number.isFinite(Date.parse(resolvedAt))) return null;
+  const resolvedBy = String(body.sender?.login ?? '').trim();
+  return {
+    threadId,
+    resolvedAt,
+    resolvedBy: resolvedBy || undefined,
   };
 }
 

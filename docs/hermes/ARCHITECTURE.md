@@ -226,7 +226,16 @@ Created by the worker (`recordPrWatch`) when the initial PR opens; all subsequen
 A tiny row written by `rememberGitHubDelivery` with a 7-day TTL; a conditional `attribute_not_exists`
 put makes duplicate GitHub deliveries no-ops.
 
-### 3.5 `review-memory:<hash>` — accepted reviewer-feedback memory
+### 3.5 `review-resolution:<hash>` — timestamped thread-resolution evidence
+
+One idempotent row per signed `pull_request_review_thread:resolved` webhook, partitioned on the
+`status-index` by repo + PR and retained for 30 days. GitHub's GraphQL review-thread object exposes
+only the current resolved state, not when it changed; the webhook's `thread.updated_at` is therefore
+the immutable evidence used to prove resolution happened before the PR merged. The GitHub App must
+subscribe to **Pull request review thread** events. If evidence is absent or newer than the merge,
+the resolved flag alone is fail-closed and does not teach the system.
+
+### 3.6 `review-memory:<hash>` — accepted reviewer-feedback memory
 
 One row per accepted review thread or top-level change request. The `status-index` partition is
 `review-memory:<repo>`, which lets a worker retrieve the newest bounded candidate set with one
@@ -237,8 +246,9 @@ The learning gate is intentionally conservative:
 
 1. The feedback author must be a GitHub `OWNER`, `MEMBER`, or `COLLABORATOR`; bots, Hermes, unknown
    authors, acknowledgements, and prompt-injection-shaped text are excluded.
-2. Inline feedback needs either an explicitly resolved thread or a Hermes addressed-marker with no
-   later human reply. A top-level `CHANGES_REQUESTED` body needs a later approval from that reviewer.
+2. Inline feedback needs either a thread-resolution webhook timestamped no later than the merge, or
+   a Hermes addressed-marker naming that exact comment with no later human reply. A top-level
+   `CHANGES_REQUESTED` body needs a later approval from that reviewer.
 3. The PR must merge. Closed/unmerged PRs never teach the system. The `hermes-no-learn` PR label
    opts the whole PR out.
 4. Capture is event-driven in the merge reconcile path and idempotent by repo + GitHub source ID.
@@ -479,8 +489,9 @@ sequenceDiagram
 least-privilege permissions (`contents:write`, `pull_requests:write`, `issues:write`,
 `checks:read`, `actions:write`, `metadata:read`) — defense-in-depth even if the App is broader.
 Tokens are never written to disk. Inbound PR/CI/review events hit `/github/webhook` (HMAC-verified,
-delivery-deduped). The worker clones via `https://x-access-token:<token>@github.com/…` with retries
-for token-propagation 404s.
+delivery-deduped); the App subscribes to **Pull request review thread** events so signed resolution
+timestamps can be preserved before merge. The worker clones via
+`https://x-access-token:<token>@github.com/…` with retries for token-propagation 404s.
 
 **Slack** — Events API + slash commands at `/slack/events` and `/slack/commands`, HMAC-verified
 against `SECRET_SLACK`; both ack within Slack's 3s window and process asynchronously. The control
