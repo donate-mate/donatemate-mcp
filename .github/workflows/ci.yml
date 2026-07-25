@@ -36,3 +36,6 @@ jobs:
 
       - name: Type check
         run: npm run type-check --workspaces --if-present
+
+      - name: Hermes worker regression tests
+        run: npx vitest run packages/hermes-worker/src/*.test.ts
