@@ -97,7 +97,7 @@ export interface PrWatch {
 
 interface ReviewLearningCaptureRequest {
   jobId: string;
-  status: 'reviewcapture:pending' | 'reviewcapture:done';
+  status: 'reviewcapture:pending' | 'reviewcapture:done' | 'reviewcapture:orphaned';
   watchJobId: string;
   repo: string;
   prNumber: number;
@@ -213,9 +213,9 @@ export async function seedLegacyReviewLearningCaptureRequests(maxEvaluated = 100
       TableName: TABLE,
       Key: { jobId: REVIEW_LEARNING_MIGRATION_KEY },
       UpdateExpression: cursor
-        ? 'SET #s = :running, cursor = :cursor, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt'
-        : 'SET #s = :done, completedAt = :completedAt, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt REMOVE cursor',
-      ExpressionAttributeNames: { '#s': 'status' },
+        ? 'SET #s = :running, #cursor = :cursor, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt'
+        : 'SET #s = :done, completedAt = :completedAt, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt REMOVE #cursor',
+      ExpressionAttributeNames: { '#s': 'status', '#cursor': 'cursor' },
       ExpressionAttributeValues: {
         ...(cursor
           ? { ':running': 'reviewcapture:migration-running', ':cursor': cursor }
@@ -261,6 +261,33 @@ export async function listReviewLearningBackfillWatches(maxResults = 25): Promis
         new GetCommand({ TableName: TABLE, Key: { jobId: request.watchJobId } })
       );
       return watch.Item as PrWatch | undefined;
+    })
+  );
+  await Promise.all(
+    requests.map(async (request, index) => {
+      if (watches[index]) return;
+      const now = new Date().toISOString();
+      try {
+        await ddb.send(
+          new UpdateCommand({
+            TableName: TABLE,
+            Key: { jobId: request.jobId },
+            UpdateExpression:
+              'SET #s = :orphaned, orphanedAt = :orphanedAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+            ConditionExpression: '#s = :pending',
+            ExpressionAttributeNames: { '#s': 'status' },
+            ExpressionAttributeValues: {
+              ':pending': 'reviewcapture:pending',
+              ':orphaned': 'reviewcapture:orphaned',
+              ':orphanedAt': now,
+              ':updatedAt': now,
+              ':expiresAt': ttl(),
+            },
+          })
+        );
+      } catch (err) {
+        if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') throw err;
+      }
     })
   );
   return watches.filter((watch): watch is PrWatch => Boolean(watch));

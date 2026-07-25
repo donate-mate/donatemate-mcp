@@ -1140,8 +1140,14 @@ export async function reconcileOpenPrs(log: FastifyBaseLogger, opts: { periodic?
   const [active, blocked, pendingLearningBackfill, migratedLearningBackfill] = await Promise.all([
     listActivePrWatches(),
     listBlockedPrWatches(),
-    listReviewLearningBackfillWatches(),
-    seedLegacyReviewLearningCaptureRequests(),
+    listReviewLearningBackfillWatches().catch((err) => {
+      log.warn({ err }, 'failed to list pending PR-review captures; continuing normal reconcile');
+      return [];
+    }),
+    seedLegacyReviewLearningCaptureRequests().catch((err) => {
+      log.warn({ err }, 'failed to seed legacy PR-review captures; continuing normal reconcile');
+      return [];
+    }),
   ]);
   const learningBackfill = [
     ...new Map(
