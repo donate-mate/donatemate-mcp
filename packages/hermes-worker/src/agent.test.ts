@@ -1,5 +1,8 @@
+import { access, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildCodexExecInvocation } from './agent.js';
+import { buildCodexExecInvocation, runProcessWithTimeout } from './agent.js';
 
 describe('buildCodexExecInvocation', () => {
   it('streams prompts larger than the OS argv limit through stdin', () => {
@@ -18,4 +21,42 @@ describe('buildCodexExecInvocation', () => {
     expect(invocation.args.join('').length).toBeLessThan(1024);
     expect(invocation.stdin).toBe(prompt);
   });
+
+  it.skipIf(process.platform !== 'linux')(
+    'settles promptly and terminates descendants that escape the process group',
+    async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'hermes-agent-timeout-'));
+      const marker = join(dir, 'escaped-child-survived');
+      try {
+        const escapedScript = [
+          "const { writeFileSync } = require('node:fs');",
+          `setTimeout(() => writeFileSync(${JSON.stringify(marker)}, 'alive'), 800);`,
+          'setTimeout(() => {}, 1500);',
+        ].join('\n');
+        const childScript = [
+          "const { spawn } = require('node:child_process');",
+          // This descendant creates a different process group while retaining the command's pipes.
+          `spawn(process.execPath, ['-e', ${JSON.stringify(escapedScript)}], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });`,
+          'setInterval(() => {}, 1000);',
+        ].join('\n');
+        const startedAt = Date.now();
+
+        const result = await runProcessWithTimeout({
+          command: process.execPath,
+          args: ['-e', childScript],
+          stdin: '',
+          cwd: process.cwd(),
+          env: process.env,
+          timeoutMs: 250,
+        });
+
+        expect(result.timedOut).toBe(true);
+        expect(Date.now() - startedAt).toBeLessThan(1000);
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        await expect(access(marker)).rejects.toThrow();
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  );
 });
