@@ -43,6 +43,7 @@ import {
   listActivePrWatches,
   listBlockedPrWatches,
   listReviewLearningBackfillWatches,
+  seedLegacyReviewLearningCaptureRequests,
   markWatchBlocked,
   acquireReconcileLease,
   ensureReviewLearningCapturePending,
@@ -1136,11 +1137,20 @@ export async function reconcileOpenPrs(log: FastifyBaseLogger, opts: { periodic?
     return;
   }
 
-  const [active, blocked, learningBackfill] = await Promise.all([
+  const [active, blocked, pendingLearningBackfill, migratedLearningBackfill] = await Promise.all([
     listActivePrWatches(),
     listBlockedPrWatches(),
     listReviewLearningBackfillWatches(),
+    seedLegacyReviewLearningCaptureRequests(),
   ]);
+  const learningBackfill = [
+    ...new Map(
+      [...pendingLearningBackfill, ...migratedLearningBackfill].map((watch) => [
+        watch.jobId,
+        watch,
+      ])
+    ).values(),
+  ];
   const watches = [...active, ...blocked.filter(isRecoverableDeploymentBlock)];
   const budgetProbe = watches[0] ?? learningBackfill[0];
   if (!budgetProbe) return;

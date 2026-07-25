@@ -107,10 +107,20 @@ interface ReviewLearningCaptureRequest {
   expiresAt: number;
 }
 
+interface ReviewLearningMigrationState {
+  jobId: 'reviewcapture:migration-v1';
+  status: 'reviewcapture:migration-running' | 'reviewcapture:migration-done';
+  cursor?: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
 const ttl = () => Math.floor(Date.now() / 1000) + 30 * 24 * 3600;
 export const prWatchKey = (repo: string, prNumber: number): string => `prwatch:${repo}#${prNumber}`;
 export const reviewLearningCaptureKey = (repo: string, prNumber: number): string =>
   `reviewcapture:${repo}#${prNumber}`;
+const REVIEW_LEARNING_MIGRATION_KEY = 'reviewcapture:migration-v1';
 
 export async function getPrWatch(repo: string, prNumber: number): Promise<PrWatch | undefined> {
   const res = await ddb.send(new GetCommand({ TableName: TABLE, Key: { jobId: prWatchKey(repo, prNumber) } }));
@@ -148,6 +158,74 @@ export async function listBlockedPrWatches(): Promise<PrWatch[]> {
     })
   );
   return (res.Items ?? []) as PrWatch[];
+}
+
+/**
+ * One-time migration for watches completed before durable capture requests existed.
+ *
+ * Each sweep evaluates one bounded status-index page and persists its LastEvaluatedKey. Eligibility
+ * uses updatedAt (the legacy terminal transition timestamp), not the PR/watch creation timestamp.
+ * The cursor only advances after every eligible row on the page has a deterministic pending
+ * request, so a transient write failure retries the same page instead of silently skipping it.
+ */
+export async function seedLegacyReviewLearningCaptureRequests(maxEvaluated = 100): Promise<PrWatch[]> {
+  const stateResult = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { jobId: REVIEW_LEARNING_MIGRATION_KEY } })
+  );
+  const state = stateResult.Item as ReviewLearningMigrationState | undefined;
+  if (state?.completedAt) return [];
+
+  const configuredDays = Number(process.env.REVIEW_LEARNING_LEGACY_MIGRATION_DAYS ?? 30);
+  const days = Number.isFinite(configuredDays) ? Math.max(1, Math.floor(configuredDays)) : 30;
+  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  const limit = Number.isFinite(maxEvaluated) ? Math.max(1, Math.floor(maxEvaluated)) : 100;
+  const page = await ddb.send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'status-index',
+      KeyConditionExpression: '#s = :s',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: { ':s': 'prwatch:done' },
+      ScanIndexForward: false,
+      Limit: limit,
+      ExclusiveStartKey: state?.cursor,
+    })
+  );
+  const eligible = ((page.Items ?? []) as PrWatch[]).filter(
+    (watch) =>
+      !watch.reviewLearningCapturedAt &&
+      Number.isFinite(Date.parse(watch.updatedAt)) &&
+      Date.parse(watch.updatedAt) >= cutoffMs
+  );
+  await Promise.all(
+    eligible.map((watch) =>
+      ensureReviewLearningCapturePending(
+        watch,
+        watch.reviewLearningMergeCommitSha || watch.headSha
+      )
+    )
+  );
+
+  const now = new Date().toISOString();
+  const cursor = page.LastEvaluatedKey as Record<string, string> | undefined;
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { jobId: REVIEW_LEARNING_MIGRATION_KEY },
+      UpdateExpression: cursor
+        ? 'SET #s = :running, cursor = :cursor, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt'
+        : 'SET #s = :done, completedAt = :completedAt, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt REMOVE cursor',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: {
+        ...(cursor
+          ? { ':running': 'reviewcapture:migration-running', ':cursor': cursor }
+          : { ':done': 'reviewcapture:migration-done', ':completedAt': now }),
+        ':createdAt': now,
+        ':updatedAt': now,
+      },
+    })
+  );
+  return eligible;
 }
 
 /**
