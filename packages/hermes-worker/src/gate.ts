@@ -11,10 +11,11 @@
  * the repository's real thresholds (e.g. 90% coverage) rather than anything Hermes invents. It
  * depends on WS1 having installed dependencies + generated the Prisma client.
  */
-import { spawn, execFile } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { promisify } from 'node:util';
+import { InfrastructureCommandTimeoutError, runProcessWithTimeout } from './agent.js';
 import { detectPackageManager, workspaceScriptCommand, type PackageManager } from './workspace.js';
 
 const execFileP = promisify(execFile);
@@ -71,57 +72,42 @@ export function runGateCommand(
   cwd: string,
   timeoutMs = CMD_TIMEOUT_MS
 ): Promise<GateCommandResult> {
-  return new Promise((resolve) => {
-    // NODE_ENV=test (not the image's 'production', which would skip dev tooling/behavior); HUSKY=0 so
-    // no repo hook fires while the gate runs the repo's own prettier/eslint/test scripts.
-    const env = { ...process.env, CI: 'true', HUSKY: '0', NODE_ENV: process.env.NODE_ENV === 'production' ? 'test' : process.env.NODE_ENV ?? 'test' };
-    const useProcessGroup = process.platform !== 'win32';
-    const child = spawn(cmd, args, {
-      cwd,
-      env,
-      detached: useProcessGroup,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let out = '';
-    let timedOut = false;
-    let settled = false;
-    const finish = (result: GateCommandResult) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    const terminate = () => {
-      if (useProcessGroup && child.pid) {
-        try {
-          process.kill(-child.pid, 'SIGKILL');
-          return;
-        } catch {
-          // Fall back to the direct child if the process group already exited or cannot be signaled.
-        }
+  // NODE_ENV=test (not the image's 'production', which would skip dev tooling/behavior); HUSKY=0 so
+  // no repo hook fires while the gate runs the repo's own prettier/eslint/test scripts.
+  const env = {
+    ...process.env,
+    CI: 'true',
+    HUSKY: '0',
+    NODE_ENV: process.env.NODE_ENV === 'production' ? 'test' : (process.env.NODE_ENV ?? 'test'),
+  };
+  return runProcessWithTimeout({
+    command: cmd,
+    args,
+    stdin: '',
+    cwd,
+    env,
+    timeoutMs,
+  })
+    .then((result) => {
+      if (result.timedOut) {
+        // The wrapper may have exited after daemonizing a child, making that child unobservable
+        // through /proc. Force a fresh ECS task before SQS retry instead of continuing this worker.
+        throw new InfrastructureCommandTimeoutError(`gate: ${cmd}`, timeoutMs);
       }
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // The process may have exited between the timeout firing and the signal attempt.
-      }
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      terminate();
-    }, timeoutMs);
-    const onData = (d: Buffer) => {
-      if (out.length < OUT_CAP * 8) out += d.toString();
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
-    child.on('error', (e) => {
-      finish({ code: 127, out: `${out}\n${e instanceof Error ? e.message : String(e)}`, timedOut });
+      return {
+        code: result.code,
+        out: `${result.stdout}\n${result.stderr}`.trim().slice(-OUT_CAP),
+        timedOut: false,
+      };
+    })
+    .catch((error) => {
+      if (error instanceof InfrastructureCommandTimeoutError) throw error;
+      return {
+        code: 127,
+        out: error instanceof Error ? error.message : String(error),
+        timedOut: false,
+      };
     });
-    child.on('close', (code) => {
-      finish({ code: timedOut ? 124 : (code ?? 1), out: out.slice(-OUT_CAP), timedOut });
-    });
-  });
 }
 
 async function fileExists(path: string): Promise<boolean> {

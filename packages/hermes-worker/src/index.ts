@@ -29,7 +29,7 @@ import {
   prepareMergeConflictResolution,
   type MergeConflictPreparation,
 } from './github.js';
-import { AgentTimeoutError, runAgent } from './agent.js';
+import { ContainerRestartRequiredError, runAgent } from './agent.js';
 import { installWorkspace } from './workspace.js';
 import { runGate, gateSummary, type GateResult } from './gate.js';
 import { loadContract, contractPromptBlock, validatePrBody, buildReportRepairPrompt, loadReport } from './contract.js';
@@ -818,14 +818,29 @@ async function processJob(jobId: string): Promise<void> {
       );
     }
     // Preserve the original classification even if every best-effort reporting operation fails.
-    // AgentTimeoutError must reach loop() so the container exits before SQS redelivery.
+    // ContainerRestartRequiredError must reach loop() so the container exits before SQS redelivery.
     throw err; // do not delete the SQS message → redelivery, then DLQ
   } finally {
     stopHeartbeat();
     try {
-      await rm(dir, { recursive: true, force: true });
-    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (cleanupError) {
+      // A workspace is unique to this task and disappears with the Fargate container. Cleanup must
+      // never turn an already-terminal job into an SQS redelivery (or mask its original failure).
+      console.warn(
+        `[${jobId}] workspace cleanup failed; leaving it for container teardown:`,
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      );
+    }
+    try {
       await stopProtection(); // idle again — allow scale-in even if temp cleanup fails
+    } catch (protectionError) {
+      // The initial lease is bounded. Reporting a release failure is safer than duplicating a job
+      // whose durable terminal state and external writes have already completed.
+      console.warn(
+        `[${jobId}] failed to release task protection:`,
+        protectionError instanceof Error ? protectionError.message : String(protectionError)
+      );
     }
   }
 }
@@ -856,7 +871,7 @@ async function loop(): Promise<void> {
         // A timed-out command may have deliberately escaped the Codex process group. processJob
         // has already recorded the failure, cleaned the workspace, and released task protection;
         // exit this container so ECS removes any last escaped process before SQS redelivery.
-        if (err instanceof AgentTimeoutError) throw err;
+        if (err instanceof ContainerRestartRequiredError) throw err;
       } finally {
         stopVisibilityHeartbeat();
       }

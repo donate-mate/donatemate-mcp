@@ -70,10 +70,24 @@ export interface RunProcessInput {
   timeoutMs: number;
 }
 
-export class AgentTimeoutError extends Error {
+/**
+ * A command timeout can leave a deliberately daemonized descendant outside the observable
+ * process tree. Callers must let this error reach the worker loop so ECS replaces the container
+ * before the SQS message is retried.
+ */
+export class ContainerRestartRequiredError extends Error {}
+
+export class AgentTimeoutError extends ContainerRestartRequiredError {
   constructor(timeoutSeconds: number) {
     super(`Agent timed out after ${timeoutSeconds}s`);
     this.name = 'AgentTimeoutError';
+  }
+}
+
+export class InfrastructureCommandTimeoutError extends ContainerRestartRequiredError {
+  constructor(command: string, timeoutMs: number) {
+    super(`Infrastructure command timed out after ${Math.ceil(timeoutMs / 1000)}s: ${command}`);
+    this.name = 'InfrastructureCommandTimeoutError';
   }
 }
 
