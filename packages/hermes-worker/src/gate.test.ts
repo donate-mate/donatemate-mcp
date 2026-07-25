@@ -76,4 +76,16 @@ describe('runGateCommand timeout', () => {
     expect(result.code).not.toBe(0);
     expect(Date.now() - startedAt).toBeLessThan(1500);
   });
+
+  it('overrides a successful parent exit when inherited pipes remain open past the deadline', async () => {
+    const grandchild = 'setTimeout(() => process.exit(0), 3000);';
+    const parent = [
+      "const { spawn } = require('node:child_process');",
+      `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: ['ignore', 'inherit', 'inherit'] });`,
+    ].join('');
+
+    const result = await runGateCommand(process.execPath, ['-e', parent], process.cwd(), 100);
+
+    expect(result).toMatchObject({ timedOut: true, code: 124 });
+  });
 });

@@ -119,7 +119,7 @@ export function runGateCommand(
       finish({ code: 127, out: `${out}\n${e instanceof Error ? e.message : String(e)}`, timedOut });
     });
     child.on('close', (code) => {
-      finish({ code: code ?? (timedOut ? 124 : 1), out: out.slice(-OUT_CAP), timedOut });
+      finish({ code: timedOut ? 124 : (code ?? 1), out: out.slice(-OUT_CAP), timedOut });
     });
   });
 }
