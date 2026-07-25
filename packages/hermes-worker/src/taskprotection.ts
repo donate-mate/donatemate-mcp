@@ -91,7 +91,7 @@ export async function setScaleInProtection(
 export async function startScaleInProtectionRenewal(): Promise<() => Promise<void>> {
   await setScaleInProtection(true, PROTECTION_MINUTES);
   let stopped = false;
-  let renewal: Promise<void> | undefined;
+  let renewal: Promise<boolean> | undefined;
   const timer = setInterval(() => {
     if (stopped || renewal) return;
     renewal = setScaleInProtection(true, PROTECTION_MINUTES).finally(() => {
