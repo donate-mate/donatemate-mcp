@@ -700,9 +700,10 @@ export function lessonFromReviewThreadNode(
       ));
   if (!resolvedBeforeAcceptance && !hermesRepliedAfterFeedback) return null;
 
-  const acceptedThroughIndex = hermesRepliedAfterFeedback ? lastMarkerIndex : comments.length - 1;
-  const feedbackComments = comments
-    .slice(0, acceptedThroughIndex + 1)
+  const evidenceComments = resolvedBeforeAcceptance
+    ? comments
+    : [comments[lastNonBotHumanIndex]];
+  const feedbackComments = evidenceComments
     .filter(isTrustedHumanComment)
     .map((comment) => ({ comment, text: cleanReviewFeedback(comment.body, 700) }))
     .filter(({ text }) => isLearnableFeedback(text))

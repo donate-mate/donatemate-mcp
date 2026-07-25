@@ -251,6 +251,39 @@ describe('accepted review learning', () => {
     ).toBeNull();
   });
 
+  it('limits marker-based memory to the exact trusted comment named by the latest marker', () => {
+    const laterFeedback = {
+      ...trustedRoot,
+      id: 'PRRC_later',
+      body: 'Preserve the nullable provider state in the generated type.',
+      createdAt: '2026-07-10T10:00:00Z',
+    };
+    const laterMarker = {
+      ...hermesReply,
+      id: 'PRRC_later_marker',
+      body: [
+        'Addressed in commit `def5678`.',
+        `${HERMES_REVIEW_REPLY_MARKER_PREFIX}PRRC_later -->`,
+      ].join('\n'),
+      createdAt: '2026-07-10T10:05:00Z',
+    };
+
+    expect(
+      lessonFromReviewThreadNode(
+        thread([trustedRoot, hermesReply, laterFeedback, laterMarker])
+      )
+    ).toMatchObject({
+      feedbackCommentId: 'PRRC_later',
+      feedback: expect.stringContaining('nullable provider state'),
+      fixCommitSha: 'def5678',
+    });
+    expect(
+      lessonFromReviewThreadNode(
+        thread([trustedRoot, hermesReply, laterFeedback, laterMarker])
+      )?.feedback
+    ).not.toContain('validate the provider schema');
+  });
+
   it('rejects untrusted authors and prompt-injection-shaped feedback', () => {
     expect(
       lessonFromReviewThreadNode(
