@@ -5,6 +5,7 @@
  * The model is pinned via AGENT_MODEL (default gpt-5.5). Hard timeout is the budget guardrail.
  */
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { rm, mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -53,11 +54,27 @@ export interface AgentResult {
   timedOut?: boolean;
 }
 
-interface RunResult {
+export interface RunResult {
   stdout: string;
   stderr: string;
   code: number;
   timedOut: boolean;
+}
+
+export interface RunProcessInput {
+  command: string;
+  args: string[];
+  stdin: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+}
+
+export class AgentTimeoutError extends Error {
+  constructor(timeoutSeconds: number) {
+    super(`Agent timed out after ${timeoutSeconds}s`);
+    this.name = 'AgentTimeoutError';
+  }
 }
 
 // Authenticate the Codex CLI with the API key. `codex exec` reads auth from ~/.codex/auth.json,
@@ -82,16 +99,100 @@ function codexLogin(apiKey: string, env: NodeJS.ProcessEnv): Promise<void> {
 // Keep prompts off argv. Linux limits each argument to roughly 128 KiB, which large pre-open
 // review diffs can exceed. `codex exec -` reads the prompt from stdin; explicitly ending the pipe
 // supplies EOF so Codex does not wait for more input.
-function runCodex(args: string[], prompt: string, cwd: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
+/**
+ * Return every live descendant while the root still owns the parent/child relationships. A
+ * descendant remains visible here even if it called `setsid` or created another process group.
+ */
+function linuxDescendantPids(rootPid: number): number[] {
+  if (process.platform !== 'linux') return [];
+  const pending = [rootPid];
+  const seen = new Set<number>([rootPid]);
+  const descendants: number[] = [];
+  while (pending.length) {
+    const pid = pending.pop()!;
+    let raw = '';
+    try {
+      raw = readFileSync(`/proc/${pid}/task/${pid}/children`, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const value of raw.trim().split(/\s+/)) {
+      const childPid = Number(value);
+      if (!Number.isSafeInteger(childPid) || childPid <= 0 || seen.has(childPid)) continue;
+      seen.add(childPid);
+      descendants.push(childPid);
+      pending.push(childPid);
+    }
+  }
+  return descendants;
+}
+
+function signalProcess(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // The process may have exited between discovery and signalling.
+  }
+}
+
+/**
+ * Stop both the normal process group and descendants that escaped it with `setsid`/`detached`.
+ * Descendants are snapshotted before the group leader is killed so they cannot be orphaned first.
+ */
+function terminateProcessTree(child: ReturnType<typeof spawn>, useProcessGroup: boolean): void {
+  if (!child.pid) {
+    child.kill('SIGKILL');
+    return;
+  }
+  const descendants = linuxDescendantPids(child.pid);
+  for (const pid of descendants.reverse()) signalProcess(pid, 'SIGKILL');
+  if (useProcessGroup) signalProcess(-child.pid, 'SIGKILL');
+  signalProcess(child.pid, 'SIGKILL');
+}
+
+/**
+ * Run a command in its own POSIX process group so the timeout can terminate the complete tree.
+ *
+ * `codex exec` can launch tests, shells, and other descendants. Killing only the Codex PID leaves
+ * those descendants alive with the stdout/stderr pipes open, so Node never emits `close` and the
+ * Hermes job remains `running` indefinitely after its timeout.
+ */
+export function runProcessWithTimeout(input: RunProcessInput): Promise<RunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('codex', args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const useProcessGroup = process.platform !== 'win32';
+    const child = spawn(input.command, input.args, {
+      cwd: input.cwd,
+      env: input.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: useProcessGroup,
+    });
     let stdout = '';
     let stderr = '';
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, JOB_TIMEOUT_MS);
+    let settled = false;
+    let timer: NodeJS.Timeout;
+    const finish = (result: RunResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    };
+    timer = setTimeout(() => {
+      terminateProcessTree(child, useProcessGroup);
+      // Do not rely on every inherited writer closing before settling. Destroying our pipe ends
+      // guarantees this invocation releases its listeners even if an unobservable descendant races
+      // process discovery. The worker exits after recording AgentTimeoutError, so ECS then destroys
+      // the entire container before SQS redelivery.
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      finish({ stdout, stderr, code: 124, timedOut: true });
+    }, input.timeoutMs);
     child.stdout.on('data', (d) => {
       if (stdout.length < OUTPUT_CAP) stdout += d.toString();
     });
@@ -99,23 +200,31 @@ function runCodex(args: string[], prompt: string, cwd: string, env: NodeJS.Proce
       if (stderr.length < OUTPUT_CAP) stderr += d.toString();
     });
     child.on('error', (e) => {
-      clearTimeout(timer);
-      reject(e);
+      fail(e);
     });
     // A fast CLI failure can close stdin before the buffered prompt is flushed. The process exit
     // and stderr are the useful result in that case, so prevent EPIPE from becoming an unhandled
     // stream error.
     child.stdin.on('error', (e: NodeJS.ErrnoException) => {
       if (e.code !== 'EPIPE') {
-        clearTimeout(timer);
-        reject(e);
+        fail(e);
       }
     });
-    child.stdin.end(prompt);
+    child.stdin.end(input.stdin);
     child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ stdout, stderr, code: code ?? 0, timedOut });
+      finish({ stdout, stderr, code: code ?? 0, timedOut: false });
     });
+  });
+}
+
+function runCodex(args: string[], prompt: string, cwd: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
+  return runProcessWithTimeout({
+    command: 'codex',
+    args,
+    stdin: prompt,
+    cwd,
+    env,
+    timeoutMs: JOB_TIMEOUT_MS,
   });
 }
 
@@ -199,7 +308,7 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
     const env = { ...process.env, OPENAI_API_KEY: apiKey };
     await codexLogin(apiKey, env); // write ~/.codex/auth.json so `codex exec` can authenticate
     const { stdout, stderr, code, timedOut } = await runCodex(invocation.args, invocation.stdin, dir, env);
-    if (timedOut) throw new Error(`Agent timed out after ${JOB_TIMEOUT_MS / 1000}s`);
+    if (timedOut) throw new AgentTimeoutError(JOB_TIMEOUT_MS / 1000);
     // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides based
     // on whether the working tree changed.
     const finalMessage = (await readFinalMessage()) ?? (stderr.trim() || undefined);

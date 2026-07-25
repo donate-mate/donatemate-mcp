@@ -284,10 +284,13 @@ CLI** in non-interactive `codex exec` mode. Key facts as-coded:
 - **Working dir**: `-C <clonedir>`. The agent's final message is captured to a `-o last.txt` file
   **outside** the clone (so it can't pollute the diff) and surfaced as `reason` (explains e.g. a
   no-change run).
-- **stdin** is set to `ignore` — an open/piped stdin makes `codex exec` block waiting for EOF and
-  hang the job.
-- **Timeout**: hard `JOB_TIMEOUT_SECONDS` (default 2400s) budget guardrail; on expiry the child is
-  `SIGKILL`ed and the job fails as timed out. Output is capped at 16 MiB.
+- **stdin** streams the complete prompt and is explicitly closed to supply EOF, avoiding both the
+  Linux argv-size limit and an open-pipe hang.
+- **Timeout**: hard `JOB_TIMEOUT_SECONDS` (default 2400s) budget guardrail. Codex runs in its own
+  POSIX process group; on expiry the Linux worker discovers descendants through `/proc` and
+  `SIGKILL`s them (including processes that created a new group), closes the captured pipes, and
+  settles without waiting for `close`. After recording the failure and releasing protection, the
+  worker exits so ECS guarantees a clean container before SQS redelivery. Output is capped at 16 MiB.
 - **Scale-in protection**: a worker takes an initial 165-minute ECS protection lease and renews it
   every 10 minutes while a job is active. The lease covers the longest enabled workflow wait
   budget (120 minutes) plus 45 minutes for setup, polling alignment, reporting, and cleanup, while

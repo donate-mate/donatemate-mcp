@@ -29,7 +29,7 @@ import {
   prepareMergeConflictResolution,
   type MergeConflictPreparation,
 } from './github.js';
-import { runAgent } from './agent.js';
+import { AgentTimeoutError, runAgent } from './agent.js';
 import { installWorkspace } from './workspace.js';
 import { runGate, gateSummary, type GateResult } from './gate.js';
 import { loadContract, contractPromptBlock, validatePrBody, buildReportRepairPrompt, loadReport } from './contract.js';
@@ -156,6 +156,22 @@ function compactText(value: string, max = FAILURE_COMMENT_MAX): string {
     .trim();
   if (normalized.length <= max) return normalized;
   return `${normalized.slice(0, max)}\n...truncated`;
+}
+
+async function bestEffortFailureReport<T>(
+  jobId: string,
+  label: string,
+  operation: () => Promise<T>
+): Promise<T | undefined> {
+  try {
+    return await operation();
+  } catch (reportError) {
+    console.error(
+      `[${jobId}] failure reporting step "${label}" failed:`,
+      reportError instanceof Error ? reportError.message : String(reportError)
+    );
+    return undefined;
+  }
 }
 
 function looksLikePrecommitFailure(value: string): boolean {
@@ -770,26 +786,39 @@ async function processJob(jobId: string): Promise<void> {
   } catch (err) {
     const msg = errorText(err);
     const compactMsg = compactText(msg, 8000);
-    const failureLogUri = msg.length > compactMsg.length ? await storeTranscript(jobId, msg) : undefined;
+    const failureLogUri =
+      msg.length > compactMsg.length
+        ? await bestEffortFailureReport(jobId, 'store transcript', () => storeTranscript(jobId, msg))
+        : undefined;
     console.error(`[${jobId}] failed:`, msg);
-    await updateJob(jobId, 'failed', {
-      error: compactMsg,
-      ...(failureLogUri ? { failureLogUri } : {}),
-    });
-    await notify(job, `:x: Hermes job \`${jobId}\` failed: ${compactText(msg, 1200)}`);
+    await bestEffortFailureReport(jobId, 'update job', () =>
+      updateJob(jobId, 'failed', {
+        error: compactMsg,
+        ...(failureLogUri ? { failureLogUri } : {}),
+      })
+    );
+    await bestEffortFailureReport(jobId, 'notify', () =>
+      notify(job, `:x: Hermes job \`${jobId}\` failed: ${compactText(msg, 1200)}`)
+    );
     if (ticket) {
-      await commentOnIssue(
-        ticket,
-        formatFailureComment({
-          jobId,
-          message: msg,
-          transcriptUri: failureLogUri,
-          action: 'Moving back to **To Do**.',
-        })
+      await bestEffortFailureReport(jobId, 'comment on Jira issue', () =>
+        commentOnIssue(
+          ticket,
+          formatFailureComment({
+            jobId,
+            message: msg,
+            transcriptUri: failureLogUri,
+            action: 'Moving back to **To Do**.',
+          })
+        )
       );
-      await transitionIssue(ticket, COLUMN.toDo);
-      await markFlowDone(ticket, { flowError: msg.slice(0, 200) });
+      await bestEffortFailureReport(jobId, 'transition Jira issue', () => transitionIssue(ticket, COLUMN.toDo));
+      await bestEffortFailureReport(jobId, 'mark flow done', () =>
+        markFlowDone(ticket, { flowError: msg.slice(0, 200) })
+      );
     }
+    // Preserve the original classification even if every best-effort reporting operation fails.
+    // AgentTimeoutError must reach loop() so the container exits before SQS redelivery.
     throw err; // do not delete the SQS message → redelivery, then DLQ
   } finally {
     stopHeartbeat();
@@ -824,6 +853,10 @@ async function loop(): Promise<void> {
       } catch (err) {
         // Leave the message un-deleted → SQS redelivers up to maxReceiveCount, then DLQ.
         console.error('job processing error (will retry / DLQ):', err);
+        // A timed-out command may have deliberately escaped the Codex process group. processJob
+        // has already recorded the failure, cleaned the workspace, and released task protection;
+        // exit this container so ECS removes any last escaped process before SQS redelivery.
+        if (err instanceof AgentTimeoutError) throw err;
       } finally {
         stopVisibilityHeartbeat();
       }
