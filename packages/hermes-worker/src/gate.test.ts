@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
-import { runGate } from './gate.js';
+import { runGate, runGateCommand } from './gate.js';
 
 const exec = promisify(execFile);
 const cleanup: string[] = [];
@@ -57,5 +57,23 @@ describe('runGate merge-conflict scope', () => {
     const gate = await runGate(dir, mainSha, false);
 
     expect(gate.changedPackages).toEqual(['@test/pr-change']);
+  });
+});
+
+describe('runGateCommand timeout', () => {
+  it('terminates command descendants and reports a non-zero timeout result', async () => {
+    const grandchild = 'setTimeout(() => process.exit(0), 3000);';
+    const parent = [
+      "const { spawn } = require('node:child_process');",
+      `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: ['ignore', 'inherit', 'inherit'] });`,
+      'setInterval(() => {}, 1000);',
+    ].join('');
+    const startedAt = Date.now();
+
+    const result = await runGateCommand(process.execPath, ['-e', parent], process.cwd(), 100);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.code).not.toBe(0);
+    expect(Date.now() - startedAt).toBeLessThan(1500);
   });
 });
