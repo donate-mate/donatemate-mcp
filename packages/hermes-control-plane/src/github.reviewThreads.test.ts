@@ -2,6 +2,7 @@ process.env.AWS_REGION ??= 'us-east-2';
 
 import { describe, expect, it } from 'vitest';
 import {
+  filterReviewLessonsForAcceptedCommits,
   HERMES_REVIEW_REPLY_MARKER_PREFIX,
   lessonFromReviewThreadNode,
   lessonsFromReviewNodes,
@@ -281,6 +282,25 @@ describe('accepted review learning', () => {
         '2026-07-09T20:00:00Z'
       )
     ).toEqual([]);
+  });
+
+  it('keeps marker evidence only when its fix commit reached the accepted PR history', async () => {
+    const accepted = lessonFromReviewThreadNode(thread([trustedRoot, hermesReply]));
+    const removed = accepted
+      ? { ...accepted, sourceId: 'thread:removed', fixCommitSha: 'deadbee' }
+      : null;
+    const resolved = accepted
+      ? { ...accepted, sourceId: 'thread:resolved', evidence: 'thread_resolved' as const }
+      : null;
+    expect(accepted).not.toBeNull();
+
+    const verifier = async (sha: string) => sha === 'abc1234';
+    expect(
+      await filterReviewLessonsForAcceptedCommits(
+        [accepted!, removed!, resolved!],
+        verifier
+      )
+    ).toEqual([accepted, resolved]);
   });
 });
 

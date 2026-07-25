@@ -795,6 +795,33 @@ export function lessonsFromReviewNodes(
   });
 }
 
+/**
+ * Marker-based evidence is valid only while its claimed fix commit remains in the accepted PR
+ * history. Human resolution/approval evidence does not depend on a Hermes-authored commit.
+ */
+export async function filterReviewLessonsForAcceptedCommits(
+  lessons: ReviewLessonCandidate[],
+  isAcceptedCommit: (sha: string) => Promise<boolean>
+): Promise<ReviewLessonCandidate[]> {
+  const decisions = new Map<string, Promise<boolean>>();
+  const checked = await Promise.all(
+    lessons.map(async (lesson) => {
+      if (lesson.evidence !== 'hermes_replied') return lesson;
+      const sha = String(lesson.fixCommitSha ?? '').toLowerCase();
+      if (!sha) return null;
+      let decision = decisions.get(sha);
+      if (!decision) {
+        decision = isAcceptedCommit(sha).catch(() => false);
+        decisions.set(sha, decision);
+      }
+      return (await decision) ? lesson : null;
+    })
+  );
+  return checked.filter(
+    (lesson: ReviewLessonCandidate | null): lesson is ReviewLessonCandidate => Boolean(lesson)
+  );
+}
+
 interface ReviewSnapshot {
   signals: PrSignal[];
   lessons: ReviewLessonCandidate[];
@@ -966,6 +993,30 @@ export async function collectPrSnapshot(watch: PrWatch, extraSignals: PrSignal[]
   ]);
   const mergeSignal = mergeConflictSignal(pr);
   const state: PrSnapshot['state'] = pr.merged ? 'MERGED' : pr.state === 'closed' ? 'CLOSED' : 'OPEN';
+  const acceptedReviewLessons =
+    state === 'MERGED'
+      ? await filterReviewLessonsForAcceptedCommits(reviews.lessons, async (fixCommitSha) => {
+          // `headSha` is the exact accepted source history even when GitHub squash/rebase merging
+          // means the original PR commits are not ancestors of `merge_commit_sha`.
+          const acceptedDescendants = [
+            headSha,
+            pr.merge_commit_sha ? String(pr.merge_commit_sha) : '',
+          ].filter((sha, index, values) => Boolean(sha) && values.indexOf(sha) === index);
+          for (const descendantSha of acceptedDescendants) {
+            if (
+              await commitContainsAncestor(
+                octokit,
+                watch.repo,
+                fixCommitSha,
+                descendantSha
+              ).catch(() => false)
+            ) {
+              return true;
+            }
+          }
+          return false;
+        })
+      : reviews.lessons;
   const labels = (pr.labels ?? [])
     .map((label) => (typeof label === 'string' ? label : label.name))
     .filter((label): label is string => Boolean(label));
@@ -983,7 +1034,7 @@ export async function collectPrSnapshot(watch: PrWatch, extraSignals: PrSignal[]
     baseSha: pr.base.sha,
     mergeCommitSha: pr.merge_commit_sha ?? null,
     signals: [...checks.signals, ...reviews.signals, ...(mergeSignal ? [mergeSignal] : []), ...extraSignals],
-    reviewLessons: reviews.lessons,
+    reviewLessons: acceptedReviewLessons,
     labels,
   };
 }

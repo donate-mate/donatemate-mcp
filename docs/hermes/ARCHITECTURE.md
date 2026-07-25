@@ -250,7 +250,8 @@ The learning gate is intentionally conservative:
    authors, acknowledgements, and prompt-injection-shaped text are excluded.
 2. Inline feedback needs either a thread-resolution webhook timestamped no later than the merge, or
    a Hermes addressed-marker naming that exact comment with no later human reply. A top-level
-   `CHANGES_REQUESTED` body needs a later approval from that reviewer.
+   `CHANGES_REQUESTED` body needs a later approval from that reviewer. Marker-based evidence is
+   retained only when its claimed fix commit is still in the merged PR's accepted source history.
 3. The PR must merge. Closed/unmerged PRs never teach the system. The `hermes-no-learn` PR label
    opts the whole PR out.
 4. Capture is event-driven in the merge reconcile path and idempotent by repo + GitHub source ID.
