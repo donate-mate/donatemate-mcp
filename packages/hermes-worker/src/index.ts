@@ -483,8 +483,9 @@ async function processJob(jobId: string): Promise<void> {
   try {
     const branch = isPrFollowup ? job.headBranch : `hermes/${jobId.slice(0, 8)}`;
     if (!branch) throw new Error('follow-up job missing headBranch');
-    const { token, octokit } = await getInstallationAuth(job.repo);
-    await cloneRepo(token, job.repo, isPrFollowup ? branch : job.baseBranch, dir);
+    const initialAuth = await getInstallationAuth(job.repo);
+    let octokit = initialAuth.octokit;
+    await cloneRepo(initialAuth.token, job.repo, isPrFollowup ? branch : job.baseBranch, dir);
     if (!isPrFollowup) await createBranch(dir, branch);
     const baseSha = await getHeadSha(dir); // baseline to detect agent commits, not just dirty tree
     let gateBaseSha = baseSha;
@@ -608,6 +609,9 @@ async function processJob(jobId: string): Promise<void> {
       transcriptUri = await commitAndPushWithPrecommitRepair({ jobId, dir, branch, message: title, taskPrompt: prompt, transcript });
       const headSha = await getHeadSha(dir);
       if (!job.prNumber || !job.prUrl) throw new Error('follow-up job missing prNumber/prUrl');
+      // Installation tokens expire after roughly one hour. Validation and review-repair rounds can
+      // legitimately exceed that, so never reuse the client minted before clone for final API writes.
+      octokit = (await getInstallationAuth(job.repo)).octokit;
       // Apply any labels the agent explicitly requested via a `HERMES-APPLY-LABEL: <label>` line in
       // its final message (e.g. `skip-openapi-sync` when it determines the change is a pure refactor
       // with no API-contract change). Best-effort.
@@ -714,6 +718,9 @@ async function processJob(jobId: string): Promise<void> {
       reviewText,
     });
 
+    // Long-running validation can outlive the installation token created before clone. Git pushes
+    // refresh their own remote token; refresh Octokit independently before PR creation.
+    octokit = (await getInstallationAuth(job.repo)).octokit;
     const pr = await openPullRequest(octokit, job.repo, branch, job.baseBranch, title, body);
     if (job.type === 'fe') {
       await ensurePullRequestLabels(octokit, job.repo, pr.number, [FRONTEND_DEPLOY_LABEL]);

@@ -2,9 +2,10 @@
 # Build context = this package dir.
 FROM node:22-slim
 
-# git for clone/commit/push; awscli for backend alarm/log investigations; ca-certificates for HTTPS.
+# git for clone/commit/push; awscli for backend alarm/log investigations; jq for the
+# repository's shell-based infrastructure tests; ca-certificates for HTTPS.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git awscli ca-certificates \
+  && apt-get install -y --no-install-recommends git awscli jq ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 # WS1 — the target repo (donatemate) installs with yarn/pnpm. Enable corepack so those package
