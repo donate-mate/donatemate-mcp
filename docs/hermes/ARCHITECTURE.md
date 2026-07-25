@@ -260,7 +260,9 @@ The learning gate is intentionally conservative:
 3. The PR must merge. Closed/unmerged PRs never teach the system. The `hermes-no-learn` PR label
    opts the whole PR out.
 4. Capture is event-driven in the merge reconcile path and idempotent by repo + GitHub source ID.
-   It is fail-open and cannot block deployment verification.
+   An empty merge snapshot is refreshed after a short settle delay; recently completed watches
+   without a durable capture receipt are backfilled once, including a recorded zero-lesson result.
+   Capture is fail-open and cannot block deployment verification.
 5. The worker ranks within the same repo using file/module and task-token overlap, deduplicates
    repeated feedback, excludes the current PR, and injects at most five lessons. No relevance match
    means no memory block.
@@ -384,6 +386,8 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `REVIEW_LEARNING_ENABLED` | `true` |
 | `REVIEW_LEARNING_TTL_DAYS` | `365` |
 | `REVIEW_LEARNING_OPTOUT_LABEL` | `hermes-no-learn` |
+| `REVIEW_LEARNING_MERGE_RETRY_MS` | `1500` |
+| `REVIEW_LEARNING_BACKFILL_DAYS` | `14` |
 | `QA_BUILD_WORKFLOW_ID` | `staging.yml` |
 | `QA_AUTOMATION_ENABLED` | `false` |
 | `BE_DEPLOY_WORKFLOW_ID` | `208630294` (donate-mate/donatemate "Deploy to Staging") |

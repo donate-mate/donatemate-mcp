@@ -305,6 +305,8 @@ export class HermesStack extends cdk.Stack {
         REVIEW_LEARNING_ENABLED: 'true',
         REVIEW_LEARNING_TTL_DAYS: '365',
         REVIEW_LEARNING_OPTOUT_LABEL: 'hermes-no-learn',
+        REVIEW_LEARNING_MERGE_RETRY_MS: '1500',
+        REVIEW_LEARNING_BACKFILL_DAYS: '14',
         HERMES_METRICS_NAMESPACE: 'DonateMate/Hermes',
       },
     });

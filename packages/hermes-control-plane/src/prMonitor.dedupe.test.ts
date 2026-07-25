@@ -11,7 +11,12 @@ process.env.JOBS_TABLE ??= 'test-table';
 process.env.AWS_REGION ??= 'us-east-2';
 
 import { describe, expect, it } from 'vitest';
-import { dedupeNewSignals, isRetryOfHandledSignal, reviewReplyTargetsForSignals } from './prMonitor.js';
+import {
+  dedupeNewSignals,
+  isRetryOfHandledSignal,
+  reviewReplyTargetsForSignals,
+  shouldFinalizeReviewLearningCapture,
+} from './prMonitor.js';
 import type { PrSignal, PrWatch } from './prWatch.js';
 
 const HEAD = 'd726d96c4c1cf8055825279bd75c622aca98e504';
@@ -134,5 +139,16 @@ describe('reviewReplyTargetsForSignals', () => {
         url: inline.url,
       },
     ]);
+  });
+});
+
+describe('review-learning capture completion', () => {
+  it('defers an empty merge snapshot until the completed-watch backfill', () => {
+    expect(shouldFinalizeReviewLearningCapture(watch(), 0)).toBe(false);
+  });
+
+  it('finalizes an accepted lesson immediately and a zero-lesson terminal backfill exactly once', () => {
+    expect(shouldFinalizeReviewLearningCapture(watch(), 1)).toBe(true);
+    expect(shouldFinalizeReviewLearningCapture(watch({ status: 'prwatch:done' }), 0)).toBe(true);
   });
 });
