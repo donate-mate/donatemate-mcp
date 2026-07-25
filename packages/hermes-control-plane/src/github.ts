@@ -838,9 +838,6 @@ async function collectReviewSnapshot(
   mergedAt?: string | null
 ): Promise<ReviewSnapshot> {
   const { owner, name } = splitRepo(repo);
-  const resolutionEvidencePromise = mergedAt
-    ? listReviewThreadResolutionEvidence(repo, prNumber).catch(() => [])
-    : Promise.resolve([]);
   const query = `
     query($owner: String!, $name: String!, $number: Int!, $after: String) {
       repository(owner: $owner, name: $name) {
@@ -935,7 +932,18 @@ async function collectReviewSnapshot(
           })
       : [];
   const fallbackUrl = `https://github.com/${repo}/pull/${prNumber}`;
-  const resolutionEvidence = await resolutionEvidencePromise;
+  const resolvedThreadIds = threads
+    .filter((thread) => Boolean(thread?.isResolved))
+    .map((thread) => String(thread.id ?? ''))
+    .filter(Boolean);
+  const resolutionEvidence =
+    mergedAt && resolvedThreadIds.length
+      ? await listReviewThreadResolutionEvidence(
+          repo,
+          prNumber,
+          resolvedThreadIds
+        ).catch(() => [])
+      : [];
   const latestResolutionByThread = new Map<string, ReviewThreadResolutionEvidence>();
   for (const evidence of resolutionEvidence) {
     const current = latestResolutionByThread.get(evidence.threadId);

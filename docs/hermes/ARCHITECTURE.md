@@ -235,7 +235,8 @@ schema has no resolution timestamp. The control plane therefore records authenti
 receipt time as a conservative observation boundary. A delayed pre-merge delivery may be omitted,
 but a post-merge resolution can never be backdated into accepted memory. The repository hooks must
 subscribe to **Pull request review thread** events. If evidence is absent or newer than the merge,
-the resolved flag alone is fail-closed and does not teach the system.
+the resolved flag alone is fail-closed and does not teach the system. Merged snapshots retry a
+missing expected thread row with short bounded backoff to cover `status-index` propagation.
 
 ### 3.6 `review-memory:<hash>` — accepted reviewer-feedback memory
 

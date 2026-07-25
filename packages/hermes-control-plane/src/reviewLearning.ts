@@ -139,21 +139,37 @@ export async function recordReviewThreadResolutionEvidence(
 
 export async function listReviewThreadResolutionEvidence(
   repo: string,
-  prNumber: number
+  prNumber: number,
+  expectedThreadIds: string[] = []
 ): Promise<ReviewThreadResolutionEvidence[]> {
   if (!TABLE || !repo || !Number.isSafeInteger(prNumber) || prNumber <= 0) return [];
-  const result = await ddb.send(
-    new QueryCommand({
-      TableName: TABLE,
-      IndexName: 'status-index',
-      KeyConditionExpression: '#status = :status',
-      ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: { ':status': resolutionEvidenceStatus(repo, prNumber) },
-      ScanIndexForward: false,
-      Limit: 200,
-    })
-  );
-  return (result.Items ?? []) as ReviewThreadResolutionEvidence[];
+  const expected = new Set(expectedThreadIds.filter(Boolean));
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const result = await ddb.send(
+      new QueryCommand({
+        TableName: TABLE,
+        IndexName: 'status-index',
+        KeyConditionExpression: '#status = :status',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': resolutionEvidenceStatus(repo, prNumber) },
+        ScanIndexForward: false,
+        Limit: 200,
+      })
+    );
+    const items = (result.Items ?? []) as ReviewThreadResolutionEvidence[];
+    const found = new Set(items.map((item) => item.threadId));
+    if (
+      !expected.size ||
+      [...expected].every((threadId) => found.has(threadId)) ||
+      attempt === 3
+    ) {
+      return items;
+    }
+    // The status-index GSI is eventually consistent. A resolution immediately followed by merge
+    // can briefly miss the just-written row, so retry only the specific evidence gap.
+    await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
+  }
+  return [];
 }
 
 /**
