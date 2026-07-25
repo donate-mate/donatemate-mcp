@@ -40,7 +40,7 @@ export interface GateResult {
   report: string;
 }
 
-interface Cmd {
+export interface GateCommandResult {
   code: number;
   out: string;
   timedOut: boolean;
@@ -58,30 +58,68 @@ async function reportProgress(handler: GateProgressHandler | undefined, message:
   }
 }
 
-function run(cmd: string, args: string[], cwd: string): Promise<Cmd> {
+/**
+ * Run one repository validation command with a hard wall-clock timeout.
+ *
+ * On Linux the command is its own process group so a timeout terminates wrappers such as `npx`
+ * together with Turbo/Jest descendants. Killing only the wrapper leaves descendants holding the
+ * stdout/stderr pipes open, which prevents the `close` event and can strand a protected worker.
+ */
+export function runGateCommand(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  timeoutMs = CMD_TIMEOUT_MS
+): Promise<GateCommandResult> {
   return new Promise((resolve) => {
     // NODE_ENV=test (not the image's 'production', which would skip dev tooling/behavior); HUSKY=0 so
     // no repo hook fires while the gate runs the repo's own prettier/eslint/test scripts.
     const env = { ...process.env, CI: 'true', HUSKY: '0', NODE_ENV: process.env.NODE_ENV === 'production' ? 'test' : process.env.NODE_ENV ?? 'test' };
-    const child = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const useProcessGroup = process.platform !== 'win32';
+    const child = spawn(cmd, args, {
+      cwd,
+      env,
+      detached: useProcessGroup,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let out = '';
     let timedOut = false;
+    let settled = false;
+    const finish = (result: GateCommandResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const terminate = () => {
+      if (useProcessGroup && child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+          return;
+        } catch {
+          // Fall back to the direct child if the process group already exited or cannot be signaled.
+        }
+      }
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // The process may have exited between the timeout firing and the signal attempt.
+      }
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
-    }, CMD_TIMEOUT_MS);
+      terminate();
+    }, timeoutMs);
     const onData = (d: Buffer) => {
       if (out.length < OUT_CAP * 8) out += d.toString();
     };
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
     child.on('error', (e) => {
-      clearTimeout(timer);
-      resolve({ code: 127, out: `${out}\n${e instanceof Error ? e.message : String(e)}`, timedOut });
+      finish({ code: 127, out: `${out}\n${e instanceof Error ? e.message : String(e)}`, timedOut });
     });
     child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? 0, out: out.slice(-OUT_CAP), timedOut });
+      finish({ code: timedOut ? 124 : (code ?? 1), out: out.slice(-OUT_CAP), timedOut });
     });
   });
 }
@@ -146,7 +184,7 @@ async function toolAvailable(dir: string, bin: string): Promise<boolean> {
   return fileExists(join(dir, 'node_modules', '.bin', bin));
 }
 
-function summarize(check: Cmd, extra = ''): string {
+function summarize(check: GateCommandResult, extra = ''): string {
   const why = check.timedOut ? ' [timed out]' : '';
   return `${extra}${why}\n${check.out}`.trim();
 }
@@ -182,7 +220,7 @@ export async function runGate(
   }
   if (prettierFiles.length && (await toolAvailable(dir, 'prettier'))) {
     await reportProgress(onProgress, `starting prettier on ${prettierFiles.length} file(s)`);
-    const res = await run('npx', ['--no-install', 'prettier', '--check', ...prettierFiles], dir);
+    const res = await runGateCommand('npx', ['--no-install', 'prettier', '--check', ...prettierFiles], dir);
     checks.push({ name: 'prettier', ok: res.code === 0, output: summarize(res) });
     await reportProgress(onProgress, `prettier ${res.code === 0 ? 'passed' : 'failed'}`);
   } else {
@@ -197,7 +235,7 @@ export async function runGate(
   }
   if (lintFiles.length && installOk && (await toolAvailable(dir, 'eslint'))) {
     await reportProgress(onProgress, `starting eslint on ${lintFiles.length} file(s)`);
-    const res = await run('npx', ['--no-install', 'eslint', ...lintFiles], dir);
+    const res = await runGateCommand('npx', ['--no-install', 'eslint', ...lintFiles], dir);
     checks.push({ name: 'eslint', ok: res.code === 0, output: summarize(res) });
     await reportProgress(onProgress, `eslint ${res.code === 0 ? 'passed' : 'failed'}`);
   } else {
@@ -230,7 +268,7 @@ export async function runGate(
     if (hasTurbo && testPackages.length) {
       const filters = testPackages.flatMap(([name]) => ['--filter', `${name}...`]);
       await reportProgress(onProgress, `building the shared dependency graph for ${testPackages.length} test workspace(s)`);
-      const build = await run(
+      const build = await runGateCommand(
         'npx',
         ['--no-install', 'turbo', 'run', 'build', `--concurrency=${BUILD_CONCURRENCY}`, ...filters],
         dir
@@ -251,7 +289,7 @@ export async function runGate(
       }
       await reportProgress(onProgress, `starting tests for ${name}`);
       const { cmd, args } = workspaceScriptCommand(pm, name, 'test');
-      const res = await run(cmd, args, dir);
+      const res = await runGateCommand(cmd, args, dir);
       checks.push({ name: `test:${name}`, ok: res.code === 0, output: summarize(res, `(package ${name})`) });
       await reportProgress(onProgress, `tests for ${name} ${res.code === 0 ? 'passed' : 'failed'}`);
     }
