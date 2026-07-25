@@ -228,10 +228,12 @@ put makes duplicate GitHub deliveries no-ops.
 
 ### 3.5 `review-resolution:<hash>` — timestamped thread-resolution evidence
 
-One idempotent row per signed `pull_request_review_thread:resolved` webhook, partitioned on the
-`status-index` by repo + PR and retained for 30 days. GitHub's GraphQL review-thread object exposes
-only the current resolved state, not when it changed; the webhook's `thread.updated_at` is therefore
-the immutable evidence used to prove resolution happened before the PR merged. The GitHub App must
+One delivery-idempotent row per signed `pull_request_review_thread:resolved` webhook, partitioned
+on the `status-index` by repo + PR and retained for 30 days. GitHub's GraphQL review-thread object
+exposes only the current resolved state, not when it changed, and the generated webhook thread
+schema has no resolution timestamp. The control plane therefore records authenticated webhook
+receipt time as a conservative observation boundary. A delayed pre-merge delivery may be omitted,
+but a post-merge resolution can never be backdated into accepted memory. The repository hooks must
 subscribe to **Pull request review thread** events. If evidence is absent or newer than the merge,
 the resolved flag alone is fail-closed and does not teach the system.
 

@@ -64,7 +64,8 @@ export interface ReviewThreadResolutionEvidence {
   repo: string;
   prNumber: number;
   threadId: string;
-  resolvedAt: string;
+  deliveryId: string;
+  resolutionObservedAt: string;
   resolvedBy?: string;
 }
 
@@ -80,7 +81,7 @@ function feedbackHash(feedback: string): string {
 function resolutionEvidenceKey(evidence: ReviewThreadResolutionEvidence): string {
   const digest = createHash('sha256')
     .update(
-      `${evidence.repo}\0${evidence.prNumber}\0${evidence.threadId}\0${evidence.resolvedAt}`
+      `${evidence.repo}\0${evidence.prNumber}\0${evidence.threadId}\0${evidence.deliveryId}`
     )
     .digest('hex')
     .slice(0, 40);
@@ -92,9 +93,10 @@ function resolutionEvidenceStatus(repo: string, prNumber: number): string {
 }
 
 /**
- * Preserve the timestamp from GitHub's signed `pull_request_review_thread:resolved` webhook.
+ * Preserve when the control plane received GitHub's signed
+ * `pull_request_review_thread:resolved` webhook.
  * GraphQL exposes only the thread's current `isResolved` value, so this immutable event is the
- * evidence needed to prove that resolution happened no later than the merge.
+ * conservative evidence needed to prove that resolution was already observable before the merge.
  */
 export async function recordReviewThreadResolutionEvidence(
   evidence: ReviewThreadResolutionEvidence
@@ -105,7 +107,8 @@ export async function recordReviewThreadResolutionEvidence(
     !Number.isSafeInteger(evidence.prNumber) ||
     evidence.prNumber <= 0 ||
     !evidence.threadId ||
-    !Number.isFinite(Date.parse(evidence.resolvedAt))
+    !evidence.deliveryId ||
+    !Number.isFinite(Date.parse(evidence.resolutionObservedAt))
   ) {
     return false;
   }
@@ -120,7 +123,7 @@ export async function recordReviewThreadResolutionEvidence(
           status: resolutionEvidenceStatus(evidence.repo, evidence.prNumber),
           kind: 'review_resolution_evidence',
           ...evidence,
-          createdAt: evidence.resolvedAt,
+          createdAt: evidence.resolutionObservedAt,
           updatedAt: recordedAt,
           expiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
         },

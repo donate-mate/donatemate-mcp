@@ -971,20 +971,26 @@ export async function handleGitHubWebhook(
   body: Record<string, any>,
   log: FastifyBaseLogger
 ): Promise<{ ok: true; ignored?: string }> {
+  // GitHub's generated webhook schema has no resolution timestamp on the thread object. Capture
+  // receipt at the handler boundary: this may conservatively reject a delayed pre-merge event, but
+  // it can never make a post-merge resolution look as though the merge accepted it.
+  const receivedAt = new Date().toISOString();
   if (!(await verifyGitHubSignature(rawBody, headers))) throw new Error('invalid GitHub signature');
   const deliveryId = String(headers['x-github-delivery'] ?? '');
   const eventName = String(headers['x-github-event'] ?? '');
   const { repo, prNumber, extraSignals } = payloadRepoAndPr(body);
-  const resolutionEvidence = reviewThreadResolutionFromWebhook(body, eventName);
+  const resolutionEvidence = reviewThreadResolutionFromWebhook(body, eventName, receivedAt);
 
-  // Record signed resolution-time evidence before claiming the delivery. The evidence write is
-  // idempotent, so a transient failure can safely return 500 and let GitHub retry this delivery.
-  // This is the only reliable way to distinguish pre-merge from post-merge resolution: GraphQL's
-  // PullRequestReviewThread exposes current state but no resolution timestamp.
+  // Record signed resolution-observation evidence before claiming the delivery. The evidence key
+  // includes GitHub's delivery id, so a transient failure can safely let GitHub retry without
+  // replacing the original receipt time.
+  // This is the only conservative way to distinguish pre-merge from post-merge resolution:
+  // GraphQL exposes current state but no resolution timestamp, and the webhook thread has none.
   if (repo && prNumber && resolutionEvidence) {
     await recordReviewThreadResolutionEvidence({
       repo,
       prNumber,
+      deliveryId,
       ...resolutionEvidence,
     });
   }

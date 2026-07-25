@@ -658,7 +658,10 @@ function reviewActivityAtOrBefore(activity: any, acceptedBefore?: string | null)
 export function lessonFromReviewThreadNode(
   thread: any,
   acceptedBefore?: string | null,
-  resolutionEvidence?: Pick<ReviewThreadResolutionEvidence, 'resolvedAt' | 'resolvedBy'>
+  resolutionEvidence?: Pick<
+    ReviewThreadResolutionEvidence,
+    'resolutionObservedAt' | 'resolvedBy'
+  >
 ): ReviewLessonCandidate | null {
   const comments = ((thread?.comments?.nodes ?? []) as any[]).filter((comment) =>
     reviewActivityAtOrBefore(comment, acceptedBefore)
@@ -685,8 +688,11 @@ export function lessonFromReviewThreadNode(
     Boolean(thread.isResolved) &&
     (!acceptedBefore ||
       Boolean(
-        resolutionEvidence?.resolvedAt &&
-          reviewActivityAtOrBefore({ updatedAt: resolutionEvidence.resolvedAt }, acceptedBefore)
+        resolutionEvidence?.resolutionObservedAt &&
+          reviewActivityAtOrBefore(
+            { updatedAt: resolutionEvidence.resolutionObservedAt },
+            acceptedBefore
+          )
       ));
   if (!resolvedBeforeAcceptance && !hermesRepliedAfterFeedback) return null;
 
@@ -901,7 +907,8 @@ async function collectReviewSnapshot(
     const current = latestResolutionByThread.get(evidence.threadId);
     if (
       !current ||
-      Date.parse(evidence.resolvedAt) > Date.parse(current.resolvedAt)
+      Date.parse(evidence.resolutionObservedAt) >
+        Date.parse(current.resolutionObservedAt)
     ) {
       latestResolutionByThread.set(evidence.threadId, evidence);
     }
@@ -980,18 +987,21 @@ export async function collectPrSnapshot(watch: PrWatch, extraSignals: PrSignal[]
 
 export function reviewThreadResolutionFromWebhook(
   body: Record<string, any>,
-  eventName: string
-): Pick<ReviewThreadResolutionEvidence, 'threadId' | 'resolvedAt' | 'resolvedBy'> | null {
+  eventName: string,
+  receivedAt: string
+): Pick<
+  ReviewThreadResolutionEvidence,
+  'threadId' | 'resolutionObservedAt' | 'resolvedBy'
+> | null {
   if (eventName !== 'pull_request_review_thread' || String(body.action ?? '') !== 'resolved') {
     return null;
   }
   const threadId = String(body.thread?.node_id ?? body.thread?.nodeId ?? '');
-  const resolvedAt = String(body.thread?.updated_at ?? body.thread?.updatedAt ?? '');
-  if (!threadId || !Number.isFinite(Date.parse(resolvedAt))) return null;
+  if (!threadId || !Number.isFinite(Date.parse(receivedAt))) return null;
   const resolvedBy = String(body.sender?.login ?? '').trim();
   return {
     threadId,
-    resolvedAt,
+    resolutionObservedAt: receivedAt,
     resolvedBy: resolvedBy || undefined,
   };
 }

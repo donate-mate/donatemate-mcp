@@ -140,7 +140,7 @@ describe('accepted review learning', () => {
       lessonFromReviewThreadNode(
         thread([trustedRoot, postMergeFollowup], { isResolved: true }),
         cutoff,
-        { resolvedAt: '2026-07-10T10:00:00Z', resolvedBy: 'reviewer' }
+        { resolutionObservedAt: '2026-07-10T10:00:00Z', resolvedBy: 'reviewer' }
       )
     ).toMatchObject({
       feedbackCommentId: 'PRRC_root',
@@ -161,13 +161,13 @@ describe('accepted review learning', () => {
     expect(lessonFromReviewThreadNode(resolvedThread, cutoff)).toBeNull();
     expect(
       lessonFromReviewThreadNode(resolvedThread, cutoff, {
-        resolvedAt: '2026-07-12T10:00:00Z',
+        resolutionObservedAt: '2026-07-12T10:00:00Z',
         resolvedBy: 'reviewer',
       })
     ).toBeNull();
     expect(
       lessonFromReviewThreadNode(resolvedThread, cutoff, {
-        resolvedAt: '2026-07-10T10:00:00Z',
+        resolutionObservedAt: '2026-07-10T10:00:00Z',
         resolvedBy: 'reviewer',
       })
     ).toMatchObject({
@@ -274,21 +274,26 @@ describe('reviewThreadResolutionFromWebhook', () => {
       action: 'resolved',
       thread: {
         node_id: 'PRRT_thread',
-        updated_at: '2026-07-10T10:00:00Z',
       },
       sender: { login: 'reviewer' },
     };
+    const receivedAt = '2026-07-10T10:00:00Z';
 
-    expect(reviewThreadResolutionFromWebhook(body, 'pull_request_review_thread')).toEqual({
+    expect(
+      reviewThreadResolutionFromWebhook(body, 'pull_request_review_thread', receivedAt)
+    ).toEqual({
       threadId: 'PRRT_thread',
-      resolvedAt: '2026-07-10T10:00:00Z',
+      resolutionObservedAt: receivedAt,
       resolvedBy: 'reviewer',
     });
-    expect(reviewThreadResolutionFromWebhook(body, 'pull_request_review_comment')).toBeNull();
+    expect(
+      reviewThreadResolutionFromWebhook(body, 'pull_request_review_comment', receivedAt)
+    ).toBeNull();
     expect(
       reviewThreadResolutionFromWebhook(
-        { ...body, thread: { ...body.thread, updated_at: null } },
-        'pull_request_review_thread'
+        body,
+        'pull_request_review_thread',
+        'not-a-timestamp'
       )
     ).toBeNull();
   });
