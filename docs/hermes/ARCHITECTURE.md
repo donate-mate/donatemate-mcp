@@ -136,7 +136,10 @@ enrich the prompt with Jira context if the source references a ticket; retrieve 
 review lessons (`reviewLearning.ts`); run the agent; if the tree
 changed, commit + push (with pre-commit repair loop), open/update the PR, and write back to
 Jira/Slack/GitHub. If the agent produced **no changes**, the job fails with an explanatory comment
-and (for initial jobs) the ticket moves back to *To Do*.
+and (for initial jobs) the ticket moves back to *To Do*. Agent, workspace-install, and gate command
+timeouts share the Linux process-tree terminator. Ephemeral workspace cleanup and protection
+release are best-effort after durable job completion, so cleanup races cannot redeliver a
+successfully completed SQS message.
 
 **Pre-commit repair** (`commitAndPushWithPrecommitRepair`): if the commit hook fails on
 lint/format/typecheck, the harness re-invokes the agent with a scoped repair prompt up to

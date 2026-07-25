@@ -823,9 +823,24 @@ async function processJob(jobId: string): Promise<void> {
   } finally {
     stopHeartbeat();
     try {
-      await rm(dir, { recursive: true, force: true });
-    } finally {
+      await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch (cleanupError) {
+      // A workspace is unique to this task and disappears with the Fargate container. Cleanup must
+      // never turn an already-terminal job into an SQS redelivery (or mask its original failure).
+      console.warn(
+        `[${jobId}] workspace cleanup failed; leaving it for container teardown:`,
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      );
+    }
+    try {
       await stopProtection(); // idle again — allow scale-in even if temp cleanup fails
+    } catch (protectionError) {
+      // The initial lease is bounded. Reporting a release failure is safer than duplicating a job
+      // whose durable terminal state and external writes have already completed.
+      console.warn(
+        `[${jobId}] failed to release task protection:`,
+        protectionError instanceof Error ? protectionError.message : String(protectionError)
+      );
     }
   }
 }

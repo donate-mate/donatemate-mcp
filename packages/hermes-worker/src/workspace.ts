@@ -11,9 +11,9 @@
  * .github/workflows/hermes-images.yml) prebakes the yarn/turbo caches under HERMES_CACHE_DIR so the
  * install hits a warm cache instead of the network — first-edit target is < 2 min.
  */
-import { spawn } from 'node:child_process';
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { runProcessWithTimeout } from './agent.js';
 
 const INSTALL_TIMEOUT_MS = Number(process.env.WORKSPACE_INSTALL_TIMEOUT_SECONDS ?? 600) * 1000;
 const LOG_CAP = 24 * 1024;
@@ -35,32 +35,24 @@ interface CmdResult {
 }
 
 function run(cmd: string, args: string[], cwd: string, extraEnv: NodeJS.ProcessEnv = {}): Promise<CmdResult> {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, {
-      cwd,
-      env: { ...process.env, CI: 'true', ...extraEnv },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let out = '';
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, INSTALL_TIMEOUT_MS);
-    const onData = (d: Buffer) => {
-      if (out.length < LOG_CAP * 8) out += d.toString();
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
-    child.on('error', (e) => {
-      clearTimeout(timer);
-      resolve({ code: 127, out: `${out}\n${e instanceof Error ? e.message : String(e)}`, timedOut });
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? 0, out, timedOut });
-    });
-  });
+  return runProcessWithTimeout({
+    command: cmd,
+    args,
+    stdin: '',
+    cwd,
+    env: { ...process.env, CI: 'true', ...extraEnv },
+    timeoutMs: INSTALL_TIMEOUT_MS,
+  })
+    .then((result) => ({
+      code: result.timedOut ? 124 : result.code,
+      out: `${result.stdout}\n${result.stderr}`.trim().slice(-LOG_CAP),
+      timedOut: result.timedOut,
+    }))
+    .catch((error) => ({
+      code: 127,
+      out: error instanceof Error ? error.message : String(error),
+      timedOut: false,
+    }));
 }
 
 async function exists(path: string): Promise<boolean> {

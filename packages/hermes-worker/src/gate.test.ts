@@ -65,7 +65,7 @@ describe('runGateCommand timeout', () => {
     const grandchild = 'setTimeout(() => process.exit(0), 3000);';
     const parent = [
       "const { spawn } = require('node:child_process');",
-      `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: ['ignore', 'inherit', 'inherit'] });`,
+      `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });`,
       'setInterval(() => {}, 1000);',
     ].join('');
     const startedAt = Date.now();
