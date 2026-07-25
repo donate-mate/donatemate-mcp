@@ -547,15 +547,18 @@ export function signalFromReviewThreadNode(thread: any): PrSignal | null {
   // An unresolved GitHub thread remains open until a reviewer resolves it. A Hermes reply should
   // acknowledge the fix without causing another fix job. If a reviewer replies after our marker,
   // their comment becomes `last` and produces a fresh signal as expected.
-  const latestHumanBeforeReply = comments
+  // Automated reviewers can open actionable threads too. Suppression only proves that Hermes
+  // replied to the exact latest non-Hermes feedback comment; trusted-human checks belong solely to
+  // lesson capture below.
+  const latestFeedbackBeforeReply = comments
     .slice(0, -1)
     .reduce<any | undefined>(
-      (latest, comment) => (isHermesOrBotComment(comment) ? latest : comment),
+      (latest, comment) => (isHermesReviewComment(comment) ? latest : comment),
       undefined
     );
   if (
     isHermesReviewComment(last) &&
-    markerFeedbackId(last.body) === String(latestHumanBeforeReply?.id ?? '')
+    markerFeedbackId(last.body) === String(latestFeedbackBeforeReply?.id ?? '')
   ) {
     return null;
   }

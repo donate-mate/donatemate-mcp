@@ -57,6 +57,22 @@ describe('signalFromReviewThreadNode', () => {
     expect(signalFromReviewThreadNode(thread([root, hermesReply]))).toBeNull();
   });
 
+  it('suppresses an exact Hermes reply to an automated reviewer thread', () => {
+    const botFeedback = {
+      ...root,
+      id: 'PRRC_bot_feedback',
+      author: { login: 'review-bot[bot]', __typename: 'Bot' },
+    };
+    const hermesReply = {
+      ...root,
+      id: 'PRRC_hermes',
+      body: `Addressed.\n${HERMES_REVIEW_REPLY_MARKER_PREFIX}PRRC_bot_feedback -->`,
+      author: { login: 'donatemate-hermes', __typename: 'Bot' },
+    };
+
+    expect(signalFromReviewThreadNode(thread([botFeedback, hermesReply]))).toBeNull();
+  });
+
   it('emits a fresh signal when a reviewer follows up after Hermes replied', () => {
     const hermesReply = {
       ...root,
