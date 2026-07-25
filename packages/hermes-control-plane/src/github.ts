@@ -701,7 +701,9 @@ export function lessonFromReviewThreadNode(
   if (!resolvedBeforeAcceptance && !hermesRepliedAfterFeedback) return null;
 
   const evidenceComments = resolvedBeforeAcceptance
-    ? comments
+    ? comments.filter((comment) =>
+        reviewActivityAtOrBefore(comment, resolutionEvidence?.resolutionObservedAt)
+      )
     : [comments[lastNonBotHumanIndex]];
   const feedbackComments = evidenceComments
     .filter(isTrustedHumanComment)

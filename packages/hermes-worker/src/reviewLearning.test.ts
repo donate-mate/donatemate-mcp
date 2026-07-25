@@ -94,6 +94,22 @@ describe('rankReviewLessons', () => {
       })
     ).toEqual([]);
   });
+
+  it('does not treat common function words as relevance evidence', () => {
+    const generic = lesson({
+      path: undefined,
+      feedback: 'reviewer: Avoid the global cache for a lookup.',
+      feedbackHash: 'generic',
+    });
+
+    expect(
+      rankReviewLessons([generic], {
+        repo: 'donate-mate/donatemate',
+        type: 'be',
+        queryText: 'Add the checkout audit for a payment.',
+      })
+    ).toEqual([]);
+  });
 });
 
 describe('formatReviewLearningPromptBlock', () => {

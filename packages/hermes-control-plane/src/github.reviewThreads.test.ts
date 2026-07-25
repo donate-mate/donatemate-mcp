@@ -193,6 +193,24 @@ describe('accepted review learning', () => {
     });
   });
 
+  it('does not let an older resolution validate feedback edited afterward', () => {
+    const editedAfterResolution = {
+      ...trustedRoot,
+      updatedAt: '2026-07-10T11:00:00Z',
+    };
+
+    expect(
+      lessonFromReviewThreadNode(
+        thread([editedAfterResolution], { isResolved: true }),
+        '2026-07-11T10:00:00Z',
+        {
+          resolutionObservedAt: '2026-07-10T10:00:00Z',
+          resolvedBy: 'reviewer',
+        }
+      )
+    ).toBeNull();
+  });
+
   it('excludes feedback edited after the merge boundary', () => {
     const editedAfterMerge = {
       ...trustedRoot,
