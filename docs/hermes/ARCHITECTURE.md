@@ -36,6 +36,8 @@ The end-to-end happy path for a Jira-sourced task:
 7. **Merge → verify** — On merge, Hermes queues a post-merge job: **deploy_verification** (BE)
    or **qa_proof** (FE). It waits for the deploy/build workflow, then either advances the ticket
    toward *Ready for QA* / *Done* or blocks it with a reason.
+8. **Learn** — The merge reconcile promotes only accepted, trusted human-review feedback into
+   repo-scoped review memory. Future related jobs retrieve a small ranked set before coding.
 
 Slack and programmatic `/dispatch` requests join at step 3/4 (they skip the Jira plan/confirm
 handshake but produce the same coding job and PR-watch lifecycle).
@@ -130,7 +132,8 @@ monitor can detect a stalled fix job.
 **Coding job flow** (`processJob`): update job → running; set scale-in protection; `mkdtemp`
 workspace; mint a per-job GitHub installation token; clone (base branch for new work, PR head
 branch for follow-ups); for `merge_conflict_fix`, pre-merge the base and build a conflict prompt;
-enrich the prompt with Jira context if the source references a ticket; run the agent; if the tree
+enrich the prompt with Jira context if the source references a ticket; retrieve relevant accepted
+review lessons (`reviewLearning.ts`); run the agent; if the tree
 changed, commit + push (with pre-commit repair loop), open/update the PR, and write back to
 Jira/Slack/GitHub. If the agent produced **no changes**, the job fails with an explanatory comment
 and (for initial jobs) the ticket moves back to *To Do*.
@@ -222,6 +225,35 @@ Created by the worker (`recordPrWatch`) when the initial PR opens; all subsequen
 
 A tiny row written by `rememberGitHubDelivery` with a 7-day TTL; a conditional `attribute_not_exists`
 put makes duplicate GitHub deliveries no-ops.
+
+### 3.5 `review-memory:<hash>` — accepted reviewer-feedback memory
+
+One row per accepted review thread or top-level change request. The `status-index` partition is
+`review-memory:<repo>`, which lets a worker retrieve the newest bounded candidate set with one
+regional DynamoDB query. Rows retain the source PR/thread URL, file/line scope, reviewer association,
+acceptance evidence, merge SHA, and feedback hash; they expire after 365 days by default.
+
+The learning gate is intentionally conservative:
+
+1. The feedback author must be a GitHub `OWNER`, `MEMBER`, or `COLLABORATOR`; bots, Hermes, unknown
+   authors, acknowledgements, and prompt-injection-shaped text are excluded.
+2. Inline feedback needs either an explicitly resolved thread or a Hermes addressed-marker with no
+   later human reply. A top-level `CHANGES_REQUESTED` body needs a later approval from that reviewer.
+3. The PR must merge. Closed/unmerged PRs never teach the system. The `hermes-no-learn` PR label
+   opts the whole PR out.
+4. Capture is event-driven in the merge reconcile path and idempotent by repo + GitHub source ID.
+   It is fail-open and cannot block deployment verification.
+5. The worker ranks within the same repo using file/module and task-token overlap, deduplicates
+   repeated feedback, excludes the current PR, and injects at most five lessons. No relevance match
+   means no memory block.
+6. Stored reviewer text is delimited and HTML-escaped as untrusted evidence. The prompt explicitly
+   forbids treating it as executable instructions or allowing it to override the current task,
+   repository contract, or system instructions.
+
+This is non-parametric learning: it improves the next run without modifying model weights. Keep a
+holdout set of historical review cases and track repeat-finding rate, first-pass review acceptance,
+fix rounds, retrieval precision, lookup latency, and token overhead before broadening the gate or
+adding semantic/model-based consolidation.
 
 ---
 
@@ -322,6 +354,9 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `CONVERSE_MODEL` | `gpt-5.3-chat-latest` |
 | `MCP_ENDPOINT` | `https://mcp.donate-mate.com/mcp` |
 | `PR_RECONCILE_SECONDS` | `300` |
+| `REVIEW_LEARNING_ENABLED` | `true` |
+| `REVIEW_LEARNING_TTL_DAYS` | `365` |
+| `REVIEW_LEARNING_OPTOUT_LABEL` | `hermes-no-learn` |
 | `QA_BUILD_WORKFLOW_ID` | `staging.yml` |
 | `QA_AUTOMATION_ENABLED` | `false` |
 | `BE_DEPLOY_WORKFLOW_ID` | `208630294` (donate-mate/donatemate "Deploy to Staging") |
@@ -337,6 +372,10 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `AGENT_MODEL` | `gpt-5.5` (coding model) |
 | `MCP_ENDPOINT` | `https://mcp.donate-mate.com/mcp` |
 | `JOB_TIMEOUT_SECONDS` | `2400` |
+| `REVIEW_LEARNING_ENABLED` | `true` |
+| `REVIEW_LEARNING_TOP_K` | `5` |
+| `REVIEW_LEARNING_TIMEOUT_MS` | `1500` |
+| `REVIEW_LEARNING_MAX_CANDIDATES` | `100` |
 | `QA_BUILD_WORKFLOW_ID` | `staging.yml` |
 | `QA_EXECUTION_WORKFLOW_ID` | `hermes-qa.yml` |
 | `QA_AUTOMATION_ENABLED` | `false` |

@@ -61,6 +61,7 @@ import { getFlow, setFlow } from './jiraflow.js';
 import { fetchIssueContext, getIssueAssigneeAccountId } from './jira.js';
 import { loadQaScenarioCatalog } from './qaConfluence.js';
 import { buildQaProofPlan, buildQaReadinessPlan, summarizeQaPlan, type QaProofPlan } from './qaPlanner.js';
+import { recordMergedReviewLessons } from './reviewLearning.js';
 
 // Per-PR cap on automated fix rounds — of distinct problems AND of retries of a problem a previous
 // attempt failed to resolve (see RETRY_UNRESOLVED_SIGNALS). Reaching it blocks the watch, which is
@@ -796,6 +797,32 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
 
   if (snapshot.state === 'MERGED') {
     const mergeCommitSha = snapshot.mergeCommitSha || snapshot.headSha;
+    // Merge is the final acceptance gate for experiential review memory. Capture is idempotent and
+    // fail-open: learning can never delay or block post-merge QA/deployment verification.
+    try {
+      const recorded = await recordMergedReviewLessons({
+        repo: currentWatch.repo,
+        type: currentWatch.type,
+        baseBranch: snapshot.baseBranch,
+        prNumber: currentWatch.prNumber,
+        prUrl: snapshot.prUrl,
+        mergeCommitSha,
+        issueKey: currentWatch.issueKey,
+        labels: snapshot.labels,
+        lessons: snapshot.reviewLessons,
+      });
+      if (recorded) {
+        log.info(
+          { repo: currentWatch.repo, prNumber: currentWatch.prNumber, lessons: recorded },
+          'recorded accepted PR-review lessons'
+        );
+      }
+    } catch (err) {
+      log.warn(
+        { err, repo: currentWatch.repo, prNumber: currentWatch.prNumber },
+        'failed to record PR-review lessons; continuing merge flow'
+      );
+    }
     let recoveryRun: WorkflowRunSummary | null = null;
     if (currentWatch.status === 'prwatch:blocked') {
       recoveryRun = await recoveryWorkflowSignal(currentWatch, mergeCommitSha, log);
