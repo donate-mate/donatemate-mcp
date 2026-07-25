@@ -46,6 +46,18 @@ const annotationsCache = immutableCache<string>(1000);
 // thread, the feedback has already been handled and must not become a new signal merely because
 // Hermes's own reply changed the thread's last-comment id.
 export const HERMES_REVIEW_REPLY_MARKER_PREFIX = '<!-- hermes-review-addressed:';
+const HERMES_GITHUB_LOGIN = (process.env.HERMES_GITHUB_LOGIN ?? 'donatemate-hermes')
+  .trim()
+  .toLowerCase()
+  .replace(/\[bot\]$/, '');
+
+function isHermesReviewComment(comment: any): boolean {
+  const login = String(comment?.author?.login ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\[bot\]$/, '');
+  return Boolean(login && login === HERMES_GITHUB_LOGIN);
+}
 
 /** A rate-limit 403/429 from GitHub, as opposed to a permissions 403. */
 export function isRateLimitError(err: unknown): boolean {
@@ -531,7 +543,12 @@ export function signalFromReviewThreadNode(thread: any): PrSignal | null {
   // An unresolved GitHub thread remains open until a reviewer resolves it. A Hermes reply should
   // acknowledge the fix without causing another fix job. If a reviewer replies after our marker,
   // their comment becomes `last` and produces a fresh signal as expected.
-  if (String(last.body ?? '').includes(HERMES_REVIEW_REPLY_MARKER_PREFIX)) return null;
+  if (
+    isHermesReviewComment(last) &&
+    String(last.body ?? '').includes(HERMES_REVIEW_REPLY_MARKER_PREFIX)
+  ) {
+    return null;
+  }
 
   const rootCommentId = Number(root?.databaseId);
   const body = comments
@@ -565,7 +582,7 @@ function isHermesOrBotComment(comment: any): boolean {
   return (
     !login ||
     String(comment?.author?.__typename ?? '').toLowerCase() === 'bot' ||
-    login.includes('hermes') ||
+    isHermesReviewComment(comment) ||
     login.endsWith('[bot]')
   );
 }
@@ -611,7 +628,10 @@ export function lessonFromReviewThreadNode(thread: any): ReviewLessonCandidate |
   );
   const lastMarkerIndex = comments.reduce(
     (last, comment, index) =>
-      String(comment?.body ?? '').includes(HERMES_REVIEW_REPLY_MARKER_PREFIX) ? index : last,
+      isHermesReviewComment(comment) &&
+      String(comment?.body ?? '').includes(HERMES_REVIEW_REPLY_MARKER_PREFIX)
+        ? index
+        : last,
     -1
   );
   const hermesRepliedAfterFeedback = lastMarkerIndex > lastNonBotHumanIndex && lastNonBotHumanIndex >= 0;

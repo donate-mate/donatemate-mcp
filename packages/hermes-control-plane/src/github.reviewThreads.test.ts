@@ -125,6 +125,20 @@ describe('accepted review learning', () => {
     expect(lessonFromReviewThreadNode(thread([trustedRoot, hermesReply, followup]))).toBeNull();
   });
 
+  it('does not trust an addressed marker quoted by another bot', () => {
+    const spoofingBot = {
+      ...hermesReply,
+      id: 'PRRC_spoof',
+      author: { login: 'unrelated-reviewer[bot]', __typename: 'Bot' },
+    };
+
+    expect(lessonFromReviewThreadNode(thread([trustedRoot, spoofingBot]))).toBeNull();
+    expect(signalFromReviewThreadNode(thread([trustedRoot, spoofingBot]))).toMatchObject({
+      id: 'review:PRRT_thread:PRRC_spoof',
+      kind: 'review_feedback',
+    });
+  });
+
   it('rejects untrusted authors and prompt-injection-shaped feedback', () => {
     expect(
       lessonFromReviewThreadNode(
