@@ -301,6 +301,10 @@ export class HermesStack extends cdk.Stack {
         OVERLAP_COORDINATION_ENABLED: 'true', // WS5.1/5.2 cross-PR overlap + merge re-review
         CHECKLIST_ENABLED: 'true', // WS5.3 ticket checklist + readiness gate
         EVIDENCE_CHECK_ENABLED: 'true', // WS5.4 evidence-ID verification gate
+        // Only trusted, addressed review feedback from merged PRs is promoted to durable memory.
+        REVIEW_LEARNING_ENABLED: 'true',
+        REVIEW_LEARNING_TTL_DAYS: '365',
+        REVIEW_LEARNING_OPTOUT_LABEL: 'hermes-no-learn',
         HERMES_METRICS_NAMESPACE: 'DonateMate/Hermes',
       },
     });
@@ -402,7 +406,10 @@ export class HermesStack extends cdk.Stack {
         PREOPEN_REVIEW_ENABLED: 'true', // WS4 pre-open adversarial review stage
         PREOPEN_REVIEW_EFFORT: 'high', // WS4 review runs at high reasoning effort
         GATE_MAX_RETRIES: '3', // WS2 pre-commit gate repair rounds before fail-open
-        KB_INJECTION_ENABLED: 'true', // WS6 inject "previously flagged patterns" from the KB
+        REVIEW_LEARNING_ENABLED: 'true',
+        REVIEW_LEARNING_TOP_K: '5',
+        REVIEW_LEARNING_TIMEOUT_MS: '1500',
+        REVIEW_LEARNING_MAX_CANDIDATES: '100',
         WORKSPACE_INSTALL_TIMEOUT_SECONDS: '600', // WS1 dependency-install budget
         HERMES_CACHE_DIR: '/opt/hermes-cache', // WS1 warm yarn/turbo cache baked by the nightly image
         HERMES_METRICS_NAMESPACE: 'DonateMate/Hermes', // WS2 CloudWatch metrics namespace

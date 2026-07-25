@@ -37,5 +37,9 @@ jobs:
       - name: Type check
         run: npm run type-check --workspaces --if-present
 
-      - name: Hermes worker regression tests
-        run: npx vitest run packages/hermes-worker/src/*.test.ts
+      - name: Hermes regression tests
+        run: |
+          npx vitest run \
+            packages/hermes-control-plane/src/*.test.ts \
+            packages/hermes-worker/src/*.test.ts \
+            --pool=forks --poolOptions.forks.singleFork=true

@@ -26,6 +26,7 @@ import {
   rebasePullRequestBranch,
   remainingRestBudget,
   requestReReviewFromChangeRequesters,
+  reviewThreadResolutionFromWebhook,
   signalFromPrCommentWebhook,
   signalFromReviewWebhook,
   verifyGitHubSignature,
@@ -61,6 +62,10 @@ import { getFlow, setFlow } from './jiraflow.js';
 import { fetchIssueContext, getIssueAssigneeAccountId } from './jira.js';
 import { loadQaScenarioCatalog } from './qaConfluence.js';
 import { buildQaProofPlan, buildQaReadinessPlan, summarizeQaPlan, type QaProofPlan } from './qaPlanner.js';
+import {
+  recordMergedReviewLessons,
+  recordReviewThreadResolutionEvidence,
+} from './reviewLearning.js';
 
 // Per-PR cap on automated fix rounds — of distinct problems AND of retries of a problem a previous
 // attempt failed to resolve (see RETRY_UNRESOLVED_SIGNALS). Reaching it blocks the watch, which is
@@ -796,6 +801,32 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
 
   if (snapshot.state === 'MERGED') {
     const mergeCommitSha = snapshot.mergeCommitSha || snapshot.headSha;
+    // Merge is the final acceptance gate for experiential review memory. Capture is idempotent and
+    // fail-open: learning can never delay or block post-merge QA/deployment verification.
+    try {
+      const recorded = await recordMergedReviewLessons({
+        repo: currentWatch.repo,
+        type: currentWatch.type,
+        baseBranch: snapshot.baseBranch,
+        prNumber: currentWatch.prNumber,
+        prUrl: snapshot.prUrl,
+        mergeCommitSha,
+        issueKey: currentWatch.issueKey,
+        labels: snapshot.labels,
+        lessons: snapshot.reviewLessons,
+      });
+      if (recorded) {
+        log.info(
+          { repo: currentWatch.repo, prNumber: currentWatch.prNumber, lessons: recorded },
+          'recorded accepted PR-review lessons'
+        );
+      }
+    } catch (err) {
+      log.warn(
+        { err, repo: currentWatch.repo, prNumber: currentWatch.prNumber },
+        'failed to record PR-review lessons; continuing merge flow'
+      );
+    }
     let recoveryRun: WorkflowRunSummary | null = null;
     if (currentWatch.status === 'prwatch:blocked') {
       recoveryRun = await recoveryWorkflowSignal(currentWatch, mergeCommitSha, log);
@@ -940,12 +971,33 @@ export async function handleGitHubWebhook(
   body: Record<string, any>,
   log: FastifyBaseLogger
 ): Promise<{ ok: true; ignored?: string }> {
+  // GitHub's generated webhook schema has no resolution timestamp on the thread object. Capture
+  // receipt at the handler boundary: this may conservatively reject a delayed pre-merge event, but
+  // it can never make a post-merge resolution look as though the merge accepted it.
+  const receivedAt = new Date().toISOString();
   if (!(await verifyGitHubSignature(rawBody, headers))) throw new Error('invalid GitHub signature');
   const deliveryId = String(headers['x-github-delivery'] ?? '');
+  const eventName = String(headers['x-github-event'] ?? '');
+  const { repo, prNumber, extraSignals } = payloadRepoAndPr(body);
+  const resolutionEvidence = reviewThreadResolutionFromWebhook(body, eventName, receivedAt);
+
+  // Record signed resolution-observation evidence before claiming the delivery. The evidence key
+  // includes GitHub's delivery id, so a transient failure can safely let GitHub retry without
+  // replacing the original receipt time.
+  // This is the only conservative way to distinguish pre-merge from post-merge resolution:
+  // GraphQL exposes current state but no resolution timestamp, and the webhook thread has none.
+  if (repo && prNumber && resolutionEvidence) {
+    await recordReviewThreadResolutionEvidence({
+      repo,
+      prNumber,
+      deliveryId,
+      ...resolutionEvidence,
+    });
+  }
+
   const firstDelivery = await rememberGitHubDelivery(deliveryId);
   if (!firstDelivery) return { ok: true, ignored: 'duplicate delivery' };
 
-  const { repo, prNumber, extraSignals } = payloadRepoAndPr(body);
   if (!repo || !prNumber) return { ok: true, ignored: 'not a watched PR event' };
 
   // A CI run on a PR with ~27 checks emits ~54 check_run events, and each one used to drive a full

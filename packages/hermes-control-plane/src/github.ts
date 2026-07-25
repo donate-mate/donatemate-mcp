@@ -7,6 +7,11 @@ import { createAppAuth } from '@octokit/auth-app';
 import { Octokit } from '@octokit/rest';
 import { getSecretJson } from './secrets.js';
 import type { PrSignal, PrWatch } from './prWatch.js';
+import {
+  listReviewThreadResolutionEvidence,
+  type ReviewLessonCandidate,
+  type ReviewThreadResolutionEvidence,
+} from './reviewLearning.js';
 
 const SECRET_GITHUB_APP = process.env.SECRET_GITHUB_APP!;
 
@@ -45,6 +50,18 @@ const annotationsCache = immutableCache<string>(1000);
 // thread, the feedback has already been handled and must not become a new signal merely because
 // Hermes's own reply changed the thread's last-comment id.
 export const HERMES_REVIEW_REPLY_MARKER_PREFIX = '<!-- hermes-review-addressed:';
+const HERMES_GITHUB_LOGIN = (process.env.HERMES_GITHUB_LOGIN ?? 'donatemate-hermes')
+  .trim()
+  .toLowerCase()
+  .replace(/\[bot\]$/, '');
+
+function isHermesReviewComment(comment: any): boolean {
+  const login = String(comment?.author?.login ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\[bot\]$/, '');
+  return Boolean(login && login === HERMES_GITHUB_LOGIN);
+}
 
 /** A rate-limit 403/429 from GitHub, as opposed to a permissions 403. */
 export function isRateLimitError(err: unknown): boolean {
@@ -82,6 +99,9 @@ export interface PrSnapshot {
   baseSha: string;
   mergeCommitSha?: string | null;
   signals: PrSignal[];
+  /** Accepted-feedback candidates. They become durable only in the merged-PR reconcile branch. */
+  reviewLessons: ReviewLessonCandidate[];
+  labels: string[];
 }
 
 export interface WorkflowRunSummary {
@@ -527,7 +547,21 @@ export function signalFromReviewThreadNode(thread: any): PrSignal | null {
   // An unresolved GitHub thread remains open until a reviewer resolves it. A Hermes reply should
   // acknowledge the fix without causing another fix job. If a reviewer replies after our marker,
   // their comment becomes `last` and produces a fresh signal as expected.
-  if (String(last.body ?? '').includes(HERMES_REVIEW_REPLY_MARKER_PREFIX)) return null;
+  // Automated reviewers can open actionable threads too. Suppression only proves that Hermes
+  // replied to the exact latest non-Hermes feedback comment; trusted-human checks belong solely to
+  // lesson capture below.
+  const latestFeedbackBeforeReply = comments
+    .slice(0, -1)
+    .reduce<any | undefined>(
+      (latest, comment) => (isHermesReviewComment(comment) ? latest : comment),
+      undefined
+    );
+  if (
+    isHermesReviewComment(last) &&
+    markerFeedbackId(last.body) === String(latestFeedbackBeforeReply?.id ?? '')
+  ) {
+    return null;
+  }
 
   const rootCommentId = Number(root?.databaseId);
   const body = comments
@@ -550,19 +584,288 @@ export function signalFromReviewThreadNode(thread: any): PrSignal | null {
   };
 }
 
-async function reviewThreadSignals(token: string, repo: string, prNumber: number): Promise<PrSignal[]> {
+const TRUSTED_REVIEW_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+const REVIEW_ACKNOWLEDGEMENT =
+  /^(?:lgtm|looks good(?: to me)?|thank(?:s| you)|done|resolved|approved|nice|great)[.! 👍✅]*$/i;
+const PROMPT_INJECTION_LANGUAGE =
+  /\b(?:ignore (?:all |any |the )?(?:previous|prior) instructions?|system (?:prompt|message)|developer message|reveal (?:a |the )?(?:secret|token|credential)|exfiltrat(?:e|ion)|you are (?:chatgpt|an ai)|begin system)\b/i;
+
+function isHermesOrBotComment(comment: any): boolean {
+  const login = String(comment?.author?.login ?? '').toLowerCase();
+  return (
+    !login ||
+    String(comment?.author?.__typename ?? '').toLowerCase() === 'bot' ||
+    isHermesReviewComment(comment) ||
+    login.endsWith('[bot]')
+  );
+}
+
+function isTrustedHumanComment(comment: any): boolean {
+  return (
+    !isHermesOrBotComment(comment) &&
+    TRUSTED_REVIEW_ASSOCIATIONS.has(String(comment?.authorAssociation ?? '').toUpperCase())
+  );
+}
+
+function cleanReviewFeedback(body: unknown, limit = 1200): string {
+  return compactText(
+    String(body ?? '')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' '),
+    limit
+  );
+}
+
+function isLearnableFeedback(body: string): boolean {
+  return body.length >= 12 && !REVIEW_ACKNOWLEDGEMENT.test(body) && !PROMPT_INJECTION_LANGUAGE.test(body);
+}
+
+function markerFixCommit(body: unknown): string | undefined {
+  const match = String(body ?? '').match(/\bcommit\s+`?([a-f0-9]{7,40})`?/i);
+  return match?.[1]?.toLowerCase();
+}
+
+function markerFeedbackId(body: unknown): string | undefined {
+  const match = String(body ?? '').match(/<!--\s*hermes-review-addressed:([A-Za-z0-9_:-]+)\s*-->/);
+  return match?.[1];
+}
+
+/**
+ * Learning is a snapshot of feedback accepted by a particular merge. A later reconcile may see
+ * comments, edits, or approvals posted after that merge, so conservatively exclude any review
+ * object whose creation/submission or latest edit is outside the immutable merge boundary.
+ */
+function reviewActivityAtOrBefore(activity: any, acceptedBefore?: string | null): boolean {
+  if (!acceptedBefore) return true;
+  const cutoffMs = Date.parse(acceptedBefore);
+  if (!Number.isFinite(cutoffMs)) return false;
+
+  const timestamps = [activity?.createdAt, activity?.submittedAt, activity?.updatedAt].filter(
+    (value): value is string => typeof value === 'string' && value.length > 0
+  );
+  return (
+    timestamps.length > 0 &&
+    timestamps.every((value) => {
+      const activityMs = Date.parse(value);
+      return Number.isFinite(activityMs) && activityMs <= cutoffMs;
+    })
+  );
+}
+
+/**
+ * Convert a review thread into a candidate lesson. This is deliberately stricter than signal
+ * detection: the author must be trusted, the content must be substantive, and GitHub/Hermes must
+ * provide evidence that the feedback was addressed. The caller still waits for PR merge before
+ * persisting it.
+ */
+export function lessonFromReviewThreadNode(
+  thread: any,
+  acceptedBefore?: string | null,
+  resolutionEvidence?: Pick<
+    ReviewThreadResolutionEvidence,
+    'resolutionObservedAt' | 'resolvedBy'
+  >
+): ReviewLessonCandidate | null {
+  const comments = ((thread?.comments?.nodes ?? []) as any[]).filter((comment) =>
+    reviewActivityAtOrBefore(comment, acceptedBefore)
+  );
+  if (!thread?.id || !comments.length) return null;
+
+  let lastNonBotHumanIndex = -1;
+  let lastMarkerIndex = -1;
+  comments.forEach((comment, index) => {
+    if (!isHermesOrBotComment(comment)) {
+      lastNonBotHumanIndex = index;
+      return;
+    }
+    if (
+      isHermesReviewComment(comment) &&
+      lastNonBotHumanIndex >= 0 &&
+      isTrustedHumanComment(comments[lastNonBotHumanIndex]) &&
+      markerFeedbackId(comment.body) === String(comments[lastNonBotHumanIndex]?.id ?? '')
+    ) {
+      lastMarkerIndex = index;
+    }
+  });
+  const hermesRepliedAfterFeedback = lastMarkerIndex > lastNonBotHumanIndex && lastNonBotHumanIndex >= 0;
+  const resolvedBeforeAcceptance =
+    Boolean(thread.isResolved) &&
+    (!acceptedBefore ||
+      Boolean(
+        resolutionEvidence?.resolutionObservedAt &&
+          reviewActivityAtOrBefore(
+            { updatedAt: resolutionEvidence.resolutionObservedAt },
+            acceptedBefore
+          )
+      ));
+  if (!resolvedBeforeAcceptance && !hermesRepliedAfterFeedback) return null;
+
+  const evidenceComments = resolvedBeforeAcceptance
+    ? comments.filter((comment) =>
+        reviewActivityAtOrBefore(comment, resolutionEvidence?.resolutionObservedAt)
+      )
+    : [comments[lastNonBotHumanIndex]];
+  const feedbackComments = evidenceComments
+    .filter(isTrustedHumanComment)
+    .map((comment) => ({ comment, text: cleanReviewFeedback(comment.body, 700) }))
+    .filter(({ text }) => isLearnableFeedback(text))
+    .slice(-3);
+  if (!feedbackComments.length) return null;
+
+  const feedback = feedbackComments
+    .map(({ comment, text }) => `${comment.author.login}: ${text}`)
+    .join('\n')
+    .slice(0, 1600);
+  const latest = feedbackComments[feedbackComments.length - 1].comment;
+  const markerComment = lastMarkerIndex >= 0 ? comments[lastMarkerIndex] : undefined;
+  const reviewers = [...new Set(feedbackComments.map(({ comment }) => String(comment.author.login)))];
+  const associations = [
+    ...new Set(feedbackComments.map(({ comment }) => String(comment.authorAssociation).toUpperCase())),
+  ];
+  const rawLine = thread.line ?? thread.originalLine;
+  const line = rawLine == null ? undefined : Number(rawLine);
+
+  return {
+    sourceId: `thread:${thread.id}`,
+    feedbackCommentId: String(latest.id ?? ''),
+    path: thread.path ? String(thread.path) : undefined,
+    line: line !== undefined && Number.isSafeInteger(line) && line > 0 ? line : undefined,
+    feedback,
+    reviewerLogins: reviewers,
+    reviewerAssociations: associations,
+    sourceUrl: String(latest.url ?? ''),
+    feedbackCreatedAt: String(latest.createdAt ?? new Date().toISOString()),
+    evidence: resolvedBeforeAcceptance ? 'thread_resolved' : 'hermes_replied',
+    resolvedBy: resolvedBeforeAcceptance
+      ? resolutionEvidence?.resolvedBy ??
+        (thread.resolvedBy?.login ? String(thread.resolvedBy.login) : undefined)
+      : undefined,
+    fixCommitSha: markerFixCommit(markerComment?.body),
+  };
+}
+
+/**
+ * A top-level CHANGES_REQUESTED review becomes learnable only when the same trusted reviewer later
+ * approves. Merge gating happens separately, so an admin-merged change request is never promoted
+ * merely because the PR closed.
+ */
+export function lessonsFromReviewNodes(
+  reviews: any[],
+  fallbackUrl = '',
+  acceptedBefore?: string | null
+): ReviewLessonCandidate[] {
+  const acceptedReviews = reviews.filter((review) =>
+    reviewActivityAtOrBefore(review, acceptedBefore)
+  );
+  return acceptedReviews.flatMap((review, index) => {
+    if (
+      String(review?.state ?? '').toUpperCase() !== 'CHANGES_REQUESTED' ||
+      !isTrustedHumanComment(review)
+    ) {
+      return [];
+    }
+    const body = cleanReviewFeedback(review.body);
+    if (!isLearnableFeedback(body)) return [];
+
+    const login = String(review.author.login);
+    const submittedAt = String(review.submittedAt ?? review.updatedAt ?? '');
+    const submittedMs = Date.parse(submittedAt);
+    const laterApproval = acceptedReviews.some((candidate) => {
+      if (
+        String(candidate?.state ?? '').toUpperCase() !== 'APPROVED' ||
+        String(candidate?.author?.login ?? '').toLowerCase() !== login.toLowerCase() ||
+        !isTrustedHumanComment(candidate)
+      ) {
+        return false;
+      }
+      const approvedMs = Date.parse(String(candidate.submittedAt ?? candidate.updatedAt ?? ''));
+      return Number.isFinite(submittedMs) && Number.isFinite(approvedMs) && approvedMs > submittedMs;
+    });
+    if (!laterApproval) return [];
+
+    const reviewId = String(review.id ?? review.databaseId ?? `${login}:${submittedAt}:${index}`);
+    return [
+      {
+        sourceId: `review:${reviewId}`,
+        feedbackCommentId: reviewId,
+        feedback: `${login}: ${body}`,
+        reviewerLogins: [login],
+        reviewerAssociations: [String(review.authorAssociation).toUpperCase()],
+        sourceUrl: String(review.url ?? fallbackUrl),
+        feedbackCreatedAt: submittedAt || new Date().toISOString(),
+        evidence: 'reviewer_approved' as const,
+      },
+    ];
+  });
+}
+
+/**
+ * Marker-based evidence is valid only while its claimed fix commit remains in the accepted PR
+ * history. Human resolution/approval evidence does not depend on a Hermes-authored commit.
+ */
+export async function filterReviewLessonsForAcceptedCommits(
+  lessons: ReviewLessonCandidate[],
+  isAcceptedCommit: (sha: string) => Promise<boolean>
+): Promise<ReviewLessonCandidate[]> {
+  const decisions = new Map<string, Promise<boolean>>();
+  const checked = await Promise.all(
+    lessons.map(async (lesson) => {
+      if (lesson.evidence !== 'hermes_replied') return lesson;
+      const sha = String(lesson.fixCommitSha ?? '').toLowerCase();
+      if (!sha) return null;
+      let decision = decisions.get(sha);
+      if (!decision) {
+        decision = isAcceptedCommit(sha).catch(() => false);
+        decisions.set(sha, decision);
+      }
+      return (await decision) ? lesson : null;
+    })
+  );
+  return checked.filter(
+    (lesson: ReviewLessonCandidate | null): lesson is ReviewLessonCandidate => Boolean(lesson)
+  );
+}
+
+interface ReviewSnapshot {
+  signals: PrSignal[];
+  lessons: ReviewLessonCandidate[];
+}
+
+async function collectReviewSnapshot(
+  token: string,
+  repo: string,
+  prNumber: number,
+  mergedAt?: string | null
+): Promise<ReviewSnapshot> {
   const { owner, name } = splitRepo(repo);
   const query = `
-    query($owner: String!, $name: String!, $number: Int!) {
+    query($owner: String!, $name: String!, $number: Int!, $after: String) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
-          reviewThreads(first: 50) {
+          reviewDecision
+          reviews(last: 50) {
+            nodes {
+              id
+              databaseId
+              state
+              body
+              url
+              submittedAt
+              updatedAt
+              authorAssociation
+              author { login __typename }
+            }
+          }
+          reviewThreads(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
             nodes {
               id
               isResolved
               isOutdated
               path
               line
+              originalLine
+              resolvedBy { login }
               comments(first: 100) {
                 nodes {
                   id
@@ -570,7 +873,9 @@ async function reviewThreadSignals(token: string, repo: string, prNumber: number
                   body
                   url
                   createdAt
-                  author { login }
+                  updatedAt
+                  authorAssociation
+                  author { login __typename }
                 }
               }
             }
@@ -578,64 +883,91 @@ async function reviewThreadSignals(token: string, repo: string, prNumber: number
         }
       }
     }`;
-  const res = await fetch('https://api.github.com/graphql', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, variables: { owner, name, number: prNumber } }),
-  });
-  if (!res.ok) throw new Error(`GitHub GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = (await res.json()) as any;
-  const threads = data.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
-  return threads.map(signalFromReviewThreadNode).filter((signal: PrSignal | null): signal is PrSignal => Boolean(signal));
-}
+  const threads: any[] = [];
+  let reviews: any[] = [];
+  let reviewDecision = '';
+  let after: string | undefined;
 
-async function reviewDecisionSignals(token: string, repo: string, prNumber: number): Promise<PrSignal[]> {
-  const { owner, name } = splitRepo(repo);
-  const query = `
-    query($owner: String!, $name: String!, $number: Int!) {
-      repository(owner: $owner, name: $name) {
-        pullRequest(number: $number) {
-          reviewDecision
-          reviews(last: 20) {
-            nodes {
-              databaseId
-              state
-              body
-              url
-              submittedAt
-              updatedAt
-              author { login }
-            }
-          }
-        }
-      }
-    }`;
-  const res = await fetch('https://api.github.com/graphql', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, variables: { owner, name, number: prNumber } }),
-  });
-  if (!res.ok) throw new Error(`GitHub GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
-
-  const data = (await res.json()) as any;
-  const pr = data.data?.repository?.pullRequest;
-  if (String(pr?.reviewDecision ?? '').toUpperCase() !== 'CHANGES_REQUESTED') return [];
-
-  const reviews = (pr.reviews?.nodes ?? []) as any[];
-  return reviews
-    .filter((review) => String(review?.state ?? '').toUpperCase() === 'CHANGES_REQUESTED')
-    .map((review) => {
-      const createdAt = review.submittedAt ?? review.updatedAt ?? new Date().toISOString();
-      const reviewId = review.databaseId ?? review.id ?? createdAt;
-      return {
-        id: `review-state:${reviewId}:${createdAt}`,
-        kind: 'review_feedback',
-        summary: `Review requested changes by ${review.author?.login ?? 'reviewer'}`,
-        details: compactText(review.body || 'Reviewer requested changes.', 1200),
-        url: review.url,
-        createdAt,
-      } as PrSignal;
+  for (let page = 0; page < 5; page++) {
+    const res = await fetch('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, variables: { owner, name, number: prNumber, after } }),
     });
+    if (!res.ok) throw new Error(`GitHub GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = (await res.json()) as any;
+    if (data.errors?.length) {
+      throw new Error(`GitHub GraphQL: ${String(data.errors[0]?.message ?? 'unknown error').slice(0, 200)}`);
+    }
+    const pr = data.data?.repository?.pullRequest;
+    if (!pr) break;
+    if (!page) {
+      reviews = pr.reviews?.nodes ?? [];
+      reviewDecision = String(pr.reviewDecision ?? '').toUpperCase();
+    }
+    const connection = pr.reviewThreads;
+    threads.push(...(connection?.nodes ?? []));
+    if (!connection?.pageInfo?.hasNextPage || !connection.pageInfo.endCursor) break;
+    after = String(connection.pageInfo.endCursor);
+  }
+
+  const threadSignals = threads
+    .map(signalFromReviewThreadNode)
+    .filter((signal: PrSignal | null): signal is PrSignal => Boolean(signal));
+  const decisionSignals =
+    reviewDecision === 'CHANGES_REQUESTED'
+      ? reviews
+          .filter((review) => String(review?.state ?? '').toUpperCase() === 'CHANGES_REQUESTED')
+          .map((review) => {
+            const createdAt = review.submittedAt ?? review.updatedAt ?? new Date().toISOString();
+            const reviewId = review.databaseId ?? review.id ?? createdAt;
+            return {
+              id: `review-state:${reviewId}:${createdAt}`,
+              kind: 'review_feedback',
+              summary: `Review requested changes by ${review.author?.login ?? 'reviewer'}`,
+              details: compactText(review.body || 'Reviewer requested changes.', 1200),
+              url: review.url,
+              createdAt,
+            } as PrSignal;
+          })
+      : [];
+  const fallbackUrl = `https://github.com/${repo}/pull/${prNumber}`;
+  const resolvedThreadIds = threads
+    .filter((thread) => Boolean(thread?.isResolved))
+    .map((thread) => String(thread.id ?? ''))
+    .filter(Boolean);
+  const resolutionEvidence =
+    mergedAt && resolvedThreadIds.length
+      ? await listReviewThreadResolutionEvidence(
+          repo,
+          prNumber,
+          resolvedThreadIds
+        ).catch(() => [])
+      : [];
+  const latestResolutionByThread = new Map<string, ReviewThreadResolutionEvidence>();
+  for (const evidence of resolutionEvidence) {
+    const current = latestResolutionByThread.get(evidence.threadId);
+    if (
+      !current ||
+      Date.parse(evidence.resolutionObservedAt) >
+        Date.parse(current.resolutionObservedAt)
+    ) {
+      latestResolutionByThread.set(evidence.threadId, evidence);
+    }
+  }
+  const lessons = [
+    ...threads
+      .map((thread) =>
+        lessonFromReviewThreadNode(
+          thread,
+          mergedAt,
+          latestResolutionByThread.get(String(thread.id ?? ''))
+        )
+      )
+      .filter((lesson: ReviewLessonCandidate | null): lesson is ReviewLessonCandidate => Boolean(lesson)),
+    ...lessonsFromReviewNodes(reviews, fallbackUrl, mergedAt),
+  ];
+  return { signals: [...threadSignals, ...decisionSignals], lessons };
 }
 
 function mergeConflictSignal(pr: any): PrSignal | null {
@@ -667,13 +999,39 @@ export async function collectPrSnapshot(watch: PrWatch, extraSignals: PrSignal[]
   const { owner, name } = splitRepo(watch.repo);
   const pr = await octokit.pulls.get({ owner, repo: name, pull_number: watch.prNumber }).then((r) => r.data);
   const headSha = pr.head.sha;
-  const checks = await checkRunSignals(octokit, watch.repo, headSha);
-  const [threadSignals, decisionSignals] = await Promise.all([
-    reviewThreadSignals(token, watch.repo, watch.prNumber),
-    reviewDecisionSignals(token, watch.repo, watch.prNumber),
+  const [checks, reviews] = await Promise.all([
+    checkRunSignals(octokit, watch.repo, headSha),
+    collectReviewSnapshot(token, watch.repo, watch.prNumber, pr.merged_at),
   ]);
   const mergeSignal = mergeConflictSignal(pr);
   const state: PrSnapshot['state'] = pr.merged ? 'MERGED' : pr.state === 'closed' ? 'CLOSED' : 'OPEN';
+  const acceptedReviewLessons =
+    state === 'MERGED'
+      ? await filterReviewLessonsForAcceptedCommits(reviews.lessons, async (fixCommitSha) => {
+          // `headSha` is the exact accepted source history even when GitHub squash/rebase merging
+          // means the original PR commits are not ancestors of `merge_commit_sha`.
+          const acceptedDescendants = [
+            headSha,
+            pr.merge_commit_sha ? String(pr.merge_commit_sha) : '',
+          ].filter((sha, index, values) => Boolean(sha) && values.indexOf(sha) === index);
+          for (const descendantSha of acceptedDescendants) {
+            if (
+              await commitContainsAncestor(
+                octokit,
+                watch.repo,
+                fixCommitSha,
+                descendantSha
+              ).catch(() => false)
+            ) {
+              return true;
+            }
+          }
+          return false;
+        })
+      : reviews.lessons;
+  const labels = (pr.labels ?? [])
+    .map((label) => (typeof label === 'string' ? label : label.name))
+    .filter((label): label is string => Boolean(label));
   return {
     repo: watch.repo,
     prNumber: watch.prNumber,
@@ -687,7 +1045,30 @@ export async function collectPrSnapshot(watch: PrWatch, extraSignals: PrSignal[]
     baseBranch: pr.base.ref,
     baseSha: pr.base.sha,
     mergeCommitSha: pr.merge_commit_sha ?? null,
-    signals: [...checks.signals, ...threadSignals, ...decisionSignals, ...(mergeSignal ? [mergeSignal] : []), ...extraSignals],
+    signals: [...checks.signals, ...reviews.signals, ...(mergeSignal ? [mergeSignal] : []), ...extraSignals],
+    reviewLessons: acceptedReviewLessons,
+    labels,
+  };
+}
+
+export function reviewThreadResolutionFromWebhook(
+  body: Record<string, any>,
+  eventName: string,
+  receivedAt: string
+): Pick<
+  ReviewThreadResolutionEvidence,
+  'threadId' | 'resolutionObservedAt' | 'resolvedBy'
+> | null {
+  if (eventName !== 'pull_request_review_thread' || String(body.action ?? '') !== 'resolved') {
+    return null;
+  }
+  const threadId = String(body.thread?.node_id ?? body.thread?.nodeId ?? '');
+  if (!threadId || !Number.isFinite(Date.parse(receivedAt))) return null;
+  const resolvedBy = String(body.sender?.login ?? '').trim();
+  return {
+    threadId,
+    resolutionObservedAt: receivedAt,
+    resolvedBy: resolvedBy || undefined,
   };
 }
 

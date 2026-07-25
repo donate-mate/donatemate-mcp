@@ -34,7 +34,7 @@ import { installWorkspace } from './workspace.js';
 import { runGate, gateSummary, type GateResult } from './gate.js';
 import { loadContract, contractPromptBlock, validatePrBody, buildReportRepairPrompt, loadReport } from './contract.js';
 import { runPreopenReview, buildReviewFixPrompt, reviewSummary } from './review.js';
-import { knowledgePromptBlock } from './knowledge.js';
+import { reviewLearningPromptBlock } from './reviewLearning.js';
 import { putMetric } from './metrics.js';
 import {
   getJob,
@@ -550,15 +550,34 @@ async function processJob(jobId: string): Promise<void> {
       prompt = `${prompt}\n\n---\n\nMerge conflict resolution context:\n${mergeConflictPrompt(job.baseBranch, mergePrep)}`;
     }
 
-    // WS6 — prepend "previously flagged patterns in this area" from the knowledge base (fail-open).
-    const kbBlock = await knowledgePromptBlock(`${job.prompt} ${jiraContext ?? ''}`, [job.repo, job.type]);
+    // Retrieve only accepted, repo-scoped review lessons that overlap this task. The lookup is
+    // bounded and fail-open, and replaces the broad external KB query on the critical startup path.
+    const reviewMemory = await reviewLearningPromptBlock({
+      repo: job.repo,
+      type: job.type,
+      queryText: `${job.prompt} ${jiraContext ?? ''} ${job.feedbackSummary ?? ''}`,
+      currentPrNumber: job.prNumber,
+    });
+    console.log(
+      `[${jobId}] review-memory lookup selected ${reviewMemory.lessonIds.length} lesson(s) in ${reviewMemory.lookupMs}ms`
+    );
+    if (reviewMemory.lessonIds.length) {
+      console.log(
+        `[${jobId}] injected accepted review lessons: ${reviewMemory.lessonIds.join(', ')}`
+      );
+    }
     const stagingDbBlock = stagingDatabasePromptBlock(job.type, issueKey ?? undefined);
     // WS3.3 — ask for the six-section outcome report up front (initial PRs only) to avoid an extra round.
     const reportInstruction = isPrFollowup
       ? ''
       : '\n\n--- OUTCOME REPORT ---\nWhen the change is complete, ALSO write an outcome report to a file named HERMES_REPORT.md at the repo root, with a level-2 Markdown heading for EACH section: Root cause, Evidence, Verification, Blast radius, Data repair, Deferred. The harness reads this into the PR description. Do not commit or push it.';
     const agentPrompt =
-      [contract ? contractPromptBlock(contract) : undefined, kbBlock || undefined, stagingDbBlock || undefined, prompt]
+      [
+        contract ? contractPromptBlock(contract) : undefined,
+        reviewMemory.block || undefined,
+        stagingDbBlock || undefined,
+        prompt,
+      ]
         .filter(Boolean)
         .join('\n\n') +
       reportInstruction;
