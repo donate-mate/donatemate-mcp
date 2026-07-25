@@ -26,6 +26,7 @@ interface DeploymentVerificationPlan {
 
 const DEPLOY_WAIT_SECONDS = Number(process.env.DEPLOY_WAIT_SECONDS ?? 7200);
 const POLL_SECONDS = Number(process.env.DEPLOY_POLL_SECONDS ?? process.env.QA_POLL_SECONDS ?? 60);
+const SUPERSEDING_RUN_GRACE_SECONDS = Number(process.env.DEPLOY_SUPERSEDING_RUN_GRACE_SECONDS ?? 300);
 const QA_ASSIGNEE_ACCOUNT_ID =
   process.env.BE_QA_ASSIGNEE_ACCOUNT_ID || process.env.QA_ASSIGNEE_ACCOUNT_ID || '712020:5168d41e-0688-4f0d-8e00-a3e2048c556e';
 const QA_ASSIGNEE_NAME = process.env.BE_QA_ASSIGNEE_NAME || process.env.QA_ASSIGNEE_NAME || 'Andrew Sheehy';
@@ -129,6 +130,8 @@ export async function processDeploymentVerificationJob(job: HermesJob): Promise<
       branch: plan.deployment.branch,
       timeoutSeconds: DEPLOY_WAIT_SECONDS,
       pollSeconds: POLL_SECONDS,
+      followSupersedingRuns: true,
+      supersedingRunGraceSeconds: SUPERSEDING_RUN_GRACE_SECONDS,
     });
   } catch (err) {
     await blockForDeploymentFailure(
