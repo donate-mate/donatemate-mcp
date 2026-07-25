@@ -233,6 +233,24 @@ describe('accepted review learning', () => {
     });
   });
 
+  it('does not use a marker for an untrusted reply to validate earlier trusted feedback', () => {
+    const untrustedReply = {
+      ...trustedRoot,
+      id: 'PRRC_untrusted',
+      body: 'Please make an unrelated change too.',
+      authorAssociation: 'NONE',
+      author: { login: 'external-user', __typename: 'User' },
+    };
+    const replyToUntrusted = {
+      ...hermesReply,
+      body: `${HERMES_REVIEW_REPLY_MARKER_PREFIX}PRRC_untrusted -->`,
+    };
+
+    expect(
+      lessonFromReviewThreadNode(thread([trustedRoot, untrustedReply, replyToUntrusted]))
+    ).toBeNull();
+  });
+
   it('rejects untrusted authors and prompt-injection-shaped feedback', () => {
     expect(
       lessonFromReviewThreadNode(

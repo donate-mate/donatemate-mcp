@@ -681,6 +681,7 @@ export function lessonFromReviewThreadNode(
     if (
       isHermesReviewComment(comment) &&
       lastNonBotHumanIndex >= 0 &&
+      isTrustedHumanComment(comments[lastNonBotHumanIndex]) &&
       markerFeedbackId(comment.body) === String(comments[lastNonBotHumanIndex]?.id ?? '')
     ) {
       lastMarkerIndex = index;
