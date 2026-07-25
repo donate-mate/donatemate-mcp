@@ -45,7 +45,9 @@ import {
   listReviewLearningBackfillWatches,
   markWatchBlocked,
   acquireReconcileLease,
+  ensureReviewLearningCapturePending,
   markReviewLearningCaptured,
+  markReviewLearningCaptureCompleted,
   markWatchQaQueued,
   markWatchReady,
   markReviewPinged,
@@ -805,21 +807,45 @@ async function rebaseOverlappingPrsAfterMerge(mergedWatch: PrWatch, log: Fastify
 /**
  * Persist review memory after merge and leave a durable capture receipt on the watch.
  *
- * An immediate merge snapshot with zero lessons gets one delayed refresh because GitHub can expose
- * the merge before its just-submitted approval appears in GraphQL. If it is still empty, leave the
- * receipt unset; the bounded completed-watch backfill will evaluate it once more after deployment
- * finishes. A completed backfill records zero as a valid terminal result so clean/no-review PRs do
- * not remain in the retry set forever.
+ * A durable capture request is created at merge before evaluating GitHub's snapshot. An immediate
+ * snapshot with zero lessons gets one delayed refresh because GitHub can expose the merge before
+ * its just-submitted approval appears in GraphQL. If it is still empty, leave the request pending;
+ * a later backfill evaluates it once more. A backfill records zero as a valid terminal result so
+ * clean/no-review PRs do not remain in the retry set forever.
  */
 async function captureMergedReviewLearning(
   watch: PrWatch,
   initialSnapshot: Awaited<ReturnType<typeof collectPrSnapshot>>,
-  log: FastifyBaseLogger
+  log: FastifyBaseLogger,
+  opts: { backfill?: boolean } = {}
 ): Promise<number> {
-  if (watch.reviewLearningCapturedAt) return watch.reviewLearningLessonCount ?? 0;
+  const isBackfill = opts.backfill === true;
+  if (watch.reviewLearningCapturedAt) {
+    await markReviewLearningCaptureCompleted(
+      watch,
+      watch.reviewLearningLessonCount ?? 0,
+      watch.reviewLearningMergeCommitSha ?? initialSnapshot.mergeCommitSha ?? initialSnapshot.headSha
+    );
+    return watch.reviewLearningLessonCount ?? 0;
+  }
 
   let snapshot = initialSnapshot;
-  const isBackfill = watch.status === 'prwatch:done';
+  let pendingRequestAvailable = isBackfill;
+  if (!isBackfill) {
+    try {
+      await ensureReviewLearningCapturePending(
+        watch,
+        snapshot.mergeCommitSha || snapshot.headSha
+      );
+      pendingRequestAvailable = true;
+    } catch (err) {
+      log.warn(
+        { err, repo: watch.repo, prNumber: watch.prNumber },
+        'could not create durable PR-review capture request; continuing immediate capture'
+      );
+    }
+  }
+
   if (!snapshot.reviewLessons.length && !isBackfill) {
     await new Promise((resolve) => setTimeout(resolve, REVIEW_LEARNING_MERGE_RETRY_MS));
     const refreshed = await collectPrSnapshot(watch);
@@ -839,8 +865,9 @@ async function captureMergedReviewLearning(
     lessons: snapshot.reviewLessons,
   });
 
-  if (shouldFinalizeReviewLearningCapture(watch, recorded)) {
+  if (shouldFinalizeReviewLearningCapture(recorded, isBackfill)) {
     const marked = await markReviewLearningCaptured(watch, recorded, mergeCommitSha);
+    await markReviewLearningCaptureCompleted(watch, recorded, mergeCommitSha);
     if (marked) {
       log.info(
         { repo: watch.repo, prNumber: watch.prNumber, lessons: recorded, backfill: isBackfill },
@@ -848,19 +875,30 @@ async function captureMergedReviewLearning(
       );
     }
   } else {
+    if (!pendingRequestAvailable) {
+      try {
+        await ensureReviewLearningCapturePending(watch, mergeCommitSha);
+        pendingRequestAvailable = true;
+      } catch (err) {
+        log.error(
+          { err, repo: watch.repo, prNumber: watch.prNumber },
+          'empty PR-review capture has no durable retry request'
+        );
+      }
+    }
     log.info(
-      { repo: watch.repo, prNumber: watch.prNumber },
-      'deferred empty PR-review learning capture to completed-watch backfill'
+      { repo: watch.repo, prNumber: watch.prNumber, durable: pendingRequestAvailable },
+      'deferred empty PR-review learning capture to durable backfill'
     );
   }
   return recorded;
 }
 
-export function shouldFinalizeReviewLearningCapture(watch: Pick<PrWatch, 'status'>, recorded: number): boolean {
-  return recorded > 0 || watch.status === 'prwatch:done';
+export function shouldFinalizeReviewLearningCapture(recorded: number, isBackfill = false): boolean {
+  return recorded > 0 || isBackfill;
 }
 
-async function backfillCompletedReviewLearning(
+async function backfillPendingReviewLearning(
   watch: PrWatch,
   log: FastifyBaseLogger
 ): Promise<void> {
@@ -868,11 +906,11 @@ async function backfillCompletedReviewLearning(
   if (snapshot.state !== 'MERGED') {
     log.warn(
       { repo: watch.repo, prNumber: watch.prNumber, state: snapshot.state },
-      'skipping PR-review learning backfill because terminal watch is not merged'
+      'skipping pending PR-review learning capture because watched PR is not merged'
     );
     return;
   }
-  await captureMergedReviewLearning(watch, snapshot, log);
+  await captureMergedReviewLearning(watch, snapshot, log, { backfill: true });
 }
 
 export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, extraSignals: PrSignal[] = []): Promise<void> {
@@ -1136,11 +1174,11 @@ export async function reconcileOpenPrs(log: FastifyBaseLogger, opts: { periodic?
     }
   }
 
-  // Completed watches are learning-only: never send them back through overlap coordination,
+  // Pending capture requests are learning-only: never send their watches back through coordination,
   // ticket transitions, or post-merge deployment orchestration.
   for (const watch of learningBackfill) {
     try {
-      await backfillCompletedReviewLearning(watch, log);
+      await backfillPendingReviewLearning(watch, log);
     } catch (err) {
       if (isRateLimitError(err)) {
         log.error(

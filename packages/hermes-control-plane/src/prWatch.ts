@@ -11,7 +11,6 @@ import {
   PutCommand,
   QueryCommand,
   UpdateCommand,
-  type QueryCommandInput,
 } from '@aws-sdk/lib-dynamodb';
 import type { WorkerType } from './jobs.js';
 
@@ -96,8 +95,22 @@ export interface PrWatch {
   expiresAt: number;
 }
 
+interface ReviewLearningCaptureRequest {
+  jobId: string;
+  status: 'reviewcapture:pending' | 'reviewcapture:done';
+  watchJobId: string;
+  repo: string;
+  prNumber: number;
+  mergeCommitSha: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: number;
+}
+
 const ttl = () => Math.floor(Date.now() / 1000) + 30 * 24 * 3600;
 export const prWatchKey = (repo: string, prNumber: number): string => `prwatch:${repo}#${prNumber}`;
+export const reviewLearningCaptureKey = (repo: string, prNumber: number): string =>
+  `reviewcapture:${repo}#${prNumber}`;
 
 export async function getPrWatch(repo: string, prNumber: number): Promise<PrWatch | undefined> {
   const res = await ddb.send(new GetCommand({ TableName: TABLE, Key: { jobId: prWatchKey(repo, prNumber) } }));
@@ -138,41 +151,112 @@ export async function listBlockedPrWatches(): Promise<PrWatch[]> {
 }
 
 /**
- * Recently completed watches whose single-shot merge capture never left a durable receipt.
+ * Durable merge-time capture requests that have passed the GitHub settle delay.
  *
- * A final approval and the pull_request.closed webhook can race GitHub's GraphQL review view. Once
- * the watch becomes done it is no longer part of the normal reconcile sweep, so without this
- * bounded backfill a transiently empty merge snapshot is permanent.
+ * Requests have their own status-index partition, timestamped when merge completion is observed.
+ * The query therefore selects pending work directly: long-lived PRs are not excluded by their
+ * original watch timestamp, and newer completed watches cannot starve older requests behind a
+ * filtered/page-capped query.
  */
 export async function listReviewLearningBackfillWatches(maxResults = 25): Promise<PrWatch[]> {
-  const configuredDays = Number(process.env.REVIEW_LEARNING_BACKFILL_DAYS ?? 14);
-  const days = Number.isFinite(configuredDays) ? Math.max(1, Math.floor(configuredDays)) : 14;
-  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  const watches: PrWatch[] = [];
-  let cursor: QueryCommandInput['ExclusiveStartKey'];
+  const configuredDelay = Number(process.env.REVIEW_LEARNING_BACKFILL_DELAY_SECONDS ?? 60);
+  const delaySeconds = Number.isFinite(configuredDelay) ? Math.max(0, configuredDelay) : 60;
+  const readyBefore = new Date(Date.now() - delaySeconds * 1000).toISOString();
+  const res = await ddb.send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'status-index',
+      KeyConditionExpression: '#s = :s AND createdAt <= :readyBefore',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: {
+        ':s': 'reviewcapture:pending',
+        ':readyBefore': readyBefore,
+      },
+      ScanIndexForward: true,
+      Limit: Math.max(1, Math.floor(maxResults)),
+    })
+  );
+  const requests = (res.Items ?? []) as ReviewLearningCaptureRequest[];
+  const watches = await Promise.all(
+    requests.map(async (request) => {
+      const watch = await ddb.send(
+        new GetCommand({ TableName: TABLE, Key: { jobId: request.watchJobId } })
+      );
+      return watch.Item as PrWatch | undefined;
+    })
+  );
+  return watches.filter((watch): watch is PrWatch => Boolean(watch));
+}
 
-  for (let page = 0; page < 5 && watches.length < maxResults; page++) {
-    const res = await ddb.send(
-      new QueryCommand({
+/**
+ * Create a durable retry request before the merge snapshot is evaluated.
+ *
+ * The deterministic key plus conditional put makes this an outbox receipt: duplicate webhook
+ * replicas cannot create duplicate work, and a completed request cannot be recreated by a stale
+ * replica. Its createdAt is the merge-observed timestamp used by the delayed status-index query.
+ */
+export async function ensureReviewLearningCapturePending(
+  watch: PrWatch,
+  mergeCommitSha: string
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  try {
+    await ddb.send(
+      new PutCommand({
         TableName: TABLE,
-        IndexName: 'status-index',
-        KeyConditionExpression: '#s = :s AND createdAt >= :cutoff',
-        FilterExpression: 'attribute_not_exists(reviewLearningCapturedAt)',
-        ExpressionAttributeNames: { '#s': 'status' },
-        ExpressionAttributeValues: {
-          ':s': 'prwatch:done',
-          ':cutoff': cutoff,
-        },
-        ScanIndexForward: false,
-        Limit: 100,
-        ExclusiveStartKey: cursor,
+        Item: {
+          jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber),
+          status: 'reviewcapture:pending',
+          watchJobId: watch.jobId,
+          repo: watch.repo,
+          prNumber: watch.prNumber,
+          mergeCommitSha,
+          createdAt: now,
+          updatedAt: now,
+          expiresAt: ttl(),
+        } satisfies ReviewLearningCaptureRequest,
+        ConditionExpression: 'attribute_not_exists(jobId)',
       })
     );
-    watches.push(...((res.Items ?? []) as PrWatch[]));
-    cursor = res.LastEvaluatedKey;
-    if (!cursor) break;
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
   }
-  return watches.slice(0, maxResults);
+}
+
+/** Retire the durable capture request after the watch has its terminal capture receipt. */
+export async function markReviewLearningCaptureCompleted(
+  watch: PrWatch,
+  lessonCount: number,
+  mergeCommitSha: string
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber) },
+        UpdateExpression:
+          'SET #s = :done, lessonCount = :lessonCount, mergeCommitSha = :mergeCommitSha, capturedAt = :capturedAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+        ConditionExpression: '#s = :pending',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':pending': 'reviewcapture:pending',
+          ':done': 'reviewcapture:done',
+          ':lessonCount': Math.max(0, Math.floor(lessonCount)),
+          ':mergeCommitSha': mergeCommitSha,
+          ':capturedAt': now,
+          ':updatedAt': now,
+          ':expiresAt': ttl(),
+        },
+      })
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
 }
 
 /** Mark review-learning capture exactly once so concurrent webhook replicas remain idempotent. */
@@ -181,18 +265,22 @@ export async function markReviewLearningCaptured(
   lessonCount: number,
   mergeCommitSha: string
 ): Promise<boolean> {
+  const now = new Date().toISOString();
   try {
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { jobId: watch.jobId },
         UpdateExpression:
-          'SET reviewLearningCapturedAt = :capturedAt, reviewLearningLessonCount = :lessonCount, reviewLearningMergeCommitSha = :mergeCommitSha',
-        ConditionExpression: 'attribute_not_exists(reviewLearningCapturedAt)',
+          'SET reviewLearningCapturedAt = :capturedAt, reviewLearningLessonCount = :lessonCount, reviewLearningMergeCommitSha = :mergeCommitSha, updatedAt = :updatedAt, expiresAt = :expiresAt',
+        ConditionExpression:
+          'attribute_exists(jobId) AND attribute_not_exists(reviewLearningCapturedAt)',
         ExpressionAttributeValues: {
-          ':capturedAt': new Date().toISOString(),
+          ':capturedAt': now,
           ':lessonCount': Math.max(0, Math.floor(lessonCount)),
           ':mergeCommitSha': mergeCommitSha,
+          ':updatedAt': now,
+          ':expiresAt': ttl(),
         },
       })
     );

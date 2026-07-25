@@ -143,12 +143,12 @@ describe('reviewReplyTargetsForSignals', () => {
 });
 
 describe('review-learning capture completion', () => {
-  it('defers an empty merge snapshot until the completed-watch backfill', () => {
-    expect(shouldFinalizeReviewLearningCapture(watch(), 0)).toBe(false);
+  it('defers an empty merge snapshot until the durable pending request is retried', () => {
+    expect(shouldFinalizeReviewLearningCapture(0)).toBe(false);
   });
 
-  it('finalizes an accepted lesson immediately and a zero-lesson terminal backfill exactly once', () => {
-    expect(shouldFinalizeReviewLearningCapture(watch(), 1)).toBe(true);
-    expect(shouldFinalizeReviewLearningCapture(watch({ status: 'prwatch:done' }), 0)).toBe(true);
+  it('finalizes an accepted lesson immediately and a zero-lesson backfill exactly once', () => {
+    expect(shouldFinalizeReviewLearningCapture(1)).toBe(true);
+    expect(shouldFinalizeReviewLearningCapture(0, true)).toBe(true);
   });
 });
