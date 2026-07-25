@@ -543,9 +543,15 @@ export function signalFromReviewThreadNode(thread: any): PrSignal | null {
   // An unresolved GitHub thread remains open until a reviewer resolves it. A Hermes reply should
   // acknowledge the fix without causing another fix job. If a reviewer replies after our marker,
   // their comment becomes `last` and produces a fresh signal as expected.
+  const latestHumanBeforeReply = comments
+    .slice(0, -1)
+    .reduce<any | undefined>(
+      (latest, comment) => (isHermesOrBotComment(comment) ? latest : comment),
+      undefined
+    );
   if (
     isHermesReviewComment(last) &&
-    String(last.body ?? '').includes(HERMES_REVIEW_REPLY_MARKER_PREFIX)
+    markerFeedbackId(last.body) === String(latestHumanBeforeReply?.id ?? '')
   ) {
     return null;
   }
@@ -612,28 +618,63 @@ function markerFixCommit(body: unknown): string | undefined {
   return match?.[1]?.toLowerCase();
 }
 
+function markerFeedbackId(body: unknown): string | undefined {
+  const match = String(body ?? '').match(/<!--\s*hermes-review-addressed:([A-Za-z0-9_:-]+)\s*-->/);
+  return match?.[1];
+}
+
+/**
+ * Learning is a snapshot of feedback accepted by a particular merge. A later reconcile may see
+ * comments, edits, or approvals posted after that merge, so conservatively exclude any review
+ * object whose creation/submission or latest edit is outside the immutable merge boundary.
+ */
+function reviewActivityAtOrBefore(activity: any, acceptedBefore?: string | null): boolean {
+  if (!acceptedBefore) return true;
+  const cutoffMs = Date.parse(acceptedBefore);
+  if (!Number.isFinite(cutoffMs)) return false;
+
+  const timestamps = [activity?.createdAt, activity?.submittedAt, activity?.updatedAt].filter(
+    (value): value is string => typeof value === 'string' && value.length > 0
+  );
+  return (
+    timestamps.length > 0 &&
+    timestamps.every((value) => {
+      const activityMs = Date.parse(value);
+      return Number.isFinite(activityMs) && activityMs <= cutoffMs;
+    })
+  );
+}
+
 /**
  * Convert a review thread into a candidate lesson. This is deliberately stricter than signal
  * detection: the author must be trusted, the content must be substantive, and GitHub/Hermes must
  * provide evidence that the feedback was addressed. The caller still waits for PR merge before
  * persisting it.
  */
-export function lessonFromReviewThreadNode(thread: any): ReviewLessonCandidate | null {
-  const comments = (thread?.comments?.nodes ?? []) as any[];
+export function lessonFromReviewThreadNode(
+  thread: any,
+  acceptedBefore?: string | null
+): ReviewLessonCandidate | null {
+  const comments = ((thread?.comments?.nodes ?? []) as any[]).filter((comment) =>
+    reviewActivityAtOrBefore(comment, acceptedBefore)
+  );
   if (!thread?.id || !comments.length) return null;
 
-  const lastNonBotHumanIndex = comments.reduce(
-    (last, comment, index) => (isHermesOrBotComment(comment) ? last : index),
-    -1
-  );
-  const lastMarkerIndex = comments.reduce(
-    (last, comment, index) =>
+  let lastNonBotHumanIndex = -1;
+  let lastMarkerIndex = -1;
+  comments.forEach((comment, index) => {
+    if (!isHermesOrBotComment(comment)) {
+      lastNonBotHumanIndex = index;
+      return;
+    }
+    if (
       isHermesReviewComment(comment) &&
-      String(comment?.body ?? '').includes(HERMES_REVIEW_REPLY_MARKER_PREFIX)
-        ? index
-        : last,
-    -1
-  );
+      lastNonBotHumanIndex >= 0 &&
+      markerFeedbackId(comment.body) === String(comments[lastNonBotHumanIndex]?.id ?? '')
+    ) {
+      lastMarkerIndex = index;
+    }
+  });
   const hermesRepliedAfterFeedback = lastMarkerIndex > lastNonBotHumanIndex && lastNonBotHumanIndex >= 0;
   if (!thread.isResolved && !hermesRepliedAfterFeedback) return null;
 
@@ -680,8 +721,15 @@ export function lessonFromReviewThreadNode(thread: any): ReviewLessonCandidate |
  * approves. Merge gating happens separately, so an admin-merged change request is never promoted
  * merely because the PR closed.
  */
-export function lessonsFromReviewNodes(reviews: any[], fallbackUrl = ''): ReviewLessonCandidate[] {
-  return reviews.flatMap((review, index) => {
+export function lessonsFromReviewNodes(
+  reviews: any[],
+  fallbackUrl = '',
+  acceptedBefore?: string | null
+): ReviewLessonCandidate[] {
+  const acceptedReviews = reviews.filter((review) =>
+    reviewActivityAtOrBefore(review, acceptedBefore)
+  );
+  return acceptedReviews.flatMap((review, index) => {
     if (
       String(review?.state ?? '').toUpperCase() !== 'CHANGES_REQUESTED' ||
       !isTrustedHumanComment(review)
@@ -694,7 +742,7 @@ export function lessonsFromReviewNodes(reviews: any[], fallbackUrl = ''): Review
     const login = String(review.author.login);
     const submittedAt = String(review.submittedAt ?? review.updatedAt ?? '');
     const submittedMs = Date.parse(submittedAt);
-    const laterApproval = reviews.some((candidate) => {
+    const laterApproval = acceptedReviews.some((candidate) => {
       if (
         String(candidate?.state ?? '').toUpperCase() !== 'APPROVED' ||
         String(candidate?.author?.login ?? '').toLowerCase() !== login.toLowerCase() ||
@@ -728,7 +776,12 @@ interface ReviewSnapshot {
   lessons: ReviewLessonCandidate[];
 }
 
-async function collectReviewSnapshot(token: string, repo: string, prNumber: number): Promise<ReviewSnapshot> {
+async function collectReviewSnapshot(
+  token: string,
+  repo: string,
+  prNumber: number,
+  mergedAt?: string | null
+): Promise<ReviewSnapshot> {
   const { owner, name } = splitRepo(repo);
   const query = `
     query($owner: String!, $name: String!, $number: Int!, $after: String) {
@@ -826,9 +879,9 @@ async function collectReviewSnapshot(token: string, repo: string, prNumber: numb
   const fallbackUrl = `https://github.com/${repo}/pull/${prNumber}`;
   const lessons = [
     ...threads
-      .map(lessonFromReviewThreadNode)
+      .map((thread) => lessonFromReviewThreadNode(thread, mergedAt))
       .filter((lesson: ReviewLessonCandidate | null): lesson is ReviewLessonCandidate => Boolean(lesson)),
-    ...lessonsFromReviewNodes(reviews, fallbackUrl),
+    ...lessonsFromReviewNodes(reviews, fallbackUrl, mergedAt),
   ];
   return { signals: [...threadSignals, ...decisionSignals], lessons };
 }
@@ -864,7 +917,7 @@ export async function collectPrSnapshot(watch: PrWatch, extraSignals: PrSignal[]
   const headSha = pr.head.sha;
   const [checks, reviews] = await Promise.all([
     checkRunSignals(octokit, watch.repo, headSha),
-    collectReviewSnapshot(token, watch.repo, watch.prNumber),
+    collectReviewSnapshot(token, watch.repo, watch.prNumber, pr.merged_at),
   ]);
   const mergeSignal = mergeConflictSignal(pr);
   const state: PrSnapshot['state'] = pr.merged ? 'MERGED' : pr.state === 'closed' ? 'CLOSED' : 'OPEN';

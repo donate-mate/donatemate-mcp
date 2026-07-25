@@ -73,6 +73,7 @@ describe('rankReviewLessons', () => {
       [
         lesson(),
         duplicate,
+        lesson({ jobId: 'review-memory:expired', expiresAt: 1, feedbackHash: 'expired' }),
         lesson({ jobId: 'review-memory:current', prNumber: 772, feedbackHash: 'current' }),
         lesson({ jobId: 'review-memory:other-repo', repo: 'other/repo', feedbackHash: 'other' }),
       ],

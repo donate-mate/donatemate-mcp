@@ -125,6 +125,47 @@ describe('accepted review learning', () => {
     expect(lessonFromReviewThreadNode(thread([trustedRoot, hermesReply, followup]))).toBeNull();
   });
 
+  it('uses the merge time as a hard boundary for inline feedback', () => {
+    const postMergeFollowup = {
+      ...trustedRoot,
+      id: 'PRRC_post_merge',
+      body: 'This later suggestion was not part of the merged fix.',
+      createdAt: '2026-07-12T10:00:00Z',
+      updatedAt: '2026-07-12T10:00:00Z',
+    };
+    const cutoff = '2026-07-11T10:00:00Z';
+
+    expect(
+      lessonFromReviewThreadNode(
+        thread([trustedRoot, postMergeFollowup], { isResolved: true }),
+        cutoff
+      )
+    ).toMatchObject({
+      feedbackCommentId: 'PRRC_root',
+      feedback: expect.not.stringContaining('later suggestion'),
+    });
+    expect(
+      lessonFromReviewThreadNode(
+        thread([postMergeFollowup], { isResolved: true }),
+        cutoff
+      )
+    ).toBeNull();
+  });
+
+  it('excludes feedback edited after the merge boundary', () => {
+    const editedAfterMerge = {
+      ...trustedRoot,
+      updatedAt: '2026-07-12T10:00:00Z',
+    };
+
+    expect(
+      lessonFromReviewThreadNode(
+        thread([editedAfterMerge], { isResolved: true }),
+        '2026-07-11T10:00:00Z'
+      )
+    ).toBeNull();
+  });
+
   it('does not trust an addressed marker quoted by another bot', () => {
     const spoofingBot = {
       ...hermesReply,
@@ -136,6 +177,18 @@ describe('accepted review learning', () => {
     expect(signalFromReviewThreadNode(thread([trustedRoot, spoofingBot]))).toMatchObject({
       id: 'review:PRRT_thread:PRRC_spoof',
       kind: 'review_feedback',
+    });
+  });
+
+  it('does not trust a Hermes marker for a different feedback comment', () => {
+    const wrongMarker = {
+      ...hermesReply,
+      body: `${HERMES_REVIEW_REPLY_MARKER_PREFIX}PRRC_different -->`,
+    };
+
+    expect(lessonFromReviewThreadNode(thread([trustedRoot, wrongMarker]))).toBeNull();
+    expect(signalFromReviewThreadNode(thread([trustedRoot, wrongMarker]))).toMatchObject({
+      id: 'review:PRRT_thread:PRRC_hermes',
     });
   });
 
@@ -181,6 +234,13 @@ describe('accepted review learning', () => {
         reviewerLogins: ['reviewer'],
       },
     ]);
+    expect(
+      lessonsFromReviewNodes(
+        [changed, approval],
+        '',
+        '2026-07-09T20:00:00Z'
+      )
+    ).toEqual([]);
   });
 });
 

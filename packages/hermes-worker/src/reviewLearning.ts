@@ -56,6 +56,7 @@ export interface StoredReviewLesson {
   feedbackCreatedAt: string;
   learnedAt: string;
   createdAt: string;
+  expiresAt?: number;
 }
 
 export interface RankedReviewLesson {
@@ -172,6 +173,9 @@ export function rankReviewLessons(
     if (
       lesson.repo !== context.repo ||
       lesson.prNumber === context.currentPrNumber ||
+      (typeof lesson.expiresAt === 'number' &&
+        Number.isFinite(lesson.expiresAt) &&
+        lesson.expiresAt <= Math.floor(nowMs / 1000)) ||
       !lesson.feedback?.trim()
     ) {
       return [];
