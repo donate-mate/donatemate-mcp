@@ -6,7 +6,10 @@
 import { ECSClient, UpdateTaskProtectionCommand } from '@aws-sdk/client-ecs';
 
 const ecs = new ECSClient({});
-const DEFAULT_PROTECTION_MINUTES = 120;
+// The longest enabled workflow wait budget is 120 minutes. Keep 45 minutes for setup, polling
+// alignment, reporting, and cleanup while remaining below CloudFormation's three-hour ECS update
+// ceiling.
+const DEFAULT_PROTECTION_MINUTES = 165;
 const DEFAULT_RENEW_SECONDS = 10 * 60;
 
 export function taskProtectionConfig(env: NodeJS.ProcessEnv = process.env): {

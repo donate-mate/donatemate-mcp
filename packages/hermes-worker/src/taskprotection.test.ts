@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { taskProtectionConfig } from './taskprotection.js';
 
 describe('taskProtectionConfig', () => {
-  it('uses a two-hour initial lease and renews every ten minutes by default', () => {
+  it('uses a lease longer than the two-hour workflow waits and renews every ten minutes', () => {
     expect(taskProtectionConfig({})).toEqual({
-      protectionMinutes: 120,
+      protectionMinutes: 165,
       renewSeconds: 600,
     });
   });
@@ -26,7 +26,7 @@ describe('taskProtectionConfig', () => {
         TASK_PROTECTION_RENEW_SECONDS: 'not-a-number',
       })
     ).toEqual({
-      protectionMinutes: 120,
+      protectionMinutes: 165,
       renewSeconds: 600,
     });
   });
