@@ -268,6 +268,9 @@ The learning gate is intentionally conservative:
    verification.
    A cursor-backed, one-time migration seeds requests for recently completed legacy watches using
    their terminal-update timestamp and advances only after each evaluated page is durably queued.
+   Missing watches are retired immediately; isolated capture failures are dead-lettered after five
+   attempts so poison requests cannot starve newer captures. Shared rate limits do not consume an
+   attempt.
 5. The worker ranks within the same repo using file/module and task-token overlap, deduplicates
    repeated feedback, excludes the current PR, and injects at most five lessons. No relevance match
    means no memory block.
@@ -393,6 +396,7 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `REVIEW_LEARNING_OPTOUT_LABEL` | `hermes-no-learn` |
 | `REVIEW_LEARNING_MERGE_RETRY_MS` | `1500` |
 | `REVIEW_LEARNING_BACKFILL_DELAY_SECONDS` | `60` |
+| `REVIEW_LEARNING_BACKFILL_MAX_ATTEMPTS` | `5` |
 | `REVIEW_LEARNING_LEGACY_MIGRATION_DAYS` | `30` |
 | `QA_BUILD_WORKFLOW_ID` | `staging.yml` |
 | `QA_AUTOMATION_ENABLED` | `false` |

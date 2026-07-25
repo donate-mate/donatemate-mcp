@@ -97,7 +97,11 @@ export interface PrWatch {
 
 interface ReviewLearningCaptureRequest {
   jobId: string;
-  status: 'reviewcapture:pending' | 'reviewcapture:done' | 'reviewcapture:orphaned';
+  status:
+    | 'reviewcapture:pending'
+    | 'reviewcapture:done'
+    | 'reviewcapture:orphaned'
+    | 'reviewcapture:failed';
   watchJobId: string;
   repo: string;
   prNumber: number;
@@ -360,6 +364,71 @@ export async function markReviewLearningCaptureCompleted(
     return true;
   } catch (err) {
     if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * Count an isolated backfill failure and dead-letter a poison request after a bounded number of
+ * sweeps. Shared GitHub rate-limit failures are handled by the caller and never charged here.
+ */
+export async function recordReviewLearningCaptureFailure(
+  watch: PrWatch,
+  error: unknown
+): Promise<{ attempts: number; terminal: boolean }> {
+  const configuredMax = Number(process.env.REVIEW_LEARNING_BACKFILL_MAX_ATTEMPTS ?? 5);
+  const maxAttempts = Number.isFinite(configuredMax) ? Math.max(1, Math.floor(configuredMax)) : 5;
+  const now = new Date().toISOString();
+  const message = (error instanceof Error ? `${error.name}: ${error.message}` : String(error)).slice(
+    0,
+    1000
+  );
+  try {
+    const result = await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber) },
+        UpdateExpression:
+          'SET lastError = :lastError, lastFailedAt = :lastFailedAt, updatedAt = :updatedAt, expiresAt = :expiresAt ADD failureCount :one',
+        ConditionExpression: '#s = :pending',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':pending': 'reviewcapture:pending',
+          ':lastError': message,
+          ':lastFailedAt': now,
+          ':updatedAt': now,
+          ':expiresAt': ttl(),
+          ':one': 1,
+        },
+        ReturnValues: 'ALL_NEW',
+      })
+    );
+    const attempts = Number(result.Attributes?.failureCount ?? 0);
+    if (attempts < maxAttempts) return { attempts, terminal: false };
+
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber) },
+        UpdateExpression:
+          'SET #s = :failed, failedAt = :failedAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+        ConditionExpression: '#s = :pending AND failureCount >= :maxAttempts',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':pending': 'reviewcapture:pending',
+          ':failed': 'reviewcapture:failed',
+          ':failedAt': now,
+          ':updatedAt': now,
+          ':expiresAt': ttl(),
+          ':maxAttempts': maxAttempts,
+        },
+      })
+    );
+    return { attempts, terminal: true };
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      return { attempts: 0, terminal: false };
+    }
     throw err;
   }
 }

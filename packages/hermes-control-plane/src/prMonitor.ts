@@ -49,6 +49,7 @@ import {
   ensureReviewLearningCapturePending,
   markReviewLearningCaptured,
   markReviewLearningCaptureCompleted,
+  recordReviewLearningCaptureFailure,
   markWatchQaQueued,
   markWatchReady,
   markReviewPinged,
@@ -905,11 +906,9 @@ async function backfillPendingReviewLearning(
 ): Promise<void> {
   const snapshot = await collectPrSnapshot(watch);
   if (snapshot.state !== 'MERGED') {
-    log.warn(
-      { repo: watch.repo, prNumber: watch.prNumber, state: snapshot.state },
-      'skipping pending PR-review learning capture because watched PR is not merged'
+    throw new Error(
+      `pending PR-review capture expected a merged PR but GitHub returned ${snapshot.state}`
     );
-    return;
   }
   await captureMergedReviewLearning(watch, snapshot, log, { backfill: true });
 }
@@ -1203,8 +1202,23 @@ export async function reconcileOpenPrs(log: FastifyBaseLogger, opts: { periodic?
         );
         return;
       }
+      const failure = await recordReviewLearningCaptureFailure(watch, err).catch(
+        (failureError) => {
+          log.warn(
+            { err: failureError, repo: watch.repo, prNumber: watch.prNumber },
+            'failed to update PR-review capture retry state'
+          );
+          return { attempts: 0, terminal: false };
+        }
+      );
       log.error(
-        { err, repo: watch.repo, prNumber: watch.prNumber },
+        {
+          err,
+          repo: watch.repo,
+          prNumber: watch.prNumber,
+          captureAttempts: failure.attempts,
+          captureDeadLettered: failure.terminal,
+        },
         'PR-review learning backfill failed'
       );
     }
