@@ -13,7 +13,7 @@
  */
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { runProcessWithTimeout } from './agent.js';
+import { InfrastructureCommandTimeoutError, runProcessWithTimeout } from './agent.js';
 
 const INSTALL_TIMEOUT_MS = Number(process.env.WORKSPACE_INSTALL_TIMEOUT_SECONDS ?? 600) * 1000;
 const LOG_CAP = 24 * 1024;
@@ -43,16 +43,26 @@ function run(cmd: string, args: string[], cwd: string, extraEnv: NodeJS.ProcessE
     env: { ...process.env, CI: 'true', ...extraEnv },
     timeoutMs: INSTALL_TIMEOUT_MS,
   })
-    .then((result) => ({
-      code: result.timedOut ? 124 : result.code,
-      out: `${result.stdout}\n${result.stderr}`.trim().slice(-LOG_CAP),
-      timedOut: result.timedOut,
-    }))
-    .catch((error) => ({
-      code: 127,
-      out: error instanceof Error ? error.message : String(error),
-      timedOut: false,
-    }));
+    .then((result) => {
+      if (result.timedOut) {
+        // A daemonized install child may no longer be discoverable after its wrapper exits.
+        // Restart the ECS task before retry so no escaped process reaches the next job.
+        throw new InfrastructureCommandTimeoutError(`workspace install: ${cmd}`, INSTALL_TIMEOUT_MS);
+      }
+      return {
+        code: result.code,
+        out: `${result.stdout}\n${result.stderr}`.trim().slice(-LOG_CAP),
+        timedOut: false,
+      };
+    })
+    .catch((error) => {
+      if (error instanceof InfrastructureCommandTimeoutError) throw error;
+      return {
+        code: 127,
+        out: error instanceof Error ? error.message : String(error),
+        timedOut: false,
+      };
+    });
 }
 
 async function exists(path: string): Promise<boolean> {

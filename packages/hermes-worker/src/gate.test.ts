@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runGate, runGateCommand } from './gate.js';
+import { InfrastructureCommandTimeoutError } from './agent.js';
 
 const exec = promisify(execFile);
 const cleanup: string[] = [];
@@ -61,7 +62,7 @@ describe('runGate merge-conflict scope', () => {
 });
 
 describe('runGateCommand timeout', () => {
-  it('terminates command descendants and reports a non-zero timeout result', async () => {
+  it('terminates command descendants and requires a clean container before retry', async () => {
     const grandchild = 'setTimeout(() => process.exit(0), 3000);';
     const parent = [
       "const { spawn } = require('node:child_process');",
@@ -70,22 +71,21 @@ describe('runGateCommand timeout', () => {
     ].join('');
     const startedAt = Date.now();
 
-    const result = await runGateCommand(process.execPath, ['-e', parent], process.cwd(), 100);
-
-    expect(result.timedOut).toBe(true);
-    expect(result.code).not.toBe(0);
+    await expect(runGateCommand(process.execPath, ['-e', parent], process.cwd(), 100)).rejects.toBeInstanceOf(
+      InfrastructureCommandTimeoutError
+    );
     expect(Date.now() - startedAt).toBeLessThan(1500);
   });
 
-  it('overrides a successful parent exit when inherited pipes remain open past the deadline', async () => {
+  it('requires a clean container when a successful parent leaves inherited pipes open', async () => {
     const grandchild = 'setTimeout(() => process.exit(0), 3000);';
     const parent = [
       "const { spawn } = require('node:child_process');",
       `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: ['ignore', 'inherit', 'inherit'] });`,
     ].join('');
 
-    const result = await runGateCommand(process.execPath, ['-e', parent], process.cwd(), 100);
-
-    expect(result).toMatchObject({ timedOut: true, code: 124 });
+    await expect(runGateCommand(process.execPath, ['-e', parent], process.cwd(), 100)).rejects.toBeInstanceOf(
+      InfrastructureCommandTimeoutError
+    );
   });
 });

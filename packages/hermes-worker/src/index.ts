@@ -29,7 +29,7 @@ import {
   prepareMergeConflictResolution,
   type MergeConflictPreparation,
 } from './github.js';
-import { AgentTimeoutError, runAgent } from './agent.js';
+import { ContainerRestartRequiredError, runAgent } from './agent.js';
 import { installWorkspace } from './workspace.js';
 import { runGate, gateSummary, type GateResult } from './gate.js';
 import { loadContract, contractPromptBlock, validatePrBody, buildReportRepairPrompt, loadReport } from './contract.js';
@@ -818,7 +818,7 @@ async function processJob(jobId: string): Promise<void> {
       );
     }
     // Preserve the original classification even if every best-effort reporting operation fails.
-    // AgentTimeoutError must reach loop() so the container exits before SQS redelivery.
+    // ContainerRestartRequiredError must reach loop() so the container exits before SQS redelivery.
     throw err; // do not delete the SQS message → redelivery, then DLQ
   } finally {
     stopHeartbeat();
@@ -871,7 +871,7 @@ async function loop(): Promise<void> {
         // A timed-out command may have deliberately escaped the Codex process group. processJob
         // has already recorded the failure, cleaned the workspace, and released task protection;
         // exit this container so ECS removes any last escaped process before SQS redelivery.
-        if (err instanceof AgentTimeoutError) throw err;
+        if (err instanceof ContainerRestartRequiredError) throw err;
       } finally {
         stopVisibilityHeartbeat();
       }

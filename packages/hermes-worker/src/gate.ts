@@ -15,7 +15,7 @@ import { execFile } from 'node:child_process';
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { promisify } from 'node:util';
-import { runProcessWithTimeout } from './agent.js';
+import { InfrastructureCommandTimeoutError, runProcessWithTimeout } from './agent.js';
 import { detectPackageManager, workspaceScriptCommand, type PackageManager } from './workspace.js';
 
 const execFileP = promisify(execFile);
@@ -88,16 +88,26 @@ export function runGateCommand(
     env,
     timeoutMs,
   })
-    .then((result) => ({
-      code: result.timedOut ? 124 : result.code,
-      out: `${result.stdout}\n${result.stderr}`.trim().slice(-OUT_CAP),
-      timedOut: result.timedOut,
-    }))
-    .catch((error) => ({
-      code: 127,
-      out: error instanceof Error ? error.message : String(error),
-      timedOut: false,
-    }));
+    .then((result) => {
+      if (result.timedOut) {
+        // The wrapper may have exited after daemonizing a child, making that child unobservable
+        // through /proc. Force a fresh ECS task before SQS retry instead of continuing this worker.
+        throw new InfrastructureCommandTimeoutError(`gate: ${cmd}`, timeoutMs);
+      }
+      return {
+        code: result.code,
+        out: `${result.stdout}\n${result.stderr}`.trim().slice(-OUT_CAP),
+        timedOut: false,
+      };
+    })
+    .catch((error) => {
+      if (error instanceof InfrastructureCommandTimeoutError) throw error;
+      return {
+        code: 127,
+        out: error instanceof Error ? error.message : String(error),
+        timedOut: false,
+      };
+    });
 }
 
 async function fileExists(path: string): Promise<boolean> {
