@@ -43,6 +43,7 @@ import {
   listActivePrWatches,
   listBlockedPrWatches,
   listReviewLearningBackfillWatches,
+  hasCurrentReviewLearningCapture,
   seedLegacyReviewLearningCaptureRequests,
   markWatchBlocked,
   acquireReconcileLease,
@@ -822,7 +823,7 @@ async function captureMergedReviewLearning(
   opts: { backfill?: boolean } = {}
 ): Promise<number> {
   const isBackfill = opts.backfill === true;
-  if (watch.reviewLearningCapturedAt) {
+  if (hasCurrentReviewLearningCapture(watch)) {
     await markReviewLearningCaptureCompleted(
       watch,
       watch.reviewLearningLessonCount ?? 0,

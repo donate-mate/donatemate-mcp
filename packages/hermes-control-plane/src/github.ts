@@ -602,6 +602,9 @@ export function signalFromReviewThreadNode(thread: any): PrSignal | null {
 }
 
 const TRUSTED_REVIEW_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+const TRUSTED_REVIEW_PERMISSIONS = new Set(['ADMIN', 'MAINTAIN', 'WRITE', 'PUSH']);
+const reviewerPermissionCache = new Map<string, { permission: string; expiresAt: number }>();
+const REVIEWER_PERMISSION_CACHE_MS = 5 * 60 * 1000;
 const REVIEW_ACKNOWLEDGEMENT =
   /^(?:lgtm|looks good(?: to me)?|thank(?:s| you)|done|resolved|approved|nice|great)[.! 👍✅]*$/i;
 const PROMPT_INJECTION_LANGUAGE =
@@ -617,11 +620,86 @@ function isHermesOrBotComment(comment: any): boolean {
   );
 }
 
-function isTrustedHumanComment(comment: any): boolean {
+function reviewerLogin(comment: any): string {
+  return String(comment?.author?.login ?? '').trim().toLowerCase();
+}
+
+export function isTrustedReviewerPermission(permission: unknown): boolean {
+  return TRUSTED_REVIEW_PERMISSIONS.has(String(permission ?? '').trim().toUpperCase());
+}
+
+function isTrustedHumanComment(
+  comment: any,
+  reviewerPermissions: ReadonlyMap<string, string> = new Map()
+): boolean {
+  const login = reviewerLogin(comment);
   return (
     !isHermesOrBotComment(comment) &&
-    TRUSTED_REVIEW_ASSOCIATIONS.has(String(comment?.authorAssociation ?? '').toUpperCase())
+    (TRUSTED_REVIEW_ASSOCIATIONS.has(String(comment?.authorAssociation ?? '').toUpperCase()) ||
+      isTrustedReviewerPermission(reviewerPermissions.get(login)))
   );
+}
+
+/**
+ * `authorAssociation` is viewer-sensitive: GitHub can report an organization administrator as a
+ * CONTRIBUTOR to an installation token even though the same review appears as MEMBER to a user
+ * token. Resolve those ambiguous humans against repository permission instead of either dropping
+ * trusted feedback or allowing every contributor to poison durable memory.
+ */
+async function resolveReviewerPermissions(
+  octokit: Octokit,
+  repo: string,
+  activities: any[]
+): Promise<Map<string, string>> {
+  const { owner, name } = splitRepo(repo);
+  const logins = [
+    ...new Set(
+      activities
+        .filter(
+          (activity) =>
+            !isHermesOrBotComment(activity) &&
+            !TRUSTED_REVIEW_ASSOCIATIONS.has(
+              String(activity?.authorAssociation ?? '').toUpperCase()
+            )
+        )
+        .map(reviewerLogin)
+        .filter(Boolean)
+    ),
+  ];
+  const permissions = new Map<string, string>();
+  await Promise.all(
+    logins.map(async (login) => {
+      const key = `${repo.toLowerCase()}\0${login}`;
+      const cached = reviewerPermissionCache.get(key);
+      if (cached && cached.expiresAt > Date.now()) {
+        permissions.set(login, cached.permission);
+        return;
+      }
+      try {
+        const result = await octokit.repos.getCollaboratorPermissionLevel({
+          owner,
+          repo: name,
+          username: login,
+        });
+        const permission = String(result.data.permission ?? '').toUpperCase();
+        reviewerPermissionCache.set(key, {
+          permission,
+          expiresAt: Date.now() + REVIEWER_PERMISSION_CACHE_MS,
+        });
+        permissions.set(login, permission);
+      } catch (err) {
+        // A non-collaborator is expected to return 404 and remains untrusted. Other failures must
+        // retry the durable capture instead of being mistaken for a valid zero-lesson result.
+        if ((err as { status?: number }).status !== 404) throw err;
+        reviewerPermissionCache.set(key, {
+          permission: 'NONE',
+          expiresAt: Date.now() + REVIEWER_PERMISSION_CACHE_MS,
+        });
+        permissions.set(login, 'NONE');
+      }
+    })
+  );
+  return permissions;
 }
 
 function cleanReviewFeedback(body: unknown, limit = 1200): string {
@@ -681,7 +759,8 @@ export function lessonFromReviewThreadNode(
   resolutionEvidence?: Pick<
     ReviewThreadResolutionEvidence,
     'resolutionObservedAt' | 'resolvedBy'
-  >
+  >,
+  reviewerPermissions: ReadonlyMap<string, string> = new Map()
 ): ReviewLessonCandidate | null {
   const comments = ((thread?.comments?.nodes ?? []) as any[]).filter((comment) =>
     reviewActivityAtOrBefore(comment, acceptedBefore)
@@ -698,7 +777,7 @@ export function lessonFromReviewThreadNode(
     if (
       isHermesReviewComment(comment) &&
       lastNonBotHumanIndex >= 0 &&
-      isTrustedHumanComment(comments[lastNonBotHumanIndex]) &&
+      isTrustedHumanComment(comments[lastNonBotHumanIndex], reviewerPermissions) &&
       markerFeedbackId(comment.body) === String(comments[lastNonBotHumanIndex]?.id ?? '')
     ) {
       lastMarkerIndex = index;
@@ -723,7 +802,7 @@ export function lessonFromReviewThreadNode(
       )
     : [comments[lastNonBotHumanIndex]];
   const feedbackComments = evidenceComments
-    .filter(isTrustedHumanComment)
+    .filter((comment) => isTrustedHumanComment(comment, reviewerPermissions))
     .map((comment) => ({ comment, text: cleanReviewFeedback(comment.body, 700) }))
     .filter(({ text }) => isLearnableFeedback(text))
     .slice(-3);
@@ -750,6 +829,9 @@ export function lessonFromReviewThreadNode(
     feedback,
     reviewerLogins: reviewers,
     reviewerAssociations: associations,
+    reviewerPermissions: reviewers
+      .map((login) => reviewerPermissions.get(login.toLowerCase()))
+      .filter((permission): permission is string => Boolean(permission)),
     sourceUrl: String(latest.url ?? ''),
     feedbackCreatedAt: String(latest.createdAt ?? new Date().toISOString()),
     evidence: resolvedBeforeAcceptance ? 'thread_resolved' : 'hermes_replied',
@@ -769,7 +851,8 @@ export function lessonFromReviewThreadNode(
 export function lessonsFromReviewNodes(
   reviews: any[],
   fallbackUrl = '',
-  acceptedBefore?: string | null
+  acceptedBefore?: string | null,
+  reviewerPermissions: ReadonlyMap<string, string> = new Map()
 ): ReviewLessonCandidate[] {
   const acceptedReviews = reviews.filter((review) =>
     reviewActivityAtOrBefore(review, acceptedBefore)
@@ -777,7 +860,7 @@ export function lessonsFromReviewNodes(
   return acceptedReviews.flatMap((review, index) => {
     if (
       String(review?.state ?? '').toUpperCase() !== 'CHANGES_REQUESTED' ||
-      !isTrustedHumanComment(review)
+      !isTrustedHumanComment(review, reviewerPermissions)
     ) {
       return [];
     }
@@ -791,7 +874,7 @@ export function lessonsFromReviewNodes(
       if (
         String(candidate?.state ?? '').toUpperCase() !== 'APPROVED' ||
         String(candidate?.author?.login ?? '').toLowerCase() !== login.toLowerCase() ||
-        !isTrustedHumanComment(candidate)
+        !isTrustedHumanComment(candidate, reviewerPermissions)
       ) {
         return false;
       }
@@ -808,6 +891,9 @@ export function lessonsFromReviewNodes(
         feedback: `${login}: ${body}`,
         reviewerLogins: [login],
         reviewerAssociations: [String(review.authorAssociation).toUpperCase()],
+        reviewerPermissions: reviewerPermissions.has(login.toLowerCase())
+          ? [String(reviewerPermissions.get(login.toLowerCase()))]
+          : undefined,
         sourceUrl: String(review.url ?? fallbackUrl),
         feedbackCreatedAt: submittedAt || new Date().toISOString(),
         evidence: 'reviewer_approved' as const,
@@ -850,6 +936,7 @@ interface ReviewSnapshot {
 
 async function collectReviewSnapshot(
   token: string,
+  octokit: Octokit,
   repo: string,
   prNumber: number,
   mergedAt?: string | null
@@ -960,6 +1047,14 @@ async function collectReviewSnapshot(
           })
       : [];
   const fallbackUrl = `https://github.com/${repo}/pull/${prNumber}`;
+  // Open-PR reconciliation only needs actionable signals. Defer permission reads until the
+  // immutable merge boundary exists so this trust check adds no latency to normal ticket/PR work.
+  const reviewerPermissions = mergedAt
+    ? await resolveReviewerPermissions(octokit, repo, [
+        ...reviews,
+        ...threads.flatMap((thread) => thread?.comments?.nodes ?? []),
+      ])
+    : new Map<string, string>();
   const resolvedThreadIds = threads
     .filter((thread) => Boolean(thread?.isResolved))
     .map((thread) => String(thread.id ?? ''))
@@ -989,11 +1084,12 @@ async function collectReviewSnapshot(
         lessonFromReviewThreadNode(
           thread,
           mergedAt,
-          latestResolutionByThread.get(String(thread.id ?? ''))
+          latestResolutionByThread.get(String(thread.id ?? '')),
+          reviewerPermissions
         )
       )
       .filter((lesson: ReviewLessonCandidate | null): lesson is ReviewLessonCandidate => Boolean(lesson)),
-    ...lessonsFromReviewNodes(reviews, fallbackUrl, mergedAt),
+    ...lessonsFromReviewNodes(reviews, fallbackUrl, mergedAt, reviewerPermissions),
   ];
   return { signals: [...threadSignals, ...decisionSignals], lessons };
 }
@@ -1029,7 +1125,7 @@ export async function collectPrSnapshot(watch: PrWatch, extraSignals: PrSignal[]
   const headSha = pr.head.sha;
   const [checks, reviews] = await Promise.all([
     checkRunSignals(octokit, watch.repo, headSha),
-    collectReviewSnapshot(token, watch.repo, watch.prNumber, pr.merged_at),
+    collectReviewSnapshot(token, octokit, watch.repo, watch.prNumber, pr.merged_at),
   ]);
   const mergeSignal = mergeConflictSignal(pr);
   const state: PrSnapshot['state'] = pr.merged ? 'MERGED' : pr.state === 'closed' ? 'CLOSED' : 'OPEN';

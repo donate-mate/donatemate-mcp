@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   filterReviewLessonsForAcceptedCommits,
   HERMES_REVIEW_REPLY_MARKER_PREFIX,
+  isTrustedReviewerPermission,
   lessonFromReviewThreadNode,
   lessonsFromReviewNodes,
   reviewThreadResolutionFromWebhook,
@@ -318,6 +319,34 @@ describe('accepted review learning', () => {
     ).toBeNull();
   });
 
+  it('accepts viewer-relative contributors only when repository permission is trusted', () => {
+    const contributorRoot = { ...trustedRoot, authorAssociation: 'CONTRIBUTOR' };
+    const permission = new Map([['reviewer', 'ADMIN']]);
+
+    expect(
+      lessonFromReviewThreadNode(
+        thread([contributorRoot], { isResolved: true }),
+        undefined,
+        undefined,
+        permission
+      )
+    ).toMatchObject({
+      reviewerLogins: ['reviewer'],
+      reviewerAssociations: ['CONTRIBUTOR'],
+      reviewerPermissions: ['ADMIN'],
+    });
+    expect(
+      lessonFromReviewThreadNode(
+        thread([contributorRoot], { isResolved: true }),
+        undefined,
+        undefined,
+        new Map([['reviewer', 'READ']])
+      )
+    ).toBeNull();
+    expect(isTrustedReviewerPermission('write')).toBe(true);
+    expect(isTrustedReviewerPermission('read')).toBe(false);
+  });
+
   it('promotes top-level change requests only after the same trusted reviewer approves', () => {
     const changed = {
       id: 'PRR_changes',
@@ -351,6 +380,39 @@ describe('accepted review learning', () => {
         '2026-07-09T20:00:00Z'
       )
     ).toEqual([]);
+  });
+
+  it('promotes contributor change requests when the reviewer has repository write permission', () => {
+    const changed = {
+      id: 'PRR_contributor_changes',
+      state: 'CHANGES_REQUESTED',
+      body: 'Keep the provider schema and generated types synchronized.',
+      submittedAt: '2026-07-09T10:00:00Z',
+      authorAssociation: 'CONTRIBUTOR',
+      author: { login: 'reviewer', __typename: 'User' },
+    };
+    const approval = {
+      ...changed,
+      id: 'PRR_contributor_approval',
+      state: 'APPROVED',
+      submittedAt: '2026-07-10T10:00:00Z',
+    };
+
+    expect(lessonsFromReviewNodes([changed, approval])).toEqual([]);
+    expect(
+      lessonsFromReviewNodes(
+        [changed, approval],
+        '',
+        undefined,
+        new Map([['reviewer', 'ADMIN']])
+      )
+    ).toMatchObject([
+      {
+        sourceId: 'review:PRR_contributor_changes',
+        reviewerAssociations: ['CONTRIBUTOR'],
+        reviewerPermissions: ['ADMIN'],
+      },
+    ]);
   });
 
   it('keeps marker evidence only when its fix commit reached the accepted PR history', async () => {

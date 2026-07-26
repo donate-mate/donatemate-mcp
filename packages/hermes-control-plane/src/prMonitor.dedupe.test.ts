@@ -18,7 +18,7 @@ import {
   shouldFinalizeReviewLearningCapture,
 } from './prMonitor.js';
 import { isRateLimitError } from './github.js';
-import type { PrSignal, PrWatch } from './prWatch.js';
+import { hasCurrentReviewLearningCapture, type PrSignal, type PrWatch } from './prWatch.js';
 
 const HEAD = 'd726d96c4c1cf8055825279bd75c622aca98e504';
 const CI_ID = `ci:${HEAD}:check:86290059761:failure`;
@@ -151,6 +151,20 @@ describe('review-learning capture completion', () => {
   it('finalizes an accepted lesson immediately and a zero-lesson backfill exactly once', () => {
     expect(shouldFinalizeReviewLearningCapture(1)).toBe(true);
     expect(shouldFinalizeReviewLearningCapture(0, true)).toBe(true);
+  });
+
+  it('reprocesses receipts created by an older extraction/trust schema', () => {
+    expect(
+      hasCurrentReviewLearningCapture({
+        reviewLearningCapturedAt: '2026-07-26T00:22:16.115Z',
+      })
+    ).toBe(false);
+    expect(
+      hasCurrentReviewLearningCapture({
+        reviewLearningCapturedAt: '2026-07-26T00:22:16.115Z',
+        reviewLearningCaptureVersion: 2,
+      })
+    ).toBe(true);
   });
 });
 
