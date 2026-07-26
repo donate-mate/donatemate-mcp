@@ -147,6 +147,17 @@ describe('attempt-cap recovery', () => {
         [reviewSignal()]
       )
     ).toBe(false);
+    expect(
+      shouldRecoverAttemptCapWatch(
+        {
+          ...capped,
+          handledSignalIds: [`merge:${HEAD}`],
+          lastFixAt: minutesAgo(2),
+        },
+        'passing',
+        [conflictSignal()]
+      )
+    ).toBe(false);
   });
 });
 

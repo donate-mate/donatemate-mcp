@@ -929,6 +929,7 @@ export function shouldRecoverAttemptCapWatch(
     watch.status === 'prwatch:blocked' &&
     /maximum automated fix attempts reached/i.test(String(watch.blockReason ?? '')) &&
     ciState === 'passing' &&
+    !signals.some((signal) => SELF_CLEARING.has(signal.kind)) &&
     dedupeNewSignals(watch, signals).length === 0
   );
 }
@@ -1060,6 +1061,10 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
     await startFollowupJob({ ...currentWatch, headSha: snapshot.headSha, headBranch: snapshot.headBranch, prUrl: snapshot.prUrl }, actionable);
     return;
   }
+
+  // A handled CI/conflict signal can be temporarily suppressed by the retry cooldown. It is still
+  // objectively present, so wait for the next retry window instead of treating this head as ready.
+  if (snapshot.signals.some((signal) => SELF_CLEARING.has(signal.kind))) return;
 
   // (An unresolved merge conflict used to be re-fired here, bypassing the handled-id dedupe. It is
   // now a self-clearing signal like any other, so dedupeNewSignals above re-fires it — under the
