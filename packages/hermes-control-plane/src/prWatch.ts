@@ -710,6 +710,41 @@ export async function tryClaimHandledSignal(watch: PrWatch, signalId: string): P
   }
 }
 
+/** Release a one-time marker when the external side effect it guarded did not complete. */
+export async function releaseHandledSignalClaim(
+  watch: PrWatch,
+  signalId: string
+): Promise<void> {
+  const current = await ddb
+    .send(
+      new GetCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        ConsistentRead: true,
+        ProjectionExpression: 'handledSignalIds',
+      })
+    )
+    .catch(() => undefined);
+  const index = (current?.Item?.handledSignalIds as string[] | undefined)?.indexOf(signalId) ?? -1;
+  if (index < 0) return;
+  await ddb
+    .send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        UpdateExpression: `SET updatedAt = :updatedAt REMOVE handledSignalIds[${index}]`,
+        ConditionExpression: `handledSignalIds[${index}] = :signalId`,
+        ExpressionAttributeValues: {
+          ':signalId': signalId,
+          ':updatedAt': new Date().toISOString(),
+        },
+      })
+    )
+    .catch(() => {
+      // Another reconciler may already have retried or released this marker.
+    });
+}
+
 /** Record an assignment pause exactly once so Jira comments and flow updates are idempotent. */
 export async function markWatchAssignmentPaused(watch: PrWatch): Promise<boolean> {
   try {
@@ -901,32 +936,31 @@ export async function unblockWatch(watch: PrWatch, headSha: string): Promise<PrW
  * green and has no new actionable feedback, later review or base-branch movement must receive a
  * fresh budget instead of inheriting every repair the long-lived PR has ever needed.
  */
-export async function resetFixAttemptBudget(watch: PrWatch): Promise<PrWatch> {
+export async function resetFixAttemptBudget(watch: PrWatch): Promise<PrWatch | null> {
   const expected = watch.fixAttemptCount ?? 0;
-  if (expected === 0) return watch;
   try {
     const res = await ddb.send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { jobId: watch.jobId },
-        UpdateExpression: 'SET fixAttemptCount = :zero, updatedAt = :updatedAt',
+        UpdateExpression: 'SET fixAttemptCount = :zero',
         ConditionExpression:
-          'fixAttemptCount = :expected AND (#s = :watching OR #s = :fixing)',
+          '#s = :watching AND fixAttemptCount = :expected AND (attribute_not_exists(activeFixJobId) OR activeFixJobId = :emptyActive)',
         ExpressionAttributeNames: { '#s': 'status' },
         ExpressionAttributeValues: {
           ':zero': 0,
           ':expected': expected,
           ':watching': 'prwatch:watching',
-          ':fixing': 'prwatch:fixing',
-          ':updatedAt': new Date().toISOString(),
+          ':emptyActive': '',
         },
         ReturnValues: 'ALL_NEW',
       })
     );
     return (res.Attributes as PrWatch) ?? { ...watch, fixAttemptCount: 0 };
   } catch {
-    // A concurrent reconciler may already have reset or advanced the watch.
-    return watch;
+    // A concurrent reconciler may have started a repair. Fail closed so this stale green snapshot
+    // cannot advance readiness underneath the active job.
+    return null;
   }
 }
 

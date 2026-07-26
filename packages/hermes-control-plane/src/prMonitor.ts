@@ -55,6 +55,7 @@ import {
   markWatchReady,
   markReviewPinged,
   markWatchAssignmentPaused,
+  releaseHandledSignalClaim,
   rememberGitHubDelivery,
   resetFixAttemptBudget,
   tryStartFix,
@@ -690,7 +691,15 @@ async function coordinateOverlaps(watch: PrWatch, changedFiles: string[], log: F
     for (const overlap of fresh) {
       const marker = `overlap:${overlap.prNumber}`;
       if (!(await tryClaimHandledSignal(watch, marker))) continue;
-      await announceOverlaps(watch.repo, watch.prNumber, watch.prUrl, [overlap]);
+      const announced = await announceOverlaps(
+        watch.repo,
+        watch.prNumber,
+        watch.prUrl,
+        [overlap]
+      );
+      if (!announced.includes(marker)) {
+        await releaseHandledSignalClaim(watch, marker);
+      }
     }
   } catch (err) {
     log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 overlap coordination failed');
@@ -702,19 +711,22 @@ async function coordinateOverlaps(watch: PrWatch, changedFiles: string[], log: F
 async function postChecklistOnce(watch: PrWatch, log: FastifyBaseLogger): Promise<void> {
   if (!CHECKLIST_ENABLED || !watch.issueKey) return;
   if ((watch.handledSignalIds ?? []).includes('checklist-posted')) return;
+  let claimed = false;
   try {
     const flow = await getFlow(watch.issueKey);
     const items = flow?.checklist ?? [];
     if (!items.length) return;
     const body = renderChecklist(items);
     if (!body) return;
-    if (!(await tryClaimHandledSignal(watch, 'checklist-posted'))) return;
+    claimed = await tryClaimHandledSignal(watch, 'checklist-posted');
+    if (!claimed) return;
     await commentOnPullRequest(
       watch.repo,
       watch.prNumber,
       `${body}\n\nHermes will not move this PR to Ready for review until every item is checked \`- [x]\` or explicitly deferred to a follow-up ticket (DM-####).`
     );
   } catch (err) {
+    if (claimed) await releaseHandledSignalClaim(watch, 'checklist-posted');
     log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 checklist post failed');
   }
 }
@@ -723,6 +735,7 @@ async function postChecklistOnce(watch: PrWatch, log: FastifyBaseLogger): Promis
 // true (proceed to Ready) on satisfaction OR on any error (fail-open: never weaken CI behavior).
 async function readinessGatesSatisfied(watch: PrWatch, log: FastifyBaseLogger): Promise<boolean> {
   if (!watch.issueKey || (!CHECKLIST_ENABLED && !EVIDENCE_CHECK_ENABLED)) return true;
+  let claimed = false;
   try {
     const [flow, issueContext, prText] = await Promise.all([
       getFlow(watch.issueKey),
@@ -750,7 +763,8 @@ async function readinessGatesSatisfied(watch: PrWatch, log: FastifyBaseLogger): 
     if (!missing.length) return true;
 
     if (!(watch.handledSignalIds ?? []).includes('readiness-blocked')) {
-      if (await tryClaimHandledSignal(watch, 'readiness-blocked')) {
+      claimed = await tryClaimHandledSignal(watch, 'readiness-blocked');
+      if (claimed) {
         await commentOnIssue(
           watch.issueKey,
           [
@@ -767,6 +781,7 @@ async function readinessGatesSatisfied(watch: PrWatch, log: FastifyBaseLogger): 
     log.info({ repo: watch.repo, prNumber: watch.prNumber, missing }, 'WS5 readiness gate held PR in review');
     return false;
   } catch (err) {
+    if (claimed) await releaseHandledSignalClaim(watch, 'readiness-blocked');
     log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 readiness gate errored; failing open');
     return true;
   }
@@ -1071,7 +1086,9 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
   // retry cooldown, which this bypassed.)
 
   if (snapshot.ciState === 'passing') {
-    currentWatch = await resetFixAttemptBudget(currentWatch);
+    const resetWatch = await resetFixAttemptBudget(currentWatch);
+    if (!resetWatch) return;
+    currentWatch = resetWatch;
 
     // CI is green and Hermes has addressed every review thread — but GitHub keeps the PR at
     // reviewDecision CHANGES_REQUESTED until that reviewer submits a NEW review, and a fixed PR does
