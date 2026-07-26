@@ -15,6 +15,7 @@ import {
   dedupeNewSignals,
   isRetryOfHandledSignal,
   reviewReplyTargetsForSignals,
+  shouldRecoverAttemptCapWatch,
   shouldFinalizeReviewLearningCapture,
 } from './prMonitor.js';
 import { isRateLimitError } from './github.js';
@@ -119,6 +120,33 @@ describe('isRetryOfHandledSignal', () => {
 
   it('does not flag a first attempt', () => {
     expect(isRetryOfHandledSignal(watch({ handledSignalIds: [] }), [ciSignal()])).toBe(false);
+  });
+});
+
+describe('attempt-cap recovery', () => {
+  it('recovers a green capped watch when every remaining signal was already handled', () => {
+    const capped = watch({
+      status: 'prwatch:blocked',
+      blockReason: 'maximum automated fix attempts reached (8)',
+      fixAttemptCount: 8,
+    });
+    expect(shouldRecoverAttemptCapWatch(capped, 'passing', [reviewSignal()])).toBe(true);
+  });
+
+  it('keeps a capped watch blocked when CI still fails or new feedback exists', () => {
+    const capped = watch({
+      status: 'prwatch:blocked',
+      blockReason: 'maximum automated fix attempts reached (8)',
+      fixAttemptCount: 8,
+    });
+    expect(shouldRecoverAttemptCapWatch(capped, 'failing', [])).toBe(false);
+    expect(
+      shouldRecoverAttemptCapWatch(
+        { ...capped, handledSignalIds: [] },
+        'passing',
+        [reviewSignal()]
+      )
+    ).toBe(false);
   });
 });
 

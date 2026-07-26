@@ -679,6 +679,37 @@ export async function appendHandledSignals(watch: PrWatch, signalIds: string[]):
   );
 }
 
+/**
+ * Atomically reserve a one-time marker before performing an external side effect.
+ *
+ * `appendHandledSignals` is bulk bookkeeping after a fix job has already been reserved.
+ * Comments and checklists are different: both control-plane replicas can observe the same stale
+ * watch and post before either append becomes visible. Claiming first prevents duplicate writes.
+ */
+export async function tryClaimHandledSignal(watch: PrWatch, signalId: string): Promise<boolean> {
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        UpdateExpression:
+          'SET handledSignalIds = list_append(if_not_exists(handledSignalIds, :empty), :signalIds), updatedAt = :updatedAt',
+        ConditionExpression:
+          'attribute_not_exists(handledSignalIds) OR NOT contains(handledSignalIds, :signalId)',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':signalIds': [signalId],
+          ':signalId': signalId,
+          ':updatedAt': new Date().toISOString(),
+        },
+      })
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Record an assignment pause exactly once so Jira comments and flow updates are idempotent. */
 export async function markWatchAssignmentPaused(watch: PrWatch): Promise<boolean> {
   try {
@@ -797,21 +828,34 @@ export async function clearActiveFix(watch: PrWatch, fixJobId: string): Promise<
     });
 }
 
-export async function markWatchBlocked(watch: PrWatch, reason: string): Promise<boolean> {
+export async function markWatchBlocked(
+  watch: PrWatch,
+  reason: string,
+  expectedFixAttemptCount?: number
+): Promise<boolean> {
   try {
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { jobId: watch.jobId },
         UpdateExpression: 'SET #s = :blocked, jiraState = :jiraState, blockReason = :reason, updatedAt = :updatedAt',
-        ConditionExpression: '#s <> :done',
+        ConditionExpression:
+          expectedFixAttemptCount === undefined
+            ? '#s <> :blocked AND #s <> :done'
+            : '#s = :watching AND fixAttemptCount = :expectedFixAttemptCount AND (attribute_not_exists(activeFixJobId) OR activeFixJobId = :emptyActive)',
         ExpressionAttributeNames: { '#s': 'status' },
         ExpressionAttributeValues: {
           ':blocked': 'prwatch:blocked',
-          ':done': 'prwatch:done',
           ':jiraState': 'blocked',
           ':reason': reason,
           ':updatedAt': new Date().toISOString(),
+          ...(expectedFixAttemptCount === undefined
+            ? { ':done': 'prwatch:done' }
+            : {
+                ':watching': 'prwatch:watching',
+                ':emptyActive': '',
+                ':expectedFixAttemptCount': expectedFixAttemptCount,
+              }),
         },
       })
     );
@@ -822,9 +866,9 @@ export async function markWatchBlocked(watch: PrWatch, reason: string): Promise<
 }
 
 /**
- * Reset a blocked watch back to active — clears the block reason, active fix, handled-signal dedupe,
- * and the fix-attempt budget — so the reconcile loop resumes automated fixes. Used when a human
- * advances a blocked PR (auto-unblock) or on an explicit revive. Returns the updated watch, or null.
+ * Reset a blocked watch back to active while preserving handled-signal history. A new human commit,
+ * check run, review, or base-branch conflict already has a new immutable signal id; deleting all
+ * history here only replays old reviews, checklists, and overlap warnings.
  */
 export async function unblockWatch(watch: PrWatch, headSha: string): Promise<PrWatch | null> {
   try {
@@ -833,15 +877,15 @@ export async function unblockWatch(watch: PrWatch, headSha: string): Promise<PrW
         TableName: TABLE,
         Key: { jobId: watch.jobId },
         UpdateExpression:
-          'SET #s = :watching, fixAttemptCount = :zero, headSha = :headSha, updatedAt = :updatedAt REMOVE blockReason, activeFixJobId, handledSignalIds',
-        ConditionExpression: '#s <> :done',
+          'SET #s = :watching, fixAttemptCount = :zero, headSha = :headSha, updatedAt = :updatedAt REMOVE blockReason, activeFixJobId',
+        ConditionExpression: '#s = :blocked',
         ExpressionAttributeNames: { '#s': 'status' },
         ExpressionAttributeValues: {
           ':watching': 'prwatch:watching',
+          ':blocked': 'prwatch:blocked',
           ':zero': 0,
           ':headSha': headSha,
           ':updatedAt': new Date().toISOString(),
-          ':done': 'prwatch:done',
         },
         ReturnValues: 'ALL_NEW',
       })
@@ -849,6 +893,40 @@ export async function unblockWatch(watch: PrWatch, headSha: string): Promise<PrW
     return (res.Attributes as PrWatch) ?? null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * A fix budget is a consecutive-repair budget, not a lifetime PR budget. Once the current head is
+ * green and has no new actionable feedback, later review or base-branch movement must receive a
+ * fresh budget instead of inheriting every repair the long-lived PR has ever needed.
+ */
+export async function resetFixAttemptBudget(watch: PrWatch): Promise<PrWatch> {
+  const expected = watch.fixAttemptCount ?? 0;
+  if (expected === 0) return watch;
+  try {
+    const res = await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        UpdateExpression: 'SET fixAttemptCount = :zero, updatedAt = :updatedAt',
+        ConditionExpression:
+          'fixAttemptCount = :expected AND (#s = :watching OR #s = :fixing)',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':zero': 0,
+          ':expected': expected,
+          ':watching': 'prwatch:watching',
+          ':fixing': 'prwatch:fixing',
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      })
+    );
+    return (res.Attributes as PrWatch) ?? { ...watch, fixAttemptCount: 0 };
+  } catch {
+    // A concurrent reconciler may already have reset or advanced the watch.
+    return watch;
   }
 }
 
