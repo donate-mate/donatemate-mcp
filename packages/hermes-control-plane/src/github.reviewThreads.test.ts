@@ -10,6 +10,7 @@ import {
   reviewThreadResolutionFromWebhook,
   signalFromReviewThreadNode,
   signalFromPrCommentWebhook,
+  signalFromReviewWebhook,
 } from './github.js';
 
 const root = {
@@ -495,6 +496,39 @@ describe('signalFromPrCommentWebhook', () => {
       id: 'pr-comment:123:2026-07-20T23:10:00Z',
       kind: 'review_feedback',
       summary: 'Top-level PR comment by reviewer',
+    });
+  });
+});
+
+describe('signalFromReviewWebhook', () => {
+  it('waits for inline-thread events when a change-request review has no body', () => {
+    expect(
+      signalFromReviewWebhook({
+        review: {
+          id: 456,
+          state: 'changes_requested',
+          body: '',
+          submitted_at: '2026-07-20T23:10:00Z',
+          user: { login: 'reviewer' },
+        },
+      })
+    ).toBeNull();
+  });
+
+  it('keeps substantive top-level change requests', () => {
+    expect(
+      signalFromReviewWebhook({
+        review: {
+          id: 456,
+          state: 'changes_requested',
+          body: 'Please preserve intentionally cleared optional fields.',
+          submitted_at: '2026-07-20T23:10:00Z',
+          user: { login: 'reviewer' },
+        },
+      })
+    ).toMatchObject({
+      id: 'review-state:456:2026-07-20T23:10:00Z',
+      kind: 'review_feedback',
     });
   });
 });

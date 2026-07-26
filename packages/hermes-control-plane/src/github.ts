@@ -1029,10 +1029,26 @@ async function collectReviewSnapshot(
   const threadSignals = threads
     .map(signalFromReviewThreadNode)
     .filter((signal: PrSignal | null): signal is PrSignal => Boolean(signal));
+  const latestDecisiveReviewByAuthor = new Map<string, any>();
+  for (const review of reviews) {
+    const state = String(review?.state ?? '').toUpperCase();
+    const author = String(review?.author?.login ?? '').toLowerCase();
+    if (!author || state === 'COMMENTED' || state === 'PENDING') continue;
+    const current = latestDecisiveReviewByAuthor.get(author);
+    const candidateAt = Date.parse(String(review.submittedAt ?? review.updatedAt ?? ''));
+    const currentAt = Date.parse(String(current?.submittedAt ?? current?.updatedAt ?? ''));
+    if (!current || !Number.isFinite(currentAt) || candidateAt >= currentAt) {
+      latestDecisiveReviewByAuthor.set(author, review);
+    }
+  }
   const decisionSignals =
     reviewDecision === 'CHANGES_REQUESTED'
-      ? reviews
-          .filter((review) => String(review?.state ?? '').toUpperCase() === 'CHANGES_REQUESTED')
+      ? [...latestDecisiveReviewByAuthor.values()]
+          .filter(
+            (review) =>
+              String(review?.state ?? '').toUpperCase() === 'CHANGES_REQUESTED' &&
+              Boolean(String(review?.body ?? '').trim())
+          )
           .map((review) => {
             const createdAt = review.submittedAt ?? review.updatedAt ?? new Date().toISOString();
             const reviewId = review.databaseId ?? review.id ?? createdAt;
@@ -1040,7 +1056,7 @@ async function collectReviewSnapshot(
               id: `review-state:${reviewId}:${createdAt}`,
               kind: 'review_feedback',
               summary: `Review requested changes by ${review.author?.login ?? 'reviewer'}`,
-              details: compactText(review.body || 'Reviewer requested changes.', 1200),
+              details: compactText(review.body, 1200),
               url: review.url,
               createdAt,
             } as PrSignal;
@@ -1199,11 +1215,16 @@ export function reviewThreadResolutionFromWebhook(
 export function signalFromReviewWebhook(body: Record<string, any>): PrSignal | null {
   const review = body.review;
   if (!review || String(review.state).toLowerCase() !== 'changes_requested') return null;
+  const text = String(review.body ?? '').trim();
+  // An empty review body means the actionable content lives in inline threads. Starting from this
+  // generic event races those thread webhooks and spends a repair attempt without giving the worker
+  // the actual feedback.
+  if (!text) return null;
   return {
     id: `review-state:${review.id}:${review.submitted_at ?? review.updated_at ?? Date.now()}`,
     kind: 'review_feedback',
     summary: `Review requested changes by ${review.user?.login ?? 'reviewer'}`,
-    details: compactText(review.body || 'Reviewer requested changes.', 1200),
+    details: compactText(text, 1200),
     url: review.html_url,
     createdAt: review.submitted_at ?? new Date().toISOString(),
   };

@@ -55,8 +55,11 @@ import {
   markWatchReady,
   markReviewPinged,
   markWatchAssignmentPaused,
+  releaseHandledSignalClaim,
   rememberGitHubDelivery,
+  resetFixAttemptBudget,
   tryStartFix,
+  tryClaimHandledSignal,
   unblockWatch,
   updateWatchHead,
   type JiraState,
@@ -349,8 +352,12 @@ async function ensureFrontendDeployLabel(watch: PrWatch, log: FastifyBaseLogger)
   );
 }
 
-async function blockWatch(watch: PrWatch, reason: string): Promise<void> {
-  if (!(await markWatchBlocked(watch, reason))) return;
+async function blockWatch(
+  watch: PrWatch,
+  reason: string,
+  expectedFixAttemptCount?: number
+): Promise<void> {
+  if (!(await markWatchBlocked(watch, reason, expectedFixAttemptCount))) return;
   if (watch.issueKey) {
     await commentOnIssue(
       watch.issueKey,
@@ -409,7 +416,11 @@ async function startFollowupJob(watch: PrWatch, signals: PrSignal[]): Promise<vo
 
   const nextAttempt = (watch.fixAttemptCount ?? 0) + 1;
   if (nextAttempt > MAX_FIX_ATTEMPTS) {
-    await blockWatch(watch, `maximum automated fix attempts reached (${MAX_FIX_ATTEMPTS})`);
+    await blockWatch(
+      watch,
+      `maximum automated fix attempts reached (${MAX_FIX_ATTEMPTS})`,
+      watch.fixAttemptCount ?? 0
+    );
     return;
   }
 
@@ -670,10 +681,26 @@ async function coordinateOverlaps(watch: PrWatch, changedFiles: string[], log: F
   try {
     const overlaps = await computeOverlaps(watch.repo, watch.prNumber, changedFiles);
     const handled = new Set(watch.handledSignalIds ?? []);
-    const fresh = overlaps.filter((o) => !handled.has(`overlap:${o.prNumber}`));
-    if (!fresh.length) return;
-    const announced = await announceOverlaps(watch.repo, watch.prNumber, watch.prUrl, fresh);
-    if (announced.length) await appendHandledSignals(watch, announced);
+    // One PR owns each pair so A↔B does not post the same warning twice. The durable claim then
+    // collapses races between the two control-plane replicas.
+    const fresh = overlaps.filter(
+      (overlap) =>
+        watch.prNumber < overlap.prNumber &&
+        !handled.has(`overlap:${overlap.prNumber}`)
+    );
+    for (const overlap of fresh) {
+      const marker = `overlap:${overlap.prNumber}`;
+      if (!(await tryClaimHandledSignal(watch, marker))) continue;
+      const announced = await announceOverlaps(
+        watch.repo,
+        watch.prNumber,
+        watch.prUrl,
+        [overlap]
+      );
+      if (!announced.includes(marker)) {
+        await releaseHandledSignalClaim(watch, marker);
+      }
+    }
   } catch (err) {
     log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 overlap coordination failed');
   }
@@ -684,19 +711,22 @@ async function coordinateOverlaps(watch: PrWatch, changedFiles: string[], log: F
 async function postChecklistOnce(watch: PrWatch, log: FastifyBaseLogger): Promise<void> {
   if (!CHECKLIST_ENABLED || !watch.issueKey) return;
   if ((watch.handledSignalIds ?? []).includes('checklist-posted')) return;
+  let claimed = false;
   try {
     const flow = await getFlow(watch.issueKey);
     const items = flow?.checklist ?? [];
     if (!items.length) return;
     const body = renderChecklist(items);
     if (!body) return;
+    claimed = await tryClaimHandledSignal(watch, 'checklist-posted');
+    if (!claimed) return;
     await commentOnPullRequest(
       watch.repo,
       watch.prNumber,
       `${body}\n\nHermes will not move this PR to Ready for review until every item is checked \`- [x]\` or explicitly deferred to a follow-up ticket (DM-####).`
     );
-    await appendHandledSignals(watch, ['checklist-posted']);
   } catch (err) {
+    if (claimed) await releaseHandledSignalClaim(watch, 'checklist-posted');
     log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 checklist post failed');
   }
 }
@@ -705,6 +735,7 @@ async function postChecklistOnce(watch: PrWatch, log: FastifyBaseLogger): Promis
 // true (proceed to Ready) on satisfaction OR on any error (fail-open: never weaken CI behavior).
 async function readinessGatesSatisfied(watch: PrWatch, log: FastifyBaseLogger): Promise<boolean> {
   if (!watch.issueKey || (!CHECKLIST_ENABLED && !EVIDENCE_CHECK_ENABLED)) return true;
+  let claimed = false;
   try {
     const [flow, issueContext, prText] = await Promise.all([
       getFlow(watch.issueKey),
@@ -732,22 +763,25 @@ async function readinessGatesSatisfied(watch: PrWatch, log: FastifyBaseLogger): 
     if (!missing.length) return true;
 
     if (!(watch.handledSignalIds ?? []).includes('readiness-blocked')) {
-      await commentOnIssue(
-        watch.issueKey,
-        [
-          `🔒 Hermes is holding ${watch.prUrl} in code review: CI passes but the readiness checklist is not satisfied.`,
-          '',
-          'Outstanding:',
-          ...missing.map((m) => `- ${m}`),
-          '',
-          'Check each item off in the PR (`- [x]`), defer it to a follow-up ticket (DM-####), or add the required evidence, then re-run.',
-        ].join('\n')
-      );
-      await appendHandledSignals(watch, ['readiness-blocked']);
+      claimed = await tryClaimHandledSignal(watch, 'readiness-blocked');
+      if (claimed) {
+        await commentOnIssue(
+          watch.issueKey,
+          [
+            `🔒 Hermes is holding ${watch.prUrl} in code review: CI passes but the readiness checklist is not satisfied.`,
+            '',
+            'Outstanding:',
+            ...missing.map((m) => `- ${m}`),
+            '',
+            'Check each item off in the PR (`- [x]`), defer it to a follow-up ticket (DM-####), or add the required evidence, then re-run.',
+          ].join('\n')
+        );
+      }
     }
     log.info({ repo: watch.repo, prNumber: watch.prNumber, missing }, 'WS5 readiness gate held PR in review');
     return false;
   } catch (err) {
+    if (claimed) await releaseHandledSignalClaim(watch, 'readiness-blocked');
     log.warn({ err, repo: watch.repo, prNumber: watch.prNumber }, 'WS5 readiness gate errored; failing open');
     return true;
   }
@@ -901,6 +935,20 @@ export function shouldFinalizeReviewLearningCapture(recorded: number, isBackfill
   return recorded > 0 || isBackfill;
 }
 
+export function shouldRecoverAttemptCapWatch(
+  watch: PrWatch,
+  ciState: 'passing' | 'failing' | 'pending' | 'unknown',
+  signals: PrSignal[]
+): boolean {
+  return (
+    watch.status === 'prwatch:blocked' &&
+    /maximum automated fix attempts reached/i.test(String(watch.blockReason ?? '')) &&
+    ciState === 'passing' &&
+    !signals.some((signal) => SELF_CLEARING.has(signal.kind)) &&
+    dedupeNewSignals(watch, signals).length === 0
+  );
+}
+
 async function backfillPendingReviewLearning(
   watch: PrWatch,
   log: FastifyBaseLogger
@@ -964,23 +1012,40 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
     return;
   }
 
-  // Auto-unblock: a watch that hit the fix cap (or was otherwise blocked) is normally never retried,
-  // but if a HUMAN pushes a new commit to it the situation changed — give the fixer a fresh budget
-  // and resume. Only triggers when the head advanced to a commit Hermes did not author.
+  // A cap can race the final CI/review webhooks from attempt N. If the authoritative snapshot is
+  // now green with no new actionable feedback, recover without requiring a meaningless human
+  // commit. Otherwise a real human commit still explicitly revives any kind of blocked watch.
   if (currentWatch.status === 'prwatch:blocked') {
-    if (!AUTO_UNBLOCK_ON_HUMAN_COMMIT) return;
-    const advanced = snapshot.headSha && snapshot.headSha !== currentWatch.headSha;
-    if (!advanced || (await isHermesCommit(currentWatch.repo, snapshot.headSha))) return;
+    const recoveredAtCap = shouldRecoverAttemptCapWatch(
+      currentWatch,
+      snapshot.ciState,
+      snapshot.signals
+    );
+    let humanAdvanced = false;
+    if (!recoveredAtCap && AUTO_UNBLOCK_ON_HUMAN_COMMIT) {
+      const advanced = snapshot.headSha && snapshot.headSha !== currentWatch.headSha;
+      humanAdvanced =
+        Boolean(advanced) && !(await isHermesCommit(currentWatch.repo, snapshot.headSha));
+    }
+    if (!recoveredAtCap && !humanAdvanced) return;
+
     const unblocked = await unblockWatch(currentWatch, snapshot.headSha);
     if (!unblocked) return;
     log.info(
-      { repo: currentWatch.repo, prNumber: currentWatch.prNumber, headSha: snapshot.headSha.slice(0, 8) },
-      'auto-unblocked PR watch after a human commit'
+      {
+        repo: currentWatch.repo,
+        prNumber: currentWatch.prNumber,
+        headSha: snapshot.headSha.slice(0, 8),
+        reason: recoveredAtCap ? 'healthy_after_attempt_cap' : 'human_commit',
+      },
+      'auto-unblocked PR watch'
     );
     if (currentWatch.issueKey) {
       await commentOnIssue(
         currentWatch.issueKey,
-        `▶️ A new commit was pushed to ${snapshot.prUrl}; Hermes resumed automated CI/review fixes.`
+        recoveredAtCap
+          ? `▶️ Hermes rechecked ${snapshot.prUrl} after the repair cap: CI is green and no new actionable review feedback remains, so monitoring resumed automatically.`
+          : `▶️ A new commit was pushed to ${snapshot.prUrl}; Hermes resumed automated CI/review fixes.`
       ).catch(() => {});
     }
     currentWatch = unblocked;
@@ -1012,11 +1077,19 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
     return;
   }
 
+  // A handled CI/conflict signal can be temporarily suppressed by the retry cooldown. It is still
+  // objectively present, so wait for the next retry window instead of treating this head as ready.
+  if (snapshot.signals.some((signal) => SELF_CLEARING.has(signal.kind))) return;
+
   // (An unresolved merge conflict used to be re-fired here, bypassing the handled-id dedupe. It is
   // now a self-clearing signal like any other, so dedupeNewSignals above re-fires it — under the
   // retry cooldown, which this bypassed.)
 
   if (snapshot.ciState === 'passing') {
+    const resetWatch = await resetFixAttemptBudget(currentWatch);
+    if (!resetWatch) return;
+    currentWatch = resetWatch;
+
     // CI is green and Hermes has addressed every review thread — but GitHub keeps the PR at
     // reviewDecision CHANGES_REQUESTED until that reviewer submits a NEW review, and a fixed PR does
     // not re-enter their queue by itself. Put it back there, once per head sha.
