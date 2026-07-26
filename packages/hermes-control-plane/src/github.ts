@@ -65,17 +65,27 @@ function isHermesReviewComment(comment: any): boolean {
 
 /** A rate-limit 403/429 from GitHub, as opposed to a permissions 403. */
 export function isRateLimitError(err: unknown): boolean {
-  const e = err as { status?: number; message?: string; code?: string };
+  const e = err as {
+    status?: number;
+    message?: string;
+    code?: string;
+    response?: { headers?: Record<string, string | number | undefined> };
+  };
   if (!e) return false;
+  if (e.status === 429) return true;
+  const headers = e.response?.headers ?? {};
+  if (
+    e.status === 403 &&
+    (String(headers['x-ratelimit-remaining'] ?? '') === '0' ||
+      headers['retry-after'] !== undefined)
+  ) {
+    return true;
+  }
   const message = String(e.message ?? '');
   const rateLimited = /rate limit|secondary rate|quota (?:was )?exceeded/i.test(message);
   if (/RATE_?LIMIT/i.test(String(e.code ?? ''))) return true;
   if (!rateLimited) return false;
-  return (
-    e.status === 403 ||
-    e.status === 429 ||
-    /^GitHub GraphQL(?::|\s+\d+:)/i.test(message)
-  );
+  return e.status === 403 || /^GitHub GraphQL(?::|\s+\d+:)/i.test(message);
 }
 
 /**

@@ -157,6 +157,14 @@ describe('review-learning capture completion', () => {
 describe('GitHub rate-limit classification', () => {
   it('recognizes REST and status-less GraphQL quota errors', () => {
     expect(isRateLimitError({ status: 403, message: 'API rate limit exceeded' })).toBe(true);
+    expect(isRateLimitError({ status: 429, message: 'Too Many Requests' })).toBe(true);
+    expect(
+      isRateLimitError({
+        status: 403,
+        message: 'Forbidden',
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      })
+    ).toBe(true);
     expect(isRateLimitError(new Error('GitHub GraphQL: API rate limit exceeded'))).toBe(true);
     expect(
       isRateLimitError(
