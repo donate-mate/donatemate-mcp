@@ -414,6 +414,7 @@ export class HermesStack extends cdk.Stack {
         PREOPEN_REVIEW_ENABLED: 'true', // WS4 pre-open adversarial review stage
         PREOPEN_REVIEW_EFFORT: 'high', // WS4 review runs at high reasoning effort
         GATE_MAX_RETRIES: '3', // WS2 pre-commit gate repair rounds before fail-open
+        GATE_CMD_TIMEOUT_SECONDS: '1200', // backend Turbo dependency graphs can exceed 10 minutes
         REVIEW_LEARNING_ENABLED: 'true',
         REVIEW_LEARNING_TOP_K: '5',
         REVIEW_LEARNING_TIMEOUT_MS: '1500',
