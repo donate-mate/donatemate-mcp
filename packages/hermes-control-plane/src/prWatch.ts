@@ -90,6 +90,8 @@ export interface PrWatch {
   reviewLearningLessonCount?: number;
   /** Merge commit whose accepted review history was evaluated. */
   reviewLearningMergeCommitSha?: string;
+  /** Extraction/trust schema used for the durable receipt. */
+  reviewLearningCaptureVersion?: number;
   createdAt: string;
   updatedAt: string;
   expiresAt: number;
@@ -106,13 +108,14 @@ interface ReviewLearningCaptureRequest {
   repo: string;
   prNumber: number;
   mergeCommitSha: string;
+  captureVersion: number;
   createdAt: string;
   updatedAt: string;
   expiresAt: number;
 }
 
 interface ReviewLearningMigrationState {
-  jobId: 'reviewcapture:migration-v1';
+  jobId: string;
   status: 'reviewcapture:migration-running' | 'reviewcapture:migration-done';
   cursor?: Record<string, string>;
   createdAt: string;
@@ -122,9 +125,23 @@ interface ReviewLearningMigrationState {
 
 const ttl = () => Math.floor(Date.now() / 1000) + 30 * 24 * 3600;
 export const prWatchKey = (repo: string, prNumber: number): string => `prwatch:${repo}#${prNumber}`;
-export const reviewLearningCaptureKey = (repo: string, prNumber: number): string =>
-  `reviewcapture:${repo}#${prNumber}`;
-const REVIEW_LEARNING_MIGRATION_KEY = 'reviewcapture:migration-v1';
+export const REVIEW_LEARNING_CAPTURE_VERSION = 2;
+export const reviewLearningCaptureKey = (
+  repo: string,
+  prNumber: number,
+  captureVersion = REVIEW_LEARNING_CAPTURE_VERSION
+): string => `reviewcapture:v${captureVersion}:${repo}#${prNumber}`;
+const REVIEW_LEARNING_MIGRATION_KEY =
+  `reviewcapture:migration-v${REVIEW_LEARNING_CAPTURE_VERSION}`;
+
+export function hasCurrentReviewLearningCapture(
+  watch: Pick<PrWatch, 'reviewLearningCapturedAt' | 'reviewLearningCaptureVersion'>
+): boolean {
+  return Boolean(
+    watch.reviewLearningCapturedAt &&
+      Number(watch.reviewLearningCaptureVersion ?? 0) >= REVIEW_LEARNING_CAPTURE_VERSION
+  );
+}
 
 export async function getPrWatch(repo: string, prNumber: number): Promise<PrWatch | undefined> {
   const res = await ddb.send(new GetCommand({ TableName: TABLE, Key: { jobId: prWatchKey(repo, prNumber) } }));
@@ -197,7 +214,7 @@ export async function seedLegacyReviewLearningCaptureRequests(maxEvaluated = 100
   );
   const eligible = ((page.Items ?? []) as PrWatch[]).filter(
     (watch) =>
-      !watch.reviewLearningCapturedAt &&
+      !hasCurrentReviewLearningCapture(watch) &&
       Number.isFinite(Date.parse(watch.updatedAt)) &&
       Date.parse(watch.updatedAt) >= cutoffMs
   );
@@ -229,7 +246,10 @@ export async function seedLegacyReviewLearningCaptureRequests(maxEvaluated = 100
       },
     })
   );
-  return eligible;
+  // Seed the whole durable page, but keep the current reconcile tick bounded to the same batch size
+  // as normal backfill. The remaining requests are selected directly from the pending partition on
+  // later ticks instead of turning a schema upgrade into an unbounded control-plane sweep.
+  return eligible.slice(0, Math.min(25, limit));
 }
 
 /**
@@ -320,6 +340,7 @@ export async function ensureReviewLearningCapturePending(
           repo: watch.repo,
           prNumber: watch.prNumber,
           mergeCommitSha,
+          captureVersion: REVIEW_LEARNING_CAPTURE_VERSION,
           createdAt: now,
           updatedAt: now,
           expiresAt: ttl(),
@@ -347,7 +368,7 @@ export async function markReviewLearningCaptureCompleted(
         TableName: TABLE,
         Key: { jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber) },
         UpdateExpression:
-          'SET #s = :done, lessonCount = :lessonCount, mergeCommitSha = :mergeCommitSha, capturedAt = :capturedAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+          'SET #s = :done, lessonCount = :lessonCount, mergeCommitSha = :mergeCommitSha, captureVersion = :captureVersion, capturedAt = :capturedAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
         ConditionExpression: '#s = :pending',
         ExpressionAttributeNames: { '#s': 'status' },
         ExpressionAttributeValues: {
@@ -355,6 +376,7 @@ export async function markReviewLearningCaptureCompleted(
           ':done': 'reviewcapture:done',
           ':lessonCount': Math.max(0, Math.floor(lessonCount)),
           ':mergeCommitSha': mergeCommitSha,
+          ':captureVersion': REVIEW_LEARNING_CAPTURE_VERSION,
           ':capturedAt': now,
           ':updatedAt': now,
           ':expiresAt': ttl(),
@@ -446,13 +468,14 @@ export async function markReviewLearningCaptured(
         TableName: TABLE,
         Key: { jobId: watch.jobId },
         UpdateExpression:
-          'SET reviewLearningCapturedAt = :capturedAt, reviewLearningLessonCount = :lessonCount, reviewLearningMergeCommitSha = :mergeCommitSha, updatedAt = :updatedAt, expiresAt = :expiresAt',
+          'SET reviewLearningCapturedAt = :capturedAt, reviewLearningLessonCount = :lessonCount, reviewLearningMergeCommitSha = :mergeCommitSha, reviewLearningCaptureVersion = :captureVersion, updatedAt = :updatedAt, expiresAt = :expiresAt',
         ConditionExpression:
-          'attribute_exists(jobId) AND attribute_not_exists(reviewLearningCapturedAt)',
+          'attribute_exists(jobId) AND (attribute_not_exists(reviewLearningCapturedAt) OR attribute_not_exists(reviewLearningCaptureVersion) OR reviewLearningCaptureVersion < :captureVersion)',
         ExpressionAttributeValues: {
           ':capturedAt': now,
           ':lessonCount': Math.max(0, Math.floor(lessonCount)),
           ':mergeCommitSha': mergeCommitSha,
+          ':captureVersion': REVIEW_LEARNING_CAPTURE_VERSION,
           ':updatedAt': now,
           ':expiresAt': ttl(),
         },

@@ -41,6 +41,8 @@ export interface ReviewLessonCandidate {
   feedback: string;
   reviewerLogins: string[];
   reviewerAssociations: string[];
+  /** Effective repository permissions used when GitHub's viewer-relative association is ambiguous. */
+  reviewerPermissions?: string[];
   sourceUrl: string;
   feedbackCreatedAt: string;
   evidence: ReviewLessonEvidence;
@@ -207,6 +209,7 @@ export async function recordMergedReviewLessons(input: RecordMergedReviewLessons
     feedbackHash: feedbackHash(lesson.feedback),
     reviewerLogins: lesson.reviewerLogins,
     reviewerAssociations: lesson.reviewerAssociations,
+    reviewerPermissions: lesson.reviewerPermissions,
     sourceUrl: lesson.sourceUrl,
     evidence: lesson.evidence,
     resolvedBy: lesson.resolvedBy,
