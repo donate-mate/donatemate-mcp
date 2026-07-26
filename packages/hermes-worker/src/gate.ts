@@ -19,7 +19,10 @@ import { InfrastructureCommandTimeoutError, runProcessWithTimeout } from './agen
 import { detectPackageManager, workspaceScriptCommand, type PackageManager } from './workspace.js';
 
 const execFileP = promisify(execFile);
-const CMD_TIMEOUT_MS = Number(process.env.GATE_CMD_TIMEOUT_SECONDS ?? 600) * 1000;
+// Backend Turbo builds can legitimately exceed ten minutes when a fix spans several workspace
+// dependency graphs. Keep this below the 40-minute job budget while leaving enough room for the
+// package tests that follow the shared build.
+const CMD_TIMEOUT_MS = Number(process.env.GATE_CMD_TIMEOUT_SECONDS ?? 1200) * 1000;
 const BUILD_CONCURRENCY = Math.max(1, Number(process.env.GATE_BUILD_CONCURRENCY ?? 2));
 const OUT_CAP = 12 * 1024;
 
