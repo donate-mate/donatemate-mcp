@@ -65,10 +65,27 @@ function isHermesReviewComment(comment: any): boolean {
 
 /** A rate-limit 403/429 from GitHub, as opposed to a permissions 403. */
 export function isRateLimitError(err: unknown): boolean {
-  const e = err as { status?: number; message?: string };
+  const e = err as {
+    status?: number;
+    message?: string;
+    code?: string;
+    response?: { headers?: Record<string, string | number | undefined> };
+  };
   if (!e) return false;
-  if (e.status !== 403 && e.status !== 429) return false;
-  return /rate limit|secondary rate/i.test(String(e.message ?? ''));
+  if (e.status === 429) return true;
+  const headers = e.response?.headers ?? {};
+  if (
+    e.status === 403 &&
+    (String(headers['x-ratelimit-remaining'] ?? '') === '0' ||
+      headers['retry-after'] !== undefined)
+  ) {
+    return true;
+  }
+  const message = String(e.message ?? '');
+  const rateLimited = /rate limit|secondary rate|quota (?:was )?exceeded/i.test(message);
+  if (/RATE_?LIMIT/i.test(String(e.code ?? ''))) return true;
+  if (!rateLimited) return false;
+  return e.status === 403 || /^GitHub GraphQL(?::|\s+\d+:)/i.test(message);
 }
 
 /**
@@ -894,10 +911,21 @@ async function collectReviewSnapshot(
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, variables: { owner, name, number: prNumber, after } }),
     });
-    if (!res.ok) throw new Error(`GitHub GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    if (!res.ok) {
+      const error = new Error(
+        `GitHub GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`
+      ) as Error & { status?: number };
+      error.status = res.status;
+      throw error;
+    }
     const data = (await res.json()) as any;
     if (data.errors?.length) {
-      throw new Error(`GitHub GraphQL: ${String(data.errors[0]?.message ?? 'unknown error').slice(0, 200)}`);
+      const first = data.errors[0] ?? {};
+      const error = new Error(
+        `GitHub GraphQL: ${String(first.message ?? 'unknown error').slice(0, 200)}`
+      ) as Error & { code?: string };
+      error.code = String(first.type ?? first.extensions?.code ?? '');
+      throw error;
     }
     const pr = data.data?.repository?.pullRequest;
     if (!pr) break;

@@ -84,13 +84,47 @@ export interface PrWatch {
   lastReviewPingSha?: string;
   /** Present while follow-up work is intentionally paused because Jira is not assigned to Hermes. */
   assignmentPausedAt?: string;
+  /** Durable receipt that accepted review feedback was evaluated after merge. */
+  reviewLearningCapturedAt?: string;
+  /** Number of accepted lessons persisted by the merge/backfill capture. Zero is a valid result. */
+  reviewLearningLessonCount?: number;
+  /** Merge commit whose accepted review history was evaluated. */
+  reviewLearningMergeCommitSha?: string;
   createdAt: string;
   updatedAt: string;
   expiresAt: number;
 }
 
+interface ReviewLearningCaptureRequest {
+  jobId: string;
+  status:
+    | 'reviewcapture:pending'
+    | 'reviewcapture:done'
+    | 'reviewcapture:orphaned'
+    | 'reviewcapture:failed';
+  watchJobId: string;
+  repo: string;
+  prNumber: number;
+  mergeCommitSha: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: number;
+}
+
+interface ReviewLearningMigrationState {
+  jobId: 'reviewcapture:migration-v1';
+  status: 'reviewcapture:migration-running' | 'reviewcapture:migration-done';
+  cursor?: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
 const ttl = () => Math.floor(Date.now() / 1000) + 30 * 24 * 3600;
 export const prWatchKey = (repo: string, prNumber: number): string => `prwatch:${repo}#${prNumber}`;
+export const reviewLearningCaptureKey = (repo: string, prNumber: number): string =>
+  `reviewcapture:${repo}#${prNumber}`;
+const REVIEW_LEARNING_MIGRATION_KEY = 'reviewcapture:migration-v1';
 
 export async function getPrWatch(repo: string, prNumber: number): Promise<PrWatch | undefined> {
   const res = await ddb.send(new GetCommand({ TableName: TABLE, Key: { jobId: prWatchKey(repo, prNumber) } }));
@@ -128,6 +162,307 @@ export async function listBlockedPrWatches(): Promise<PrWatch[]> {
     })
   );
   return (res.Items ?? []) as PrWatch[];
+}
+
+/**
+ * One-time migration for watches completed before durable capture requests existed.
+ *
+ * Each sweep evaluates one bounded status-index page and persists its LastEvaluatedKey. Eligibility
+ * uses updatedAt (the legacy terminal transition timestamp), not the PR/watch creation timestamp.
+ * The cursor only advances after every eligible row on the page has a deterministic pending
+ * request, so a transient write failure retries the same page instead of silently skipping it.
+ */
+export async function seedLegacyReviewLearningCaptureRequests(maxEvaluated = 100): Promise<PrWatch[]> {
+  const stateResult = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { jobId: REVIEW_LEARNING_MIGRATION_KEY } })
+  );
+  const state = stateResult.Item as ReviewLearningMigrationState | undefined;
+  if (state?.completedAt) return [];
+
+  const configuredDays = Number(process.env.REVIEW_LEARNING_LEGACY_MIGRATION_DAYS ?? 30);
+  const days = Number.isFinite(configuredDays) ? Math.max(1, Math.floor(configuredDays)) : 30;
+  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  const limit = Number.isFinite(maxEvaluated) ? Math.max(1, Math.floor(maxEvaluated)) : 100;
+  const page = await ddb.send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'status-index',
+      KeyConditionExpression: '#s = :s',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: { ':s': 'prwatch:done' },
+      ScanIndexForward: false,
+      Limit: limit,
+      ExclusiveStartKey: state?.cursor,
+    })
+  );
+  const eligible = ((page.Items ?? []) as PrWatch[]).filter(
+    (watch) =>
+      !watch.reviewLearningCapturedAt &&
+      Number.isFinite(Date.parse(watch.updatedAt)) &&
+      Date.parse(watch.updatedAt) >= cutoffMs
+  );
+  await Promise.all(
+    eligible.map((watch) =>
+      ensureReviewLearningCapturePending(
+        watch,
+        watch.reviewLearningMergeCommitSha || watch.headSha
+      )
+    )
+  );
+
+  const now = new Date().toISOString();
+  const cursor = page.LastEvaluatedKey as Record<string, string> | undefined;
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { jobId: REVIEW_LEARNING_MIGRATION_KEY },
+      UpdateExpression: cursor
+        ? 'SET #s = :running, #cursor = :cursor, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt'
+        : 'SET #s = :done, completedAt = :completedAt, createdAt = if_not_exists(createdAt, :createdAt), updatedAt = :updatedAt REMOVE #cursor',
+      ExpressionAttributeNames: { '#s': 'status', '#cursor': 'cursor' },
+      ExpressionAttributeValues: {
+        ...(cursor
+          ? { ':running': 'reviewcapture:migration-running', ':cursor': cursor }
+          : { ':done': 'reviewcapture:migration-done', ':completedAt': now }),
+        ':createdAt': now,
+        ':updatedAt': now,
+      },
+    })
+  );
+  return eligible;
+}
+
+/**
+ * Durable merge-time capture requests that have passed the GitHub settle delay.
+ *
+ * Requests have their own status-index partition, timestamped when merge completion is observed.
+ * The query therefore selects pending work directly: long-lived PRs are not excluded by their
+ * original watch timestamp, and newer completed watches cannot starve older requests behind a
+ * filtered/page-capped query.
+ */
+export async function listReviewLearningBackfillWatches(maxResults = 25): Promise<PrWatch[]> {
+  const configuredDelay = Number(process.env.REVIEW_LEARNING_BACKFILL_DELAY_SECONDS ?? 60);
+  const delaySeconds = Number.isFinite(configuredDelay) ? Math.max(0, configuredDelay) : 60;
+  const readyBefore = new Date(Date.now() - delaySeconds * 1000).toISOString();
+  const res = await ddb.send(
+    new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'status-index',
+      KeyConditionExpression: '#s = :s AND createdAt <= :readyBefore',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: {
+        ':s': 'reviewcapture:pending',
+        ':readyBefore': readyBefore,
+      },
+      ScanIndexForward: true,
+      Limit: Math.max(1, Math.floor(maxResults)),
+    })
+  );
+  const requests = (res.Items ?? []) as ReviewLearningCaptureRequest[];
+  const watches = await Promise.all(
+    requests.map(async (request) => {
+      const watch = await ddb.send(
+        new GetCommand({ TableName: TABLE, Key: { jobId: request.watchJobId } })
+      );
+      return watch.Item as PrWatch | undefined;
+    })
+  );
+  await Promise.all(
+    requests.map(async (request, index) => {
+      if (watches[index]) return;
+      const now = new Date().toISOString();
+      try {
+        await ddb.send(
+          new UpdateCommand({
+            TableName: TABLE,
+            Key: { jobId: request.jobId },
+            UpdateExpression:
+              'SET #s = :orphaned, orphanedAt = :orphanedAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+            ConditionExpression: '#s = :pending',
+            ExpressionAttributeNames: { '#s': 'status' },
+            ExpressionAttributeValues: {
+              ':pending': 'reviewcapture:pending',
+              ':orphaned': 'reviewcapture:orphaned',
+              ':orphanedAt': now,
+              ':updatedAt': now,
+              ':expiresAt': ttl(),
+            },
+          })
+        );
+      } catch (err) {
+        if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') throw err;
+      }
+    })
+  );
+  return watches.filter((watch): watch is PrWatch => Boolean(watch));
+}
+
+/**
+ * Create a durable retry request before the merge snapshot is evaluated.
+ *
+ * The deterministic key plus conditional put makes this an outbox receipt: duplicate webhook
+ * replicas cannot create duplicate work, and a completed request cannot be recreated by a stale
+ * replica. Its createdAt is the merge-observed timestamp used by the delayed status-index query.
+ */
+export async function ensureReviewLearningCapturePending(
+  watch: PrWatch,
+  mergeCommitSha: string
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: TABLE,
+        Item: {
+          jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber),
+          status: 'reviewcapture:pending',
+          watchJobId: watch.jobId,
+          repo: watch.repo,
+          prNumber: watch.prNumber,
+          mergeCommitSha,
+          createdAt: now,
+          updatedAt: now,
+          expiresAt: ttl(),
+        } satisfies ReviewLearningCaptureRequest,
+        ConditionExpression: 'attribute_not_exists(jobId)',
+      })
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/** Retire the durable capture request after the watch has its terminal capture receipt. */
+export async function markReviewLearningCaptureCompleted(
+  watch: PrWatch,
+  lessonCount: number,
+  mergeCommitSha: string
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber) },
+        UpdateExpression:
+          'SET #s = :done, lessonCount = :lessonCount, mergeCommitSha = :mergeCommitSha, capturedAt = :capturedAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+        ConditionExpression: '#s = :pending',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':pending': 'reviewcapture:pending',
+          ':done': 'reviewcapture:done',
+          ':lessonCount': Math.max(0, Math.floor(lessonCount)),
+          ':mergeCommitSha': mergeCommitSha,
+          ':capturedAt': now,
+          ':updatedAt': now,
+          ':expiresAt': ttl(),
+        },
+      })
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * Count an isolated backfill failure and dead-letter a poison request after a bounded number of
+ * sweeps. Shared GitHub rate-limit failures are handled by the caller and never charged here.
+ */
+export async function recordReviewLearningCaptureFailure(
+  watch: PrWatch,
+  error: unknown
+): Promise<{ attempts: number; terminal: boolean }> {
+  const configuredMax = Number(process.env.REVIEW_LEARNING_BACKFILL_MAX_ATTEMPTS ?? 5);
+  const maxAttempts = Number.isFinite(configuredMax) ? Math.max(1, Math.floor(configuredMax)) : 5;
+  const now = new Date().toISOString();
+  const message = (error instanceof Error ? `${error.name}: ${error.message}` : String(error)).slice(
+    0,
+    1000
+  );
+  try {
+    const result = await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber) },
+        UpdateExpression:
+          'SET lastError = :lastError, lastFailedAt = :lastFailedAt, updatedAt = :updatedAt, expiresAt = :expiresAt ADD failureCount :one',
+        ConditionExpression: '#s = :pending',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':pending': 'reviewcapture:pending',
+          ':lastError': message,
+          ':lastFailedAt': now,
+          ':updatedAt': now,
+          ':expiresAt': ttl(),
+          ':one': 1,
+        },
+        ReturnValues: 'ALL_NEW',
+      })
+    );
+    const attempts = Number(result.Attributes?.failureCount ?? 0);
+    if (attempts < maxAttempts) return { attempts, terminal: false };
+
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: reviewLearningCaptureKey(watch.repo, watch.prNumber) },
+        UpdateExpression:
+          'SET #s = :failed, failedAt = :failedAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+        ConditionExpression: '#s = :pending AND failureCount >= :maxAttempts',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':pending': 'reviewcapture:pending',
+          ':failed': 'reviewcapture:failed',
+          ':failedAt': now,
+          ':updatedAt': now,
+          ':expiresAt': ttl(),
+          ':maxAttempts': maxAttempts,
+        },
+      })
+    );
+    return { attempts, terminal: true };
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      return { attempts: 0, terminal: false };
+    }
+    throw err;
+  }
+}
+
+/** Mark review-learning capture exactly once so concurrent webhook replicas remain idempotent. */
+export async function markReviewLearningCaptured(
+  watch: PrWatch,
+  lessonCount: number,
+  mergeCommitSha: string
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId: watch.jobId },
+        UpdateExpression:
+          'SET reviewLearningCapturedAt = :capturedAt, reviewLearningLessonCount = :lessonCount, reviewLearningMergeCommitSha = :mergeCommitSha, updatedAt = :updatedAt, expiresAt = :expiresAt',
+        ConditionExpression:
+          'attribute_exists(jobId) AND attribute_not_exists(reviewLearningCapturedAt)',
+        ExpressionAttributeValues: {
+          ':capturedAt': now,
+          ':lessonCount': Math.max(0, Math.floor(lessonCount)),
+          ':mergeCommitSha': mergeCommitSha,
+          ':updatedAt': now,
+          ':expiresAt': ttl(),
+        },
+      })
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
 }
 
 /**

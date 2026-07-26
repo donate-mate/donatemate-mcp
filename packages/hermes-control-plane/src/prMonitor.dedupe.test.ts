@@ -11,7 +11,13 @@ process.env.JOBS_TABLE ??= 'test-table';
 process.env.AWS_REGION ??= 'us-east-2';
 
 import { describe, expect, it } from 'vitest';
-import { dedupeNewSignals, isRetryOfHandledSignal, reviewReplyTargetsForSignals } from './prMonitor.js';
+import {
+  dedupeNewSignals,
+  isRetryOfHandledSignal,
+  reviewReplyTargetsForSignals,
+  shouldFinalizeReviewLearningCapture,
+} from './prMonitor.js';
+import { isRateLimitError } from './github.js';
 import type { PrSignal, PrWatch } from './prWatch.js';
 
 const HEAD = 'd726d96c4c1cf8055825279bd75c622aca98e504';
@@ -134,5 +140,43 @@ describe('reviewReplyTargetsForSignals', () => {
         url: inline.url,
       },
     ]);
+  });
+});
+
+describe('review-learning capture completion', () => {
+  it('defers an empty merge snapshot until the durable pending request is retried', () => {
+    expect(shouldFinalizeReviewLearningCapture(0)).toBe(false);
+  });
+
+  it('finalizes an accepted lesson immediately and a zero-lesson backfill exactly once', () => {
+    expect(shouldFinalizeReviewLearningCapture(1)).toBe(true);
+    expect(shouldFinalizeReviewLearningCapture(0, true)).toBe(true);
+  });
+});
+
+describe('GitHub rate-limit classification', () => {
+  it('recognizes REST and status-less GraphQL quota errors', () => {
+    expect(isRateLimitError({ status: 403, message: 'API rate limit exceeded' })).toBe(true);
+    expect(isRateLimitError({ status: 429, message: 'Too Many Requests' })).toBe(true);
+    expect(
+      isRateLimitError({
+        status: 403,
+        message: 'Forbidden',
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      })
+    ).toBe(true);
+    expect(isRateLimitError(new Error('GitHub GraphQL: API rate limit exceeded'))).toBe(true);
+    expect(
+      isRateLimitError(
+        Object.assign(new Error('GitHub GraphQL: request failed'), { code: 'RATE_LIMITED' })
+      )
+    ).toBe(true);
+  });
+
+  it('does not treat permission failures or unrelated GraphQL errors as rate limits', () => {
+    expect(
+      isRateLimitError({ status: 403, message: 'Resource not accessible by integration' })
+    ).toBe(false);
+    expect(isRateLimitError(new Error('GitHub GraphQL: repository not found'))).toBe(false);
   });
 });

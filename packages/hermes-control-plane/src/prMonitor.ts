@@ -42,8 +42,14 @@ import {
   getPrWatch,
   listActivePrWatches,
   listBlockedPrWatches,
+  listReviewLearningBackfillWatches,
+  seedLegacyReviewLearningCaptureRequests,
   markWatchBlocked,
   acquireReconcileLease,
+  ensureReviewLearningCapturePending,
+  markReviewLearningCaptured,
+  markReviewLearningCaptureCompleted,
+  recordReviewLearningCaptureFailure,
   markWatchQaQueued,
   markWatchReady,
   markReviewPinged,
@@ -83,6 +89,12 @@ const RETRY_UNRESOLVED_SIGNALS = !/^(0|false|no|off)$/i.test(process.env.PR_MONI
 const FIX_RETRY_COOLDOWN_SECONDS = Number(process.env.PR_MONITOR_FIX_RETRY_COOLDOWN_SECONDS ?? 10 * 60);
 // Re-request human review on a green PR whose reviewer left CHANGES_REQUESTED (once per head sha).
 const REVIEW_REPING_ENABLED = !/^(0|false|no|off)$/i.test(process.env.PR_MONITOR_REVIEW_REPING ?? 'true');
+const configuredReviewLearningRetryMs = Number(
+  process.env.REVIEW_LEARNING_MERGE_RETRY_MS ?? 1500
+);
+const REVIEW_LEARNING_MERGE_RETRY_MS = Number.isFinite(configuredReviewLearningRetryMs)
+  ? Math.max(250, configuredReviewLearningRetryMs)
+  : 1500;
 // Do not start a poll sweep with less than this much of the 5,000/hr installation REST budget left —
 // webhook-driven reconciles and the fix jobs' own pushes/comments need headroom.
 const RECONCILE_BUDGET_RESERVE = Number(process.env.PR_MONITOR_BUDGET_RESERVE ?? 500);
@@ -794,6 +806,113 @@ async function rebaseOverlappingPrsAfterMerge(mergedWatch: PrWatch, log: Fastify
   }
 }
 
+/**
+ * Persist review memory after merge and leave a durable capture receipt on the watch.
+ *
+ * A durable capture request is created at merge before evaluating GitHub's snapshot. An immediate
+ * snapshot with zero lessons gets one delayed refresh because GitHub can expose the merge before
+ * its just-submitted approval appears in GraphQL. If it is still empty, leave the request pending;
+ * a later backfill evaluates it once more. A backfill records zero as a valid terminal result so
+ * clean/no-review PRs do not remain in the retry set forever.
+ */
+async function captureMergedReviewLearning(
+  watch: PrWatch,
+  initialSnapshot: Awaited<ReturnType<typeof collectPrSnapshot>>,
+  log: FastifyBaseLogger,
+  opts: { backfill?: boolean } = {}
+): Promise<number> {
+  const isBackfill = opts.backfill === true;
+  if (watch.reviewLearningCapturedAt) {
+    await markReviewLearningCaptureCompleted(
+      watch,
+      watch.reviewLearningLessonCount ?? 0,
+      watch.reviewLearningMergeCommitSha ?? initialSnapshot.mergeCommitSha ?? initialSnapshot.headSha
+    );
+    return watch.reviewLearningLessonCount ?? 0;
+  }
+
+  let snapshot = initialSnapshot;
+  let pendingRequestAvailable = isBackfill;
+  if (!isBackfill) {
+    try {
+      await ensureReviewLearningCapturePending(
+        watch,
+        snapshot.mergeCommitSha || snapshot.headSha
+      );
+      pendingRequestAvailable = true;
+    } catch (err) {
+      log.warn(
+        { err, repo: watch.repo, prNumber: watch.prNumber },
+        'could not create durable PR-review capture request; continuing immediate capture'
+      );
+    }
+  }
+
+  if (!snapshot.reviewLessons.length && !isBackfill) {
+    await new Promise((resolve) => setTimeout(resolve, REVIEW_LEARNING_MERGE_RETRY_MS));
+    const refreshed = await collectPrSnapshot(watch);
+    if (refreshed.state === 'MERGED') snapshot = refreshed;
+  }
+
+  const mergeCommitSha = snapshot.mergeCommitSha || snapshot.headSha;
+  const recorded = await recordMergedReviewLessons({
+    repo: watch.repo,
+    type: watch.type,
+    baseBranch: snapshot.baseBranch,
+    prNumber: watch.prNumber,
+    prUrl: snapshot.prUrl,
+    mergeCommitSha,
+    issueKey: watch.issueKey,
+    labels: snapshot.labels,
+    lessons: snapshot.reviewLessons,
+  });
+
+  if (shouldFinalizeReviewLearningCapture(recorded, isBackfill)) {
+    const marked = await markReviewLearningCaptured(watch, recorded, mergeCommitSha);
+    await markReviewLearningCaptureCompleted(watch, recorded, mergeCommitSha);
+    if (marked) {
+      log.info(
+        { repo: watch.repo, prNumber: watch.prNumber, lessons: recorded, backfill: isBackfill },
+        'completed accepted PR-review learning capture'
+      );
+    }
+  } else {
+    if (!pendingRequestAvailable) {
+      try {
+        await ensureReviewLearningCapturePending(watch, mergeCommitSha);
+        pendingRequestAvailable = true;
+      } catch (err) {
+        log.error(
+          { err, repo: watch.repo, prNumber: watch.prNumber },
+          'empty PR-review capture has no durable retry request'
+        );
+      }
+    }
+    log.info(
+      { repo: watch.repo, prNumber: watch.prNumber, durable: pendingRequestAvailable },
+      'deferred empty PR-review learning capture to durable backfill'
+    );
+  }
+  return recorded;
+}
+
+export function shouldFinalizeReviewLearningCapture(recorded: number, isBackfill = false): boolean {
+  return recorded > 0 || isBackfill;
+}
+
+async function backfillPendingReviewLearning(
+  watch: PrWatch,
+  log: FastifyBaseLogger
+): Promise<void> {
+  const snapshot = await collectPrSnapshot(watch);
+  if (snapshot.state !== 'MERGED') {
+    throw new Error(
+      `pending PR-review capture expected a merged PR but GitHub returned ${snapshot.state}`
+    );
+  }
+  await captureMergedReviewLearning(watch, snapshot, log, { backfill: true });
+}
+
 export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, extraSignals: PrSignal[] = []): Promise<void> {
   let currentWatch = watch;
   const snapshot = await collectPrSnapshot(currentWatch, extraSignals);
@@ -804,29 +923,16 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
     // Merge is the final acceptance gate for experiential review memory. Capture is idempotent and
     // fail-open: learning can never delay or block post-merge QA/deployment verification.
     try {
-      const recorded = await recordMergedReviewLessons({
-        repo: currentWatch.repo,
-        type: currentWatch.type,
-        baseBranch: snapshot.baseBranch,
-        prNumber: currentWatch.prNumber,
-        prUrl: snapshot.prUrl,
-        mergeCommitSha,
-        issueKey: currentWatch.issueKey,
-        labels: snapshot.labels,
-        lessons: snapshot.reviewLessons,
-      });
-      if (recorded) {
-        log.info(
-          { repo: currentWatch.repo, prNumber: currentWatch.prNumber, lessons: recorded },
-          'recorded accepted PR-review lessons'
-        );
-      }
+      await captureMergedReviewLearning(currentWatch, snapshot, log);
     } catch (err) {
       log.warn(
         { err, repo: currentWatch.repo, prNumber: currentWatch.prNumber },
         'failed to record PR-review lessons; continuing merge flow'
       );
     }
+    // A terminal watch reached this branch only for bounded learning backfill. Do not repeat
+    // overlap coordination or post-merge QA/deployment side effects.
+    if (currentWatch.status === 'prwatch:done') return;
     let recoveryRun: WorkflowRunSummary | null = null;
     if (currentWatch.status === 'prwatch:blocked') {
       recoveryRun = await recoveryWorkflowSignal(currentWatch, mergeCommitSha, log);
@@ -1030,15 +1136,43 @@ export async function reconcileOpenPrs(log: FastifyBaseLogger, opts: { periodic?
     return;
   }
 
-  const [active, blocked] = await Promise.all([listActivePrWatches(), listBlockedPrWatches()]);
+  const [active, blocked, pendingLearningBackfill, migratedLearningBackfill] = await Promise.all([
+    listActivePrWatches(),
+    listBlockedPrWatches(),
+    listReviewLearningBackfillWatches().catch((err) => {
+      log.warn({ err }, 'failed to list pending PR-review captures; continuing normal reconcile');
+      return [];
+    }),
+    seedLegacyReviewLearningCaptureRequests().catch((err) => {
+      log.warn({ err }, 'failed to seed legacy PR-review captures; continuing normal reconcile');
+      return [];
+    }),
+  ]);
+  const learningBackfill = [
+    ...new Map(
+      [...pendingLearningBackfill, ...migratedLearningBackfill].map((watch) => [
+        watch.jobId,
+        watch,
+      ])
+    ).values(),
+  ];
   const watches = [...active, ...blocked.filter(isRecoverableDeploymentBlock)];
-  if (!watches.length) return;
+  const budgetProbe = watches[0] ?? learningBackfill[0];
+  if (!budgetProbe) return;
 
   // Leave headroom for webhook-driven reconciles and for the fix jobs themselves (which push, label
   // and comment). A sweep started on an empty budget just 403s its way through every watch.
-  const remaining = await remainingRestBudget(watches[0].repo);
+  const remaining = await remainingRestBudget(budgetProbe.repo);
   if (remaining < RECONCILE_BUDGET_RESERVE) {
-    log.warn({ remaining, reserve: RECONCILE_BUDGET_RESERVE, watches: watches.length }, 'skipping PR reconcile sweep — GitHub REST budget too low');
+    log.warn(
+      {
+        remaining,
+        reserve: RECONCILE_BUDGET_RESERVE,
+        watches: watches.length,
+        learningBackfill: learningBackfill.length,
+      },
+      'skipping PR reconcile sweep — GitHub REST budget too low'
+    );
     return;
   }
 
@@ -1052,6 +1186,41 @@ export async function reconcileOpenPrs(log: FastifyBaseLogger, opts: { periodic?
         return;
       }
       log.error({ err, repo: watch.repo, prNumber: watch.prNumber }, 'PR reconciliation failed');
+    }
+  }
+
+  // Pending capture requests are learning-only: never send their watches back through coordination,
+  // ticket transitions, or post-merge deployment orchestration.
+  for (const watch of learningBackfill) {
+    try {
+      await backfillPendingReviewLearning(watch, log);
+    } catch (err) {
+      if (isRateLimitError(err)) {
+        log.error(
+          { err, repo: watch.repo, prNumber: watch.prNumber },
+          'GitHub rate limit hit — aborting PR-review learning backfill'
+        );
+        return;
+      }
+      const failure = await recordReviewLearningCaptureFailure(watch, err).catch(
+        (failureError) => {
+          log.warn(
+            { err: failureError, repo: watch.repo, prNumber: watch.prNumber },
+            'failed to update PR-review capture retry state'
+          );
+          return { attempts: 0, terminal: false };
+        }
+      );
+      log.error(
+        {
+          err,
+          repo: watch.repo,
+          prNumber: watch.prNumber,
+          captureAttempts: failure.attempts,
+          captureDeadLettered: failure.terminal,
+        },
+        'PR-review learning backfill failed'
+      );
     }
   }
 }
