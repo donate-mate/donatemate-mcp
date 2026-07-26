@@ -17,6 +17,7 @@ import {
   reviewReplyTargetsForSignals,
   shouldFinalizeReviewLearningCapture,
 } from './prMonitor.js';
+import { isRateLimitError } from './github.js';
 import type { PrSignal, PrWatch } from './prWatch.js';
 
 const HEAD = 'd726d96c4c1cf8055825279bd75c622aca98e504';
@@ -150,5 +151,24 @@ describe('review-learning capture completion', () => {
   it('finalizes an accepted lesson immediately and a zero-lesson backfill exactly once', () => {
     expect(shouldFinalizeReviewLearningCapture(1)).toBe(true);
     expect(shouldFinalizeReviewLearningCapture(0, true)).toBe(true);
+  });
+});
+
+describe('GitHub rate-limit classification', () => {
+  it('recognizes REST and status-less GraphQL quota errors', () => {
+    expect(isRateLimitError({ status: 403, message: 'API rate limit exceeded' })).toBe(true);
+    expect(isRateLimitError(new Error('GitHub GraphQL: API rate limit exceeded'))).toBe(true);
+    expect(
+      isRateLimitError(
+        Object.assign(new Error('GitHub GraphQL: request failed'), { code: 'RATE_LIMITED' })
+      )
+    ).toBe(true);
+  });
+
+  it('does not treat permission failures or unrelated GraphQL errors as rate limits', () => {
+    expect(
+      isRateLimitError({ status: 403, message: 'Resource not accessible by integration' })
+    ).toBe(false);
+    expect(isRateLimitError(new Error('GitHub GraphQL: repository not found'))).toBe(false);
   });
 });
