@@ -103,12 +103,13 @@ interface ReviewLearningCaptureRequest {
     | 'reviewcapture:pending'
     | 'reviewcapture:done'
     | 'reviewcapture:orphaned'
-    | 'reviewcapture:failed';
+    | 'reviewcapture:failed'
+    | 'reviewcapture:superseded';
   watchJobId: string;
   repo: string;
   prNumber: number;
   mergeCommitSha: string;
-  captureVersion: number;
+  captureVersion?: number;
   createdAt: string;
   updatedAt: string;
   expiresAt: number;
@@ -289,7 +290,43 @@ export async function listReviewLearningBackfillWatches(maxResults = 25): Promis
   );
   await Promise.all(
     requests.map(async (request, index) => {
-      if (watches[index]) return;
+      const watch = watches[index];
+      if (watch) {
+        const currentKey = reviewLearningCaptureKey(watch.repo, watch.prNumber);
+        if (request.jobId === currentKey) return;
+
+        // A rolling schema upgrade can select a legacy pending row. Create the current request
+        // before retiring the old one so a crash cannot lose the capture, then let this same sweep
+        // process the watch against the current-version key.
+        await ensureReviewLearningCapturePending(
+          watch,
+          request.mergeCommitSha || watch.reviewLearningMergeCommitSha || watch.headSha
+        );
+        const now = new Date().toISOString();
+        try {
+          await ddb.send(
+            new UpdateCommand({
+              TableName: TABLE,
+              Key: { jobId: request.jobId },
+              UpdateExpression:
+                'SET #s = :superseded, supersededBy = :supersededBy, supersededAt = :supersededAt, updatedAt = :updatedAt, expiresAt = :expiresAt',
+              ConditionExpression: '#s = :pending',
+              ExpressionAttributeNames: { '#s': 'status' },
+              ExpressionAttributeValues: {
+                ':pending': 'reviewcapture:pending',
+                ':superseded': 'reviewcapture:superseded',
+                ':supersededBy': currentKey,
+                ':supersededAt': now,
+                ':updatedAt': now,
+                ':expiresAt': ttl(),
+              },
+            })
+          );
+        } catch (err) {
+          if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') throw err;
+        }
+        return;
+      }
       const now = new Date().toISOString();
       try {
         await ddb.send(
