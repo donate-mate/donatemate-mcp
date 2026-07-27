@@ -949,6 +949,13 @@ export function shouldRecoverAttemptCapWatch(
   );
 }
 
+export function shouldRecoverReopenedWatch(watch: PrWatch): boolean {
+  return (
+    watch.status === 'prwatch:blocked' &&
+    /^PR was closed before merge:/i.test(String(watch.blockReason ?? ''))
+  );
+}
+
 async function backfillPendingReviewLearning(
   watch: PrWatch,
   log: FastifyBaseLogger
@@ -1012,41 +1019,47 @@ export async function reconcilePrWatch(watch: PrWatch, log: FastifyBaseLogger, e
     return;
   }
 
-  // A cap can race the final CI/review webhooks from attempt N. If the authoritative snapshot is
-  // now green with no new actionable feedback, recover without requiring a meaningless human
-  // commit. Otherwise a real human commit still explicitly revives any kind of blocked watch.
+  // A reopened PR is authoritative recovery from a closed-before-merge block. Separately, a cap
+  // can race the final CI/review webhooks from attempt N; recover when the resulting snapshot is
+  // green with no new actionable feedback. Otherwise a real human commit still explicitly
+  // revives any kind of blocked watch.
   if (currentWatch.status === 'prwatch:blocked') {
+    const recoveredAfterReopen = shouldRecoverReopenedWatch(currentWatch);
     const recoveredAtCap = shouldRecoverAttemptCapWatch(
       currentWatch,
       snapshot.ciState,
       snapshot.signals
     );
     let humanAdvanced = false;
-    if (!recoveredAtCap && AUTO_UNBLOCK_ON_HUMAN_COMMIT) {
+    if (!recoveredAfterReopen && !recoveredAtCap && AUTO_UNBLOCK_ON_HUMAN_COMMIT) {
       const advanced = snapshot.headSha && snapshot.headSha !== currentWatch.headSha;
       humanAdvanced =
         Boolean(advanced) && !(await isHermesCommit(currentWatch.repo, snapshot.headSha));
     }
-    if (!recoveredAtCap && !humanAdvanced) return;
+    if (!recoveredAfterReopen && !recoveredAtCap && !humanAdvanced) return;
 
     const unblocked = await unblockWatch(currentWatch, snapshot.headSha);
     if (!unblocked) return;
+    let recoveryReason = 'human_commit';
+    let recoveryComment = `▶️ A new commit was pushed to ${snapshot.prUrl}; Hermes resumed automated CI/review fixes.`;
+    if (recoveredAfterReopen) {
+      recoveryReason = 'pr_reopened';
+      recoveryComment = `▶️ ${snapshot.prUrl} was reopened; Hermes resumed automated CI/review fixes.`;
+    } else if (recoveredAtCap) {
+      recoveryReason = 'healthy_after_attempt_cap';
+      recoveryComment = `▶️ Hermes rechecked ${snapshot.prUrl} after the repair cap: CI is green and no new actionable review feedback remains, so monitoring resumed automatically.`;
+    }
     log.info(
       {
         repo: currentWatch.repo,
         prNumber: currentWatch.prNumber,
         headSha: snapshot.headSha.slice(0, 8),
-        reason: recoveredAtCap ? 'healthy_after_attempt_cap' : 'human_commit',
+        reason: recoveryReason,
       },
       'auto-unblocked PR watch'
     );
     if (currentWatch.issueKey) {
-      await commentOnIssue(
-        currentWatch.issueKey,
-        recoveredAtCap
-          ? `▶️ Hermes rechecked ${snapshot.prUrl} after the repair cap: CI is green and no new actionable review feedback remains, so monitoring resumed automatically.`
-          : `▶️ A new commit was pushed to ${snapshot.prUrl}; Hermes resumed automated CI/review fixes.`
-      ).catch(() => {});
+      await commentOnIssue(currentWatch.issueKey, recoveryComment).catch(() => {});
     }
     currentWatch = unblocked;
   }
