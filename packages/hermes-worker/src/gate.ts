@@ -102,7 +102,7 @@ export function runGateCommand(
       return {
         code: result.code,
         out: `${result.stdout}\n${result.stderr}`.trim().slice(-OUT_CAP),
-        timedOut: false,
+        timedOut: result.timedOut,
       };
     })
     .catch((error) => {
