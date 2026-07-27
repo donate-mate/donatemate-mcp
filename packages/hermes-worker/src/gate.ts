@@ -23,6 +23,7 @@ const execFileP = promisify(execFile);
 // dependency graphs. Keep this below the 40-minute job budget while leaving enough room for the
 // package tests that follow the shared build.
 const CMD_TIMEOUT_MS = Number(process.env.GATE_CMD_TIMEOUT_SECONDS ?? 1200) * 1000;
+const BUILD_TIMEOUT_MS = Number(process.env.GATE_BUILD_TIMEOUT_SECONDS ?? 600) * 1000;
 const BUILD_CONCURRENCY = Math.max(1, Number(process.env.GATE_BUILD_CONCURRENCY ?? 2));
 const OUT_CAP = 12 * 1024;
 
@@ -73,7 +74,8 @@ export function runGateCommand(
   cmd: string,
   args: string[],
   cwd: string,
-  timeoutMs = CMD_TIMEOUT_MS
+  timeoutMs = CMD_TIMEOUT_MS,
+  options: { restartContainerOnTimeout?: boolean } = {}
 ): Promise<GateCommandResult> {
   // NODE_ENV=test (not the image's 'production', which would skip dev tooling/behavior); HUSKY=0 so
   // no repo hook fires while the gate runs the repo's own prettier/eslint/test scripts.
@@ -92,7 +94,7 @@ export function runGateCommand(
     timeoutMs,
   })
     .then((result) => {
-      if (result.timedOut) {
+      if (result.timedOut && options.restartContainerOnTimeout !== false) {
         // The wrapper may have exited after daemonizing a child, making that child unobservable
         // through /proc. Force a fresh ECS task before SQS retry instead of continuing this worker.
         throw new InfrastructureCommandTimeoutError(`gate: ${cmd}`, timeoutMs);
@@ -100,7 +102,7 @@ export function runGateCommand(
       return {
         code: result.code,
         out: `${result.stdout}\n${result.stderr}`.trim().slice(-OUT_CAP),
-        timedOut: false,
+        timedOut: result.timedOut,
       };
     })
     .catch((error) => {
@@ -178,6 +180,20 @@ function summarize(check: GateCommandResult, extra = ''): string {
   return `${extra}${why}\n${check.out}`.trim();
 }
 
+function finalizeGate(changedPackages: string[], checks: GateCheck[]): GateResult {
+  const failures = checks.filter((check) => !check.ok);
+  const report = failures.length
+    ? [
+        'The pre-commit gate found problems in the packages you changed. Fix ONLY these issues; keep the implementation intent and avoid unrelated refactors.',
+        '',
+        ...failures.map((failure) =>
+          [`### ${failure.name} FAILED`, '```text', failure.output.slice(-6000), '```'].join('\n')
+        ),
+      ].join('\n')
+    : '';
+  return { ok: failures.length === 0, changedPackages, checks, report };
+}
+
 /**
  * Run the gate. `installOk` false means WS1 couldn't install deps — we still run prettier (which is
  * cheap and dependency-light) but mark eslint/tests as skipped-because-uninstalled so the caller
@@ -237,6 +253,15 @@ export async function runGate(
     await reportProgress(onProgress, 'eslint skipped');
   }
 
+  // Do not spend minutes building a backend dependency graph when the cheap, actionable checks
+  // already require another agent pass. Repair those first; the next gate run validates the
+  // corrected tree and can then pay the build/test cost once.
+  const cheapResult = finalizeGate(packageNames, checks);
+  if (!cheapResult.ok) {
+    await reportProgress(onProgress, `validation failed: ${gateSummary(cheapResult)}`);
+    return cheapResult;
+  }
+
   // 3) tests (with the repo's own coverage thresholds) per changed package that has a test script.
   if (pm && installOk) {
     // Internal @scope/* workspace packages are TS source that must be BUILT before a dependent
@@ -257,10 +282,22 @@ export async function runGate(
     if (hasTurbo && testPackages.length) {
       const filters = testPackages.flatMap(([name]) => ['--filter', `${name}...`]);
       await reportProgress(onProgress, `building the shared dependency graph for ${testPackages.length} test workspace(s)`);
+      // The daemon is explicitly disabled so the process tree is bounded and a timeout can fail
+      // open safely. GitHub CI remains the authoritative full-build gate after Hermes pushes.
       const build = await runGateCommand(
         'npx',
-        ['--no-install', 'turbo', 'run', 'build', `--concurrency=${BUILD_CONCURRENCY}`, ...filters],
-        dir
+        [
+          '--no-install',
+          'turbo',
+          'run',
+          'build',
+          '--daemon=false',
+          `--concurrency=${BUILD_CONCURRENCY}`,
+          ...filters,
+        ],
+        dir,
+        BUILD_TIMEOUT_MS,
+        { restartContainerOnTimeout: false }
       );
       buildOk = build.code === 0;
       buildFailure = summarize(build, '(workspace dependency build failed)');
@@ -287,16 +324,7 @@ export async function runGate(
     await reportProgress(onProgress, 'package tests skipped because dependencies are unavailable');
   }
 
-  const failures = checks.filter((c) => !c.ok);
-  const report = failures.length
-    ? [
-        'The pre-commit gate found problems in the packages you changed. Fix ONLY these issues; keep the implementation intent and avoid unrelated refactors.',
-        '',
-        ...failures.map((f) => [`### ${f.name} FAILED`, '```text', f.output.slice(-6000), '```'].join('\n')),
-      ].join('\n')
-    : '';
-
-  const result = { ok: failures.length === 0, changedPackages: [...pkgs.keys()], checks, report };
+  const result = finalizeGate(packageNames, checks);
   await reportProgress(onProgress, `validation ${result.ok ? 'passed' : 'failed'}: ${gateSummary(result)}`);
   return result;
 }
