@@ -16,6 +16,7 @@ import {
   isRetryOfHandledSignal,
   reviewReplyTargetsForSignals,
   shouldRecoverAttemptCapWatch,
+  shouldRecoverReopenedWatch,
   shouldFinalizeReviewLearningCapture,
 } from './prMonitor.js';
 import { isRateLimitError } from './github.js';
@@ -156,6 +157,30 @@ describe('attempt-cap recovery', () => {
         },
         'passing',
         [conflictSignal()]
+      )
+    ).toBe(false);
+  });
+});
+
+describe('closed-PR recovery', () => {
+  it('recovers a watch after its closed pull request is reopened', () => {
+    expect(
+      shouldRecoverReopenedWatch(
+        watch({
+          status: 'prwatch:blocked',
+          blockReason: 'PR was closed before merge: https://github.com/donate-mate/donatemate/pull/772',
+        })
+      )
+    ).toBe(true);
+  });
+
+  it('does not treat unrelated blocked watches as reopened', () => {
+    expect(
+      shouldRecoverReopenedWatch(
+        watch({
+          status: 'prwatch:blocked',
+          blockReason: 'maximum automated fix attempts reached (8)',
+        })
       )
     ).toBe(false);
   });
