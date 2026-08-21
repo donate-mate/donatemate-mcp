@@ -94,7 +94,7 @@ this safe to run from multiple control-plane tasks concurrently. GitHub deliveri
 via `ghevent:<delivery-id>` rows.
 
 **Conversational + planning layer** (`src/converse.ts`): thin wrapper over the OpenAI Chat
-Completions API. `CONVERSE_MODEL` (default `gpt-5.3-chat-latest`). Provides `converse` (gather
+Completions API. `CONVERSE_MODEL` (default `gpt-5.6-terra`). Provides `converse` (gather
 requirements), `conversationToTask` (condense transcript → task spec), `planIssue` (reviewer-facing
 plan), and `draftQaScenario`.
 
@@ -332,7 +332,7 @@ tree against the clone baseline (`hasChanges(dir, baseSha)`), so a run that touc
 detected and reported rather than producing an empty/malformed PR.
 
 The conversational/planning layer is a **separate** model (`CONVERSE_MODEL` =
-`gpt-5.3-chat-latest`) used only by the control plane for planning and chat — not for coding.
+`gpt-5.6-terra`) used only by the control plane for planning and chat — not for coding.
 
 ---
 
@@ -388,7 +388,7 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `ENVIRONMENT` | `staging` / `production` |
 | `JOBS_TABLE`, `JOBS_QUEUE_URL`, `ARTIFACTS_BUCKET` | data-plane handles |
 | `SECRET_SLACK`, `SECRET_JIRA_WEBHOOK`, `SECRET_GITHUB_APP`, `SECRET_ANTHROPIC`, `SECRET_OPENAI`, `SECRET_JIRA`, `SECRET_JIRA_BOT` | secret names |
-| `CONVERSE_MODEL` | `gpt-5.3-chat-latest` |
+| `CONVERSE_MODEL` | `gpt-5.6-terra` |
 | `MCP_ENDPOINT` | `https://mcp.donate-mate.com/mcp` |
 | `PR_RECONCILE_SECONDS` | `300` |
 | `REVIEW_LEARNING_ENABLED` | `true` |
@@ -538,5 +538,5 @@ the control plane's `/dispatch` and `/jobs/:id` endpoints.
 
 **OpenAI** — one API key (`SECRET_OPENAI`) serves two distinct roles: the **Codex CLI** coding
 engine on the worker (`AGENT_MODEL=gpt-5.5`) and the **planning/chat** layer on the control plane
-(`CONVERSE_MODEL=gpt-5.3-chat-latest`). The legacy Anthropic key (`SECRET_ANTHROPIC`) is imported
+(`CONVERSE_MODEL=gpt-5.6-terra`). The legacy Anthropic key (`SECRET_ANTHROPIC`) is imported
 but no longer used.
