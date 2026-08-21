@@ -1,13 +1,13 @@
 /**
  * Conversational layer — Hermes talks with the developer to gather a coding task before any
  * code is written, condenses a conversation into a single task spec, and drafts plans for Jira
- * tickets. Uses the OpenAI API. Model pinned via CONVERSE_MODEL (default gpt-5.3-chat-latest).
+ * tickets. Uses the OpenAI API. Model pinned via CONVERSE_MODEL (default gpt-5.6-terra).
  */
 import OpenAI from 'openai';
 import { getSecretJson } from './secrets.js';
 
 const SECRET_OPENAI = process.env.SECRET_OPENAI!;
-const MODEL = process.env.CONVERSE_MODEL || 'gpt-5.3-chat-latest';
+const MODEL = process.env.CONVERSE_MODEL || 'gpt-5.6-terra';
 
 let client: OpenAI | null = null;
 async function getClient(): Promise<OpenAI> {

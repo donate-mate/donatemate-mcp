@@ -280,7 +280,7 @@ export class HermesStack extends cdk.Stack {
         SECRET_GITHUB_APP: secGithub.secretName,
         SECRET_ANTHROPIC: secAnthropic.secretName, // (legacy) Anthropic key, no longer used
         SECRET_OPENAI: secOpenai.secretName, // conversational/planning layer (OpenAI)
-        CONVERSE_MODEL: 'gpt-5.3-chat-latest', // planning + chat model (pinned)
+        CONVERSE_MODEL: 'gpt-5.6-terra', // planning + chat model (pinned)
         SECRET_JIRA: secJira.secretName, // read referenced Jira issues during conversation
         SECRET_JIRA_BOT: secJiraBot.secretName, // write-backs (plan/progress comments + transitions) as Hermes
         MCP_ENDPOINT: props.mcpEndpoint ?? 'https://mcp.donate-mate.com/mcp',
