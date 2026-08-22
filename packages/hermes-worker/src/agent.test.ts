@@ -2,7 +2,13 @@ import { access, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildCodexExecInvocation, runProcessWithTimeout } from './agent.js';
+import {
+  buildClaudeExecInvocation,
+  buildCodexExecInvocation,
+  isProviderUnavailableOutput,
+  parseClaudeOutput,
+  runProcessWithTimeout,
+} from './agent.js';
 
 describe('buildCodexExecInvocation', () => {
   it('streams prompts larger than the OS argv limit through stdin', () => {
@@ -59,4 +65,34 @@ describe('buildCodexExecInvocation', () => {
       }
     }
   );
+});
+
+describe('Anthropic provider failover', () => {
+  it('streams the prompt to Claude Code without putting it on argv', () => {
+    const prompt = 'repair this branch'.repeat(100_000);
+    const invocation = buildClaudeExecInvocation({ model: 'claude-sonnet-5', prompt });
+
+    expect(invocation.args).toContain('-p');
+    expect(invocation.args).toContain('--dangerously-skip-permissions');
+    expect(invocation.args).not.toContain(prompt);
+    expect(invocation.stdin).toBe(prompt);
+  });
+
+  it('parses the structured Claude Code final result', () => {
+    expect(
+      parseClaudeOutput(
+        JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'fixed' }),
+        ''
+      )
+    ).toEqual({ finalMessage: 'fixed', isError: false });
+  });
+
+  it.each([
+    'credit_balance_exhausted',
+    'You have no credits remaining.',
+    'insufficient_quota',
+    'API Error: 529 overloaded_error',
+  ])('classifies provider capacity failures: %s', (message) => {
+    expect(isProviderUnavailableOutput(message)).toBe(true);
+  });
 });

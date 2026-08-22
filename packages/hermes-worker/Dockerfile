@@ -21,8 +21,9 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --no-audit --no-fund --omit=dev
 
-# OpenAI Codex CLI (the coding engine; invoked headless as `codex exec`).
-RUN npm install -g @openai/codex
+# Independent coding engines. Claude Code is pinned and used only when Codex/OpenAI is unavailable,
+# so a single provider's billing or regional outage cannot strand every Hermes instance.
+RUN npm install -g @openai/codex @anthropic-ai/claude-code@2.1.240
 
 COPY tsconfig.json ./
 COPY src ./src

@@ -7,6 +7,7 @@ import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-sec
 
 const client = new SecretsManagerClient({});
 const cache = new Map<string, Record<string, string>>();
+const stringCache = new Map<string, string>();
 
 export async function getSecretJson(name: string): Promise<Record<string, string>> {
   const cached = cache.get(name);
@@ -22,12 +23,21 @@ export async function getSecretJson(name: string): Promise<Record<string, string
 }
 
 export function clearSecretCache(name?: string): void {
-  if (name) cache.delete(name);
-  else cache.clear();
+  if (name) {
+    cache.delete(name);
+    stringCache.delete(name);
+  } else {
+    cache.clear();
+    stringCache.clear();
+  }
 }
 
 /** Plain-string secret (e.g. the Anthropic API key, stored as a raw string not JSON). */
 export async function getSecretString(name: string): Promise<string> {
+  const cached = stringCache.get(name);
+  if (cached !== undefined) return cached;
   const res = await client.send(new GetSecretValueCommand({ SecretId: name }));
-  return (res.SecretString || '').trim();
+  const value = (res.SecretString || '').trim();
+  stringCache.set(name, value);
+  return value;
 }

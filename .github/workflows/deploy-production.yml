@@ -140,8 +140,11 @@ jobs:
         run: |
           npx vitest run \
             packages/lambda-handlers/hermes-db-query/src/index.test.ts \
+            packages/hermes-control-plane/src/converse.test.ts \
+            packages/hermes-worker/src/agent.test.ts \
             packages/hermes-worker/src/gate.test.ts \
             packages/hermes-worker/src/stagingDatabase.test.ts \
+            packages/hermes-worker/src/workspace.test.ts \
             --pool=forks --poolOptions.forks.singleFork=true
           npx tsc --noEmit -p packages/lambda-handlers/hermes-db-query/tsconfig.json
           npx tsc --noEmit -p packages/infrastructure/tsconfig.json
