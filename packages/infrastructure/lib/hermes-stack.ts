@@ -57,7 +57,7 @@ export class HermesStack extends cdk.Stack {
     // (e.g. hermes-worker-count=0 for cost-optimal scale-to-zero).
     const controlPlaneDesired = Number(this.node.tryGetContext('hermes-control-plane-count') ?? 2);
     const workerDesired = Number(this.node.tryGetContext('hermes-worker-count') ?? 1);
-    const workerMax = Number(this.node.tryGetContext('hermes-worker-max') ?? 4);
+    const workerMax = Number(this.node.tryGetContext('hermes-worker-max') ?? 8);
 
     const vpc = ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true });
 
