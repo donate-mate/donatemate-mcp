@@ -36,6 +36,13 @@ export function taskProtectionConfig(env: NodeJS.ProcessEnv = process.env): {
 const { protectionMinutes: PROTECTION_MINUTES, renewSeconds: RENEW_SECONDS } =
   taskProtectionConfig();
 
+export class TaskProtectionUnavailableError extends Error {
+  constructor() {
+    super('ECS rejected task scale-in protection because this worker is already draining');
+    this.name = 'TaskProtectionUnavailableError';
+  }
+}
+
 async function taskIdentity(): Promise<{ cluster: string; taskArn: string } | null> {
   const base = process.env.ECS_CONTAINER_METADATA_URI_V4;
   if (!base) return null;
@@ -92,7 +99,8 @@ export async function setScaleInProtection(
  * can explicitly disable protection.
  */
 export async function startScaleInProtectionRenewal(): Promise<() => Promise<void>> {
-  await setScaleInProtection(true, PROTECTION_MINUTES);
+  const acquired = await setScaleInProtection(true, PROTECTION_MINUTES);
+  if (!acquired) throw new TaskProtectionUnavailableError();
   let stopped = false;
   let renewal: Promise<boolean> | undefined;
   const timer = setInterval(() => {

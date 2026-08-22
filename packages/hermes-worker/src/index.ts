@@ -54,7 +54,10 @@ import {
   recordPrWatch,
 } from './jobs.js';
 import { notify } from './notify.js';
-import { startScaleInProtectionRenewal } from './taskprotection.js';
+import {
+  startScaleInProtectionRenewal,
+  TaskProtectionUnavailableError,
+} from './taskprotection.js';
 import { findIssueKey, fetchIssueContext } from './jira.js';
 import { commentOnIssue, transitionIssue, COLUMN, jiraIssueKey } from './jiraBot.js';
 import { processQaProofJob } from './qaRunner.js';
@@ -71,6 +74,10 @@ const MESSAGE_VISIBILITY_RENEW_SECONDS = Math.max(
   30,
   Math.min(Number(process.env.MESSAGE_VISIBILITY_RENEW_SECONDS ?? 5 * 60), Math.floor(MESSAGE_VISIBILITY_SECONDS / 2))
 );
+const configuredClaimVisibility = Number(process.env.MESSAGE_CLAIM_VISIBILITY_SECONDS ?? 2 * 60);
+const MESSAGE_CLAIM_VISIBILITY_SECONDS = Number.isFinite(configuredClaimVisibility)
+  ? Math.max(30, Math.min(configuredClaimVisibility, MESSAGE_VISIBILITY_SECONDS))
+  : 2 * 60;
 const JIRA_PROGRESS_HEARTBEAT_SECONDS = Math.max(60, Number(process.env.JIRA_PROGRESS_HEARTBEAT_SECONDS ?? 10 * 60));
 const PRECOMMIT_REPAIR_ATTEMPTS = Number(process.env.PRECOMMIT_REPAIR_ATTEMPTS ?? 2);
 const GATE_MAX_RETRIES = Number(process.env.GATE_MAX_RETRIES ?? 3); // WS2
@@ -90,7 +97,7 @@ function startJobHeartbeat(jobId: string): () => void {
 function startMessageVisibilityHeartbeat(receiptHandle: string): () => void {
   let stopped = false;
   let renewing = false;
-  const interval = setInterval(() => {
+  const renew = () => {
     if (stopped || renewing) return;
     renewing = true;
     sqs
@@ -107,10 +114,19 @@ function startMessageVisibilityHeartbeat(receiptHandle: string): () => void {
       .finally(() => {
         renewing = false;
       });
-  }, MESSAGE_VISIBILITY_RENEW_SECONDS * 1000);
+  };
+  // A newly received message has a short claim lease until ECS confirms that this task is not
+  // draining. Extend it soon after protection succeeds, then use the normal long-job cadence.
+  const initialRenewal = setTimeout(
+    renew,
+    Math.max(10, Math.min(30, Math.floor(MESSAGE_CLAIM_VISIBILITY_SECONDS / 2))) * 1000
+  );
+  initialRenewal.unref();
+  const interval = setInterval(renew, MESSAGE_VISIBILITY_RENEW_SECONDS * 1000);
   interval.unref();
   return () => {
     stopped = true;
+    clearTimeout(initialRenewal);
     clearInterval(interval);
   };
 }
@@ -879,7 +895,10 @@ async function loop(): Promise<void> {
         QueueUrl: QUEUE,
         MaxNumberOfMessages: 1,
         WaitTimeSeconds: 20,
-        VisibilityTimeout: MESSAGE_VISIBILITY_SECONDS,
+        // Keep the initial claim short. A task already selected for deployment/scale-in cannot
+        // acquire protection; its message must return promptly instead of disappearing for the
+        // full long-running job lease.
+        VisibilityTimeout: MESSAGE_CLAIM_VISIBILITY_SECONDS,
       })
     );
     for (const m of res.Messages ?? []) {
@@ -892,6 +911,35 @@ async function loop(): Promise<void> {
         stopVisibilityHeartbeat();
         await sqs.send(new DeleteMessageCommand({ QueueUrl: QUEUE, ReceiptHandle: m.ReceiptHandle! }));
       } catch (err) {
+        if (err instanceof TaskProtectionUnavailableError) {
+          // The task is already draining. Hand the work to a healthy worker immediately and
+          // remove this receipt so it neither waits for the visibility lease nor burns a DLQ try.
+          try {
+            const { jobId } = JSON.parse(m.Body || '{}') as { jobId?: string };
+            if (jobId) {
+              await updateJob(jobId, 'queued', { phase: 'waiting for a non-draining worker' });
+            }
+            await sqs.send(
+              new SendMessageCommand({
+                QueueUrl: QUEUE,
+                MessageBody: m.Body || '{}',
+                DelaySeconds: 5,
+              })
+            );
+            stopVisibilityHeartbeat();
+            await sqs.send(
+              new DeleteMessageCommand({ QueueUrl: QUEUE, ReceiptHandle: m.ReceiptHandle! })
+            );
+            console.warn('job requeued because this worker is draining');
+          } catch (requeueError) {
+            // The original message has only the short claim lease and will return promptly.
+            console.error(
+              'failed to hand off job from draining worker; retaining original message:',
+              requeueError
+            );
+          }
+          continue;
+        }
         if (err instanceof AgentProvidersUnavailableError) {
           // A fresh delayed message resets SQS receive count, so a provider billing/outage event
           // cannot exhaust maxReceiveCount and dead-letter otherwise healthy work.

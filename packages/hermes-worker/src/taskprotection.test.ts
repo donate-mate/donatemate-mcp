@@ -1,5 +1,15 @@
-import { describe, expect, it } from 'vitest';
-import { taskProtectionConfig } from './taskprotection.js';
+import { ECSClient } from '@aws-sdk/client-ecs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  startScaleInProtectionRenewal,
+  TaskProtectionUnavailableError,
+  taskProtectionConfig,
+} from './taskprotection.js';
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  delete process.env.ECS_CONTAINER_METADATA_URI_V4;
+});
 
 describe('taskProtectionConfig', () => {
   it('uses a lease longer than the two-hour workflow waits and renews every ten minutes', () => {
@@ -29,5 +39,19 @@ describe('taskProtectionConfig', () => {
       protectionMinutes: 165,
       renewSeconds: 600,
     });
+  });
+
+  it('refuses work when ECS has already selected the task for draining', async () => {
+    process.env.ECS_CONTAINER_METADATA_URI_V4 = 'http://task-metadata';
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      json: async () => ({ Cluster: 'cluster', TaskARN: 'task' }),
+    } as Response);
+    vi.spyOn(ECSClient.prototype, 'send').mockResolvedValue({
+      failures: [{ reason: 'DEPLOYMENT_BLOCKED' }],
+    } as never);
+
+    await expect(startScaleInProtectionRenewal()).rejects.toBeInstanceOf(
+      TaskProtectionUnavailableError
+    );
   });
 });
