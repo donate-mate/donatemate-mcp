@@ -13,7 +13,7 @@
  */
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { InfrastructureCommandTimeoutError, runProcessWithTimeout } from './agent.js';
+import { runProcessWithTimeout } from './agent.js';
 
 const INSTALL_TIMEOUT_MS = Number(process.env.WORKSPACE_INSTALL_TIMEOUT_SECONDS ?? 600) * 1000;
 const LOG_CAP = 24 * 1024;
@@ -34,35 +34,34 @@ interface CmdResult {
   timedOut: boolean;
 }
 
-function run(cmd: string, args: string[], cwd: string, extraEnv: NodeJS.ProcessEnv = {}): Promise<CmdResult> {
+export function runWorkspaceCommand(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+  timeoutMs = INSTALL_TIMEOUT_MS
+): Promise<CmdResult> {
   return runProcessWithTimeout({
     command: cmd,
     args,
     stdin: '',
     cwd,
     env: { ...process.env, CI: 'true', ...extraEnv },
-    timeoutMs: INSTALL_TIMEOUT_MS,
+    timeoutMs,
   })
-    .then((result) => {
-      if (result.timedOut) {
-        // A daemonized install child may no longer be discoverable after its wrapper exits.
-        // Restart the ECS task before retry so no escaped process reaches the next job.
-        throw new InfrastructureCommandTimeoutError(`workspace install: ${cmd}`, INSTALL_TIMEOUT_MS);
-      }
-      return {
-        code: result.code,
-        out: `${result.stdout}\n${result.stderr}`.trim().slice(-LOG_CAP),
-        timedOut: false,
-      };
-    })
-    .catch((error) => {
-      if (error instanceof InfrastructureCommandTimeoutError) throw error;
-      return {
-        code: 127,
-        out: error instanceof Error ? error.message : String(error),
-        timedOut: false,
-      };
-    });
+    .then((result) => ({
+      // Dependency setup is an optimization for local validation, not the coding job itself. The
+      // process-tree runner has already killed the bounded command on timeout, so report a degraded
+      // install and continue instead of terminating the worker and replaying the poison workspace.
+      code: result.code,
+      out: `${result.stdout}\n${result.stderr}`.trim().slice(-LOG_CAP),
+      timedOut: result.timedOut,
+    }))
+    .catch((error) => ({
+      code: 127,
+      out: error instanceof Error ? error.message : String(error),
+      timedOut: false,
+    }));
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -174,7 +173,7 @@ export async function installWorkspace(dir: string): Promise<InstallResult> {
   const env = { ...cacheEnv(), NODE_ENV: 'development', HUSKY: '0', npm_config_production: 'false' };
   const { cmd, args } = installCommand(pm);
   console.log(`[workspace] installing with ${cmd} ${args.join(' ')} (pm=${pm})`);
-  const install = await run(cmd, args, dir, env);
+  const install = await runWorkspaceCommand(cmd, args, dir, env);
   const logs: string[] = [`$ ${cmd} ${args.join(' ')}\n${install.out}`.slice(-LOG_CAP)];
 
   if (install.code !== 0) {
@@ -192,7 +191,7 @@ export async function installWorkspace(dir: string): Promise<InstallResult> {
   const schemas = await findPrismaSchemas(dir);
   let prismaOk = true;
   for (const schema of schemas) {
-    const gen = await run('npx', ['--no-install', 'prisma', 'generate', `--schema=${schema}`], dir, env);
+    const gen = await runWorkspaceCommand('npx', ['--no-install', 'prisma', 'generate', `--schema=${schema}`], dir, env);
     logs.push(`$ npx prisma generate --schema=${schema}\n${gen.out}`.slice(-LOG_CAP));
     if (gen.code !== 0) prismaOk = false;
   }

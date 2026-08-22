@@ -13,6 +13,8 @@
  *   HermesPreopenBlocking — of those, how many were BLOCKING (WS4)
  *   HermesInstallSeconds  — workspace dependency-install wall time (WS1)
  *   HermesGateFailShipped — 1 when a PR opened WITH unresolved gate failures (fail-open)
+ *   HermesAgentProviderFallback — jobs completed through the secondary coding provider
+ *   HermesProviderUnavailable  — jobs preserved because neither coding provider was available
  *
  * Best-effort: metric publishing never throws into the job pipeline.
  */
@@ -28,7 +30,9 @@ export type HermesMetric =
   | 'HermesPreopenFindings'
   | 'HermesPreopenBlocking'
   | 'HermesInstallSeconds'
-  | 'HermesGateFailShipped';
+  | 'HermesGateFailShipped'
+  | 'HermesAgentProviderFallback'
+  | 'HermesProviderUnavailable';
 
 /**
  * Publish one metric datum. `repo` and `type` (fe/be) are attached as dimensions so the dashboard

@@ -107,7 +107,7 @@ export class HermesStack extends cdk.Stack {
     const secSlack = secretsmanager.Secret.fromSecretNameV2(this, 'SecSlack', `donatemate/${environment}/hermes/slack`);
     const secJiraHook = secretsmanager.Secret.fromSecretNameV2(this, 'SecJiraHook', `donatemate/${environment}/hermes/jira-webhook`);
     const secAnthropic = secretsmanager.Secret.fromSecretNameV2(this, 'SecAnthropic', `donatemate/${environment}/anthropic-api-key`);
-    // OpenAI API key — coding engine (Codex CLI) + planning/chat layer.
+    // OpenAI is primary; the independently funded Anthropic key is the automatic failover.
     const secOpenai = secretsmanager.Secret.fromSecretNameV2(this, 'SecOpenai', `donatemate/${environment}/hermes/openai`);
     const secJira = secretsmanager.Secret.fromSecretNameV2(this, 'SecJira', `/donatemate/${environment}/knowledge/jira`);
     // Dedicated hermes@ Atlassian account — write-backs (comments + transitions) post as Hermes.
@@ -278,9 +278,11 @@ export class HermesStack extends cdk.Stack {
         SECRET_SLACK: secSlack.secretName,
         SECRET_JIRA_WEBHOOK: secJiraHook.secretName,
         SECRET_GITHUB_APP: secGithub.secretName,
-        SECRET_ANTHROPIC: secAnthropic.secretName, // (legacy) Anthropic key, no longer used
+        SECRET_ANTHROPIC: secAnthropic.secretName, // planning/chat failover
         SECRET_OPENAI: secOpenai.secretName, // conversational/planning layer (OpenAI)
         CONVERSE_MODEL: 'gpt-5.6-terra', // planning + chat model (pinned)
+        FALLBACK_CONVERSE_MODEL: 'claude-sonnet-5',
+        OPENAI_CIRCUIT_BREAKER_SECONDS: '900',
         SECRET_JIRA: secJira.secretName, // read referenced Jira issues during conversation
         SECRET_JIRA_BOT: secJiraBot.secretName, // write-backs (plan/progress comments + transitions) as Hermes
         MCP_ENDPOINT: props.mcpEndpoint ?? 'https://mcp.donate-mate.com/mcp',
@@ -397,7 +399,10 @@ export class HermesStack extends cdk.Stack {
         ARTIFACTS_BUCKET: artifacts.bucketName,
         SECRET_GITHUB_APP: secGithub.secretName,
         SECRET_OPENAI: secOpenai.secretName, // coding engine (Codex CLI) auth
+        SECRET_ANTHROPIC: secAnthropic.secretName, // Claude Code failover auth
         AGENT_MODEL: 'gpt-5.5', // coding model (pinned)
+        FALLBACK_AGENT_MODEL: 'claude-sonnet-5',
+        OPENAI_CIRCUIT_BREAKER_SECONDS: '900',
         SECRET_JIRA: secJira.secretName,
         SECRET_JIRA_BOT: secJiraBot.secretName, // progress comments + column moves as Hermes
         SECRET_SLACK: secSlack.secretName, // worker posts PR links back to the Slack thread
@@ -464,6 +469,7 @@ export class HermesStack extends cdk.Stack {
     artifacts.grantReadWrite(workerTaskDef.taskRole);
     secGithub.grantRead(workerTaskDef.taskRole);
     secOpenai.grantRead(workerTaskDef.taskRole);
+    secAnthropic.grantRead(workerTaskDef.taskRole);
     secJira.grantRead(workerTaskDef.taskRole);
     secJiraBot.grantRead(workerTaskDef.taskRole);
     secSlack.grantRead(workerTaskDef.taskRole);

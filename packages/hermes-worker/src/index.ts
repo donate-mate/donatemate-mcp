@@ -7,7 +7,13 @@
  *
  * Run: `tsx src/index.ts` (containerized; image includes git + the `codex` CLI).
  */
-import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand, ChangeMessageVisibilityCommand } from '@aws-sdk/client-sqs';
+import {
+  SQSClient,
+  ReceiveMessageCommand,
+  DeleteMessageCommand,
+  ChangeMessageVisibilityCommand,
+  SendMessageCommand,
+} from '@aws-sdk/client-sqs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -29,7 +35,7 @@ import {
   prepareMergeConflictResolution,
   type MergeConflictPreparation,
 } from './github.js';
-import { ContainerRestartRequiredError, runAgent } from './agent.js';
+import { AgentProvidersUnavailableError, ContainerRestartRequiredError, runAgent } from './agent.js';
 import { installWorkspace } from './workspace.js';
 import { runGate, gateSummary, type GateResult } from './gate.js';
 import { loadContract, contractPromptBlock, validatePrBody, buildReportRepairPrompt, loadReport } from './contract.js';
@@ -599,6 +605,9 @@ async function processJob(jobId: string): Promise<void> {
       reportInstruction;
 
     const agentRun = await runAgent(dir, agentPrompt);
+    if (agentRun.provider === 'anthropic') {
+      await putMetric('HermesAgentProviderFallback', 1, { type: job.type }).catch(() => {});
+    }
     const exitCode = agentRun.exitCode;
     const reason = agentRun.reason;
     let transcript = agentRun.transcript;
@@ -785,6 +794,23 @@ async function processJob(jobId: string): Promise<void> {
     console.log(`[${jobId}] done → ${pr.url}`);
   } catch (err) {
     const msg = errorText(err);
+    if (err instanceof AgentProvidersUnavailableError) {
+      console.warn(`[${jobId}] coding providers unavailable; preserving job for retry: ${msg}`);
+      await bestEffortFailureReport(jobId, 'pause job for provider recovery', () =>
+        updateJob(jobId, 'queued', {
+          error: compactText(msg, 2000),
+          phase: `provider unavailable; retrying in ${err.retryAfterSeconds}s`,
+        })
+      );
+      await bestEffortFailureReport(jobId, 'notify provider pause', () =>
+        notify(
+          job,
+          `:pause_button: Hermes job \`${jobId}\` is preserved while coding providers recover; retrying automatically in ${err.retryAfterSeconds}s.`
+        )
+      );
+      await putMetric('HermesProviderUnavailable', 1, { type: job.type }).catch(() => {});
+      throw err;
+    }
     const compactMsg = compactText(msg, 8000);
     const failureLogUri =
       msg.length > compactMsg.length
@@ -866,6 +892,26 @@ async function loop(): Promise<void> {
         stopVisibilityHeartbeat();
         await sqs.send(new DeleteMessageCommand({ QueueUrl: QUEUE, ReceiptHandle: m.ReceiptHandle! }));
       } catch (err) {
+        if (err instanceof AgentProvidersUnavailableError) {
+          // A fresh delayed message resets SQS receive count, so a provider billing/outage event
+          // cannot exhaust maxReceiveCount and dead-letter otherwise healthy work.
+          try {
+            await sqs.send(
+              new SendMessageCommand({
+                QueueUrl: QUEUE,
+                MessageBody: m.Body || '{}',
+                DelaySeconds: err.retryAfterSeconds,
+              })
+            );
+            stopVisibilityHeartbeat();
+            await sqs.send(new DeleteMessageCommand({ QueueUrl: QUEUE, ReceiptHandle: m.ReceiptHandle! }));
+            console.warn(`job rescheduled in ${err.retryAfterSeconds}s while coding providers recover`);
+          } catch (requeueError) {
+            // Leave the original message intact if atomic send-then-delete cannot complete.
+            console.error('failed to reschedule provider-paused job; retaining original message:', requeueError);
+          }
+          continue;
+        }
         // Leave the message un-deleted → SQS redelivers up to maxReceiveCount, then DLQ.
         console.error('job processing error (will retry / DLQ):', err);
         // A timed-out command may have deliberately escaped the Codex process group. processJob

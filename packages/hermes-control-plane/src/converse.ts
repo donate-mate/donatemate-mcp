@@ -1,21 +1,51 @@
 /**
  * Conversational layer — Hermes talks with the developer to gather a coding task before any
  * code is written, condenses a conversation into a single task spec, and drafts plans for Jira
- * tickets. Uses the OpenAI API. Model pinned via CONVERSE_MODEL (default gpt-5.6-terra).
+ * tickets. OpenAI is primary, with Anthropic as an independent availability and billing failover.
+ * Models are pinned through CONVERSE_MODEL and FALLBACK_CONVERSE_MODEL.
  */
+import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
-import { getSecretJson } from './secrets.js';
+import { getSecretJson, getSecretString } from './secrets.js';
 
 const SECRET_OPENAI = process.env.SECRET_OPENAI!;
+const SECRET_ANTHROPIC = process.env.SECRET_ANTHROPIC!;
 const MODEL = process.env.CONVERSE_MODEL || 'gpt-5.6-terra';
+const FALLBACK_MODEL = process.env.FALLBACK_CONVERSE_MODEL || 'claude-sonnet-5';
+const OPENAI_CIRCUIT_BREAKER_MS = Number(process.env.OPENAI_CIRCUIT_BREAKER_SECONDS ?? 900) * 1000;
+let openAiUnavailableUntil = 0;
 
 let client: OpenAI | null = null;
+let fallbackClient: Anthropic | null = null;
 async function getClient(): Promise<OpenAI> {
   if (client) return client;
   const { apiKey } = await getSecretJson(SECRET_OPENAI);
   if (!apiKey) throw new Error('OpenAI API key not configured');
   client = new OpenAI({ apiKey });
   return client;
+}
+
+async function getFallbackClient(): Promise<Anthropic> {
+  if (fallbackClient) return fallbackClient;
+  if (!SECRET_ANTHROPIC) throw new Error('Anthropic fallback secret not configured');
+  const apiKey = await getSecretString(SECRET_ANTHROPIC);
+  if (!apiKey) throw new Error('Anthropic fallback API key not configured');
+  fallbackClient = new Anthropic({ apiKey });
+  return fallbackClient;
+}
+
+function errorText(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return String(error);
+}
+
+/** Errors that should open the primary-provider circuit instead of failing Jira/Slack intake. */
+export function isOpenAiUnavailableError(error: unknown): boolean {
+  const status = Number((error as { status?: unknown } | undefined)?.status);
+  if (status === 401 || status === 403 || status === 429 || status >= 500) return true;
+  return /credit_balance_exhausted|insufficient_quota|billing_hard_limit|invalid_api_key|authentication_error|no credits remaining|rate.?limit|temporarily unavailable|service unavailable/i.test(
+    errorText(error)
+  );
 }
 
 export interface ChatMsg {
@@ -37,13 +67,34 @@ Rules:
 
 /** One chat completion → trimmed text. */
 async function complete(system: string, messages: ChatMsg[], maxTokens: number): Promise<string> {
-  const c = await getClient();
-  const res = await c.chat.completions.create({
-    model: MODEL,
-    max_completion_tokens: maxTokens,
-    messages: [{ role: 'system', content: system }, ...messages],
+  if (Date.now() >= openAiUnavailableUntil) {
+    try {
+      const c = await getClient();
+      const res = await c.chat.completions.create({
+        model: MODEL,
+        max_completion_tokens: maxTokens,
+        messages: [{ role: 'system', content: system }, ...messages],
+      });
+      return (res.choices[0]?.message?.content ?? '').trim();
+    } catch (error) {
+      if (!isOpenAiUnavailableError(error)) throw error;
+      openAiUnavailableUntil = Date.now() + OPENAI_CIRCUIT_BREAKER_MS;
+      console.warn(`[converse] OpenAI unavailable; using Anthropic fallback: ${errorText(error).slice(0, 240)}`);
+    }
+  }
+
+  const anthropic = await getFallbackClient();
+  const res = await anthropic.messages.create({
+    model: FALLBACK_MODEL,
+    max_tokens: maxTokens,
+    system,
+    messages,
   });
-  return (res.choices[0]?.message?.content ?? '').trim();
+  return res.content
+    .map((block) => (block.type === 'text' ? block.text : ''))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 }
 
 export interface ConverseOpts {

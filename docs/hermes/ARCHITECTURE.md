@@ -285,14 +285,19 @@ adding semantic/model-based consolidation.
 
 ---
 
-## 4. Coding engine — OpenAI Codex CLI
+## 4. Coding engine — Codex with Claude Code failover
 
-The engine lives in `packages/hermes-worker/src/agent.ts`. The worker shells out to the **`codex`
-CLI** in non-interactive `codex exec` mode. Key facts as-coded:
+The engine lives in `packages/hermes-worker/src/agent.ts`. The worker normally shells out to the
+**`codex` CLI** in non-interactive `codex exec` mode. When OpenAI reports exhausted credit, quota,
+rate limiting, or service unavailability, an in-process circuit opens and the same stdin prompt is
+routed to the independently funded **Claude Code CLI**. Key facts as-coded:
 
 - **Auth**: `codex exec` reads `~/.codex/auth.json`, *not* `OPENAI_API_KEY`. The harness first runs
   `codex login --with-api-key`, piping the OpenAI key (from `SECRET_OPENAI`) via stdin.
 - **Model**: pinned via `AGENT_MODEL` (default `gpt-5.5`) passed as `--model`.
+- **Failover**: Claude Code uses `FALLBACK_AGENT_MODEL` (default `claude-sonnet-5`) and
+  `SECRET_ANTHROPIC`. If both providers are unavailable, the SQS message is replaced by a delayed
+  retry instead of consuming its DLQ receive budget or marking the job failed.
 - **Sandbox**: the ephemeral Fargate container *is* the sandbox, so Codex runs with
   `--dangerously-bypass-approvals-and-sandbox`, `--ephemeral`, and `--skip-git-repo-check`.
 - **Working dir**: `-C <clonedir>`. The agent's final message is captured to a `-o last.txt` file
@@ -376,7 +381,7 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `SECRET_SLACK` | `donatemate/<env>/hermes/slack` | Slack signing secret + bot token |
 | `SECRET_JIRA_WEBHOOK` | `donatemate/<env>/hermes/jira-webhook` | shared secret for `/jira/webhook`, `/dispatch`, `/github/reconcile` |
 | `SECRET_OPENAI` | `donatemate/<env>/hermes/openai` | Codex coding engine + planning/chat |
-| `SECRET_ANTHROPIC` | `donatemate/<env>/anthropic-api-key` | legacy, no longer used |
+| `SECRET_ANTHROPIC` | `donatemate/<env>/anthropic-api-key` | Claude Code + planning/chat failover |
 | `SECRET_JIRA` | `/donatemate/<env>/knowledge/jira` | read Jira issue context |
 | `SECRET_JIRA_BOT` | `donatemate/<env>/hermes/jira-bot` | write-backs as the hermes@ account |
 | `SECRET_DM_MCP` | `donatemate/<env>/hermes/dm-mcp-key` | DonateMate MCP API key (worker) |
@@ -389,6 +394,8 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `JOBS_TABLE`, `JOBS_QUEUE_URL`, `ARTIFACTS_BUCKET` | data-plane handles |
 | `SECRET_SLACK`, `SECRET_JIRA_WEBHOOK`, `SECRET_GITHUB_APP`, `SECRET_ANTHROPIC`, `SECRET_OPENAI`, `SECRET_JIRA`, `SECRET_JIRA_BOT` | secret names |
 | `CONVERSE_MODEL` | `gpt-5.6-terra` |
+| `FALLBACK_CONVERSE_MODEL` | `claude-sonnet-5` |
+| `OPENAI_CIRCUIT_BREAKER_SECONDS` | `900` |
 | `MCP_ENDPOINT` | `https://mcp.donate-mate.com/mcp` |
 | `PR_RECONCILE_SECONDS` | `300` |
 | `REVIEW_LEARNING_ENABLED` | `true` |
@@ -409,8 +416,10 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `ENVIRONMENT`, `AWS_REGION`, `AWS_DEFAULT_REGION` | env + region |
 | `WORKER_TYPE` | `fe` |
 | `JOBS_TABLE`, `JOBS_QUEUE_URL`, `ARTIFACTS_BUCKET` | data-plane handles |
-| `SECRET_GITHUB_APP`, `SECRET_OPENAI`, `SECRET_JIRA`, `SECRET_JIRA_BOT`, `SECRET_SLACK`, `SECRET_DM_MCP` | secret names |
+| `SECRET_GITHUB_APP`, `SECRET_OPENAI`, `SECRET_ANTHROPIC`, `SECRET_JIRA`, `SECRET_JIRA_BOT`, `SECRET_SLACK`, `SECRET_DM_MCP` | secret names |
 | `AGENT_MODEL` | `gpt-5.5` (coding model) |
+| `FALLBACK_AGENT_MODEL` | `claude-sonnet-5` |
+| `OPENAI_CIRCUIT_BREAKER_SECONDS` | `900` |
 | `MCP_ENDPOINT` | `https://mcp.donate-mate.com/mcp` |
 | `JOB_TIMEOUT_SECONDS` | `2400` |
 | `TASK_PROTECTION_EXPIRES_MINUTES` | `165` |
@@ -536,7 +545,8 @@ DonateMate MCP server, wired into the environment for the agent (e.g. Jira/Figma
 The MCP server also exposes Hermes tools (`dm_hermes_create_pr`, `dm_hermes_job_status`) that reach
 the control plane's `/dispatch` and `/jobs/:id` endpoints.
 
-**OpenAI** — one API key (`SECRET_OPENAI`) serves two distinct roles: the **Codex CLI** coding
-engine on the worker (`AGENT_MODEL=gpt-5.5`) and the **planning/chat** layer on the control plane
-(`CONVERSE_MODEL=gpt-5.6-terra`). The legacy Anthropic key (`SECRET_ANTHROPIC`) is imported
-but no longer used.
+**Coding providers** — OpenAI remains primary for the **Codex CLI** worker
+(`AGENT_MODEL=gpt-5.5`) and planning/chat (`CONVERSE_MODEL=gpt-5.6-terra`). Anthropic is a separate
+funded failure domain for Claude Code (`FALLBACK_AGENT_MODEL=claude-sonnet-5`) and planning/chat
+(`FALLBACK_CONVERSE_MODEL=claude-sonnet-5`). Provider-capacity failures open a 15-minute local
+circuit so subsequent calls fail over immediately.

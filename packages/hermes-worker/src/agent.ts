@@ -1,20 +1,24 @@
 /**
- * Coding engine: runs OpenAI Codex headless inside the cloned repo. We shell out to the `codex`
- * CLI (installed in the worker image) in non-interactive `codex exec` mode. The container is the
- * sandbox (ephemeral, isolated), so Codex runs with --dangerously-bypass-approvals-and-sandbox.
- * The model is pinned via AGENT_MODEL (default gpt-5.5). Hard timeout is the budget guardrail.
+ * Coding engine: runs OpenAI Codex headless inside the cloned repo, with Claude Code as an
+ * independent failover when OpenAI is unavailable or out of credit. Both CLIs run non-interactively
+ * inside the ephemeral Fargate sandbox and receive prompts over stdin. Hard timeout is the budget
+ * guardrail for either provider.
  */
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { rm, mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getSecretJson } from './secrets.js';
+import { getSecretJson, getSecretString } from './secrets.js';
 
 const SECRET_OPENAI = process.env.SECRET_OPENAI!;
+const SECRET_ANTHROPIC = process.env.SECRET_ANTHROPIC;
 const AGENT_MODEL = process.env.AGENT_MODEL || 'gpt-5.5';
+const FALLBACK_AGENT_MODEL = process.env.FALLBACK_AGENT_MODEL || 'claude-sonnet-5';
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_SECONDS ?? 2400) * 1000;
+const OPENAI_CIRCUIT_BREAKER_MS = Number(process.env.OPENAI_CIRCUIT_BREAKER_SECONDS ?? 900) * 1000;
 const OUTPUT_CAP = 16 * 1024 * 1024;
+let openAiUnavailableUntil = 0;
 
 // WS3.1 — reasoning effort. Codex takes `-c model_reasoning_effort=<minimal|low|medium|high>`.
 // Default is env-configurable ("medium") for implementation jobs; the pre-open review session
@@ -46,6 +50,8 @@ export interface RunAgentOptions {
 export interface AgentResult {
   transcript: string;
   exitCode: number;
+  /** Provider that produced the final result. */
+  provider: 'openai' | 'anthropic';
   /** The agent's final message, truncated for Slack/Jira display and no-change explanations. */
   reason?: string;
   /** The agent's final message, untruncated — used by the WS4 review session to parse findings JSON. */
@@ -84,11 +90,47 @@ export class AgentTimeoutError extends ContainerRestartRequiredError {
   }
 }
 
+/** A validation wrapper may intentionally request a clean container after an escaped child. */
 export class InfrastructureCommandTimeoutError extends ContainerRestartRequiredError {
   constructor(command: string, timeoutMs: number) {
     super(`Infrastructure command timed out after ${Math.ceil(timeoutMs / 1000)}s: ${command}`);
     this.name = 'InfrastructureCommandTimeoutError';
   }
+}
+
+/** Both coding providers are unavailable. The queue loop reschedules rather than failing the job. */
+export class AgentProvidersUnavailableError extends Error {
+  readonly retryAfterSeconds: number;
+
+  constructor(message: string, retryAfterSeconds = 900) {
+    super(message);
+    this.name = 'AgentProvidersUnavailableError';
+    this.retryAfterSeconds = Math.max(1, Math.min(900, Math.round(retryAfterSeconds)));
+  }
+}
+
+const PROVIDER_UNAVAILABLE_PATTERNS = [
+  /credit_balance_exhausted/i,
+  /insufficient_quota/i,
+  /billing_hard_limit_reached/i,
+  /invalid_api_key/i,
+  /authentication_error/i,
+  /incorrect api key/i,
+  /api key not configured/i,
+  /no credits remaining/i,
+  /exceeded (?:your|the) current quota/i,
+  /rate[_ -]?limit(?:ed|_exceeded)?/i,
+  /too many requests/i,
+  /overloaded_error/i,
+  /temporarily unavailable/i,
+  /service unavailable/i,
+  /stream disconnected before completion/i,
+  /(?:status|api error)\s*:?[ ]*5(?:00|02|03|04|29)\b/i,
+];
+
+/** Provider errors that are safe to route to the independent fallback. */
+export function isProviderUnavailableOutput(text: string): boolean {
+  return PROVIDER_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 // Authenticate the Codex CLI with the API key. `codex exec` reads auth from ~/.codex/auth.json,
@@ -242,6 +284,17 @@ function runCodex(args: string[], prompt: string, cwd: string, env: NodeJS.Proce
   });
 }
 
+function runClaude(args: string[], prompt: string, cwd: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
+  return runProcessWithTimeout({
+    command: 'claude',
+    args,
+    stdin: prompt,
+    cwd,
+    env,
+    timeoutMs: JOB_TIMEOUT_MS,
+  });
+}
+
 // Prepended to every task. The harness owns git: the agent edits files only, so change-detection
 // and PR creation stay deterministic and the agent can't open a malformed/duplicate PR.
 const HARNESS_PREAMBLE = `You are running inside an automated CI harness, on a fresh shallow clone of the repository, on a new branch that has already been created for you.
@@ -262,6 +315,11 @@ AWS observability is available through the task role and the \`aws\` CLI. For ba
 `;
 
 export interface CodexExecInvocation {
+  args: string[];
+  stdin: string;
+}
+
+export interface ClaudeExecInvocation {
   args: string[];
   stdin: string;
 }
@@ -294,9 +352,44 @@ export function buildCodexExecInvocation(input: {
   };
 }
 
+/** Build a non-interactive Claude Code invocation without putting the prompt on argv. */
+export function buildClaudeExecInvocation(input: { model: string; prompt: string }): ClaudeExecInvocation {
+  return {
+    args: [
+      '-p',
+      '--model',
+      input.model,
+      '--output-format',
+      'json',
+      '--dangerously-skip-permissions', // the Fargate container is the sandbox
+    ],
+    stdin: input.prompt,
+  };
+}
+
+export interface ClaudeOutput {
+  finalMessage?: string;
+  isError: boolean;
+}
+
+/** Parse Claude Code's JSON print-mode result while tolerating an incidental leading log line. */
+export function parseClaudeOutput(stdout: string, stderr: string): ClaudeOutput {
+  const candidates = [stdout.trim(), ...stdout.trim().split('\n').reverse()].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as { result?: unknown; is_error?: unknown; subtype?: unknown };
+      return {
+        finalMessage: typeof parsed.result === 'string' ? parsed.result.trim() || undefined : undefined,
+        isError: parsed.is_error === true || parsed.subtype === 'error',
+      };
+    } catch {
+      // Try the next candidate. The raw transcript is retained when no JSON result is present.
+    }
+  }
+  return { finalMessage: stderr.trim() || stdout.trim() || undefined, isError: false };
+}
+
 export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOptions = {}): Promise<AgentResult> {
-  const { apiKey } = await getSecretJson(SECRET_OPENAI);
-  if (!apiKey) throw new Error('OpenAI API key not configured in Secrets Manager');
   const prompt = (opts.preamble ?? HARNESS_PREAMBLE) + taskPrompt;
   const model = opts.model || AGENT_MODEL;
   const effort = normalizeEffort(opts.reasoningEffort) ?? DEFAULT_REASONING_EFFORT;
@@ -307,7 +400,7 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
   const outDir = await mkdtemp(join(tmpdir(), 'hermes-codex-'));
   const lastMsgFile = join(outDir, 'last.txt');
 
-  const invocation = buildCodexExecInvocation({ dir, lastMsgFile, model, effort, prompt });
+  const codexInvocation = buildCodexExecInvocation({ dir, lastMsgFile, model, effort, prompt });
 
   const readFinalMessage = async (): Promise<string | undefined> => {
     try {
@@ -319,16 +412,98 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
   };
 
   try {
-    const env = { ...process.env, OPENAI_API_KEY: apiKey };
-    await codexLogin(apiKey, env); // write ~/.codex/auth.json so `codex exec` can authenticate
-    const { stdout, stderr, code, timedOut } = await runCodex(invocation.args, invocation.stdin, dir, env);
+    let primaryTranscript = '';
+    let primaryFailure = '';
+
+    if (Date.now() >= openAiUnavailableUntil) {
+      try {
+        const { apiKey } = await getSecretJson(SECRET_OPENAI);
+        if (!apiKey) throw new Error('OpenAI API key not configured in Secrets Manager');
+        const env = { ...process.env, OPENAI_API_KEY: apiKey };
+        await codexLogin(apiKey, env); // write ~/.codex/auth.json so `codex exec` can authenticate
+        const { stdout, stderr, code, timedOut } = await runCodex(
+          codexInvocation.args,
+          codexInvocation.stdin,
+          dir,
+          env
+        );
+        if (timedOut) throw new AgentTimeoutError(JOB_TIMEOUT_MS / 1000);
+        primaryTranscript = `${stdout}\n${stderr}`.trim();
+        const finalMessage = (await readFinalMessage()) ?? (stderr.trim() || undefined);
+        console.log(`[agent] codex exit ${code} (model=${model}, effort=${effort})`);
+        if (code === 0 || !isProviderUnavailableOutput(`${primaryTranscript}\n${finalMessage ?? ''}`)) {
+          return {
+            transcript: primaryTranscript,
+            exitCode: code,
+            provider: 'openai',
+            reason: finalMessage?.slice(0, 500),
+            finalMessage,
+          };
+        }
+        primaryFailure = finalMessage ?? `Codex exited ${code}`;
+      } catch (error) {
+        if (error instanceof AgentTimeoutError) throw error;
+        primaryFailure = error instanceof Error ? error.message : String(error);
+      }
+      openAiUnavailableUntil = Date.now() + OPENAI_CIRCUIT_BREAKER_MS;
+    } else {
+      primaryFailure = `OpenAI circuit open until ${new Date(openAiUnavailableUntil).toISOString()}`;
+    }
+
+    console.warn(`[agent] OpenAI unavailable (${primaryFailure.slice(0, 240)}); falling back to Anthropic`);
+    if (!SECRET_ANTHROPIC) {
+      throw new AgentProvidersUnavailableError('OpenAI is unavailable and SECRET_ANTHROPIC is not configured');
+    }
+
+    let anthropicApiKey = '';
+    try {
+      anthropicApiKey = await getSecretString(SECRET_ANTHROPIC);
+    } catch (error) {
+      throw new AgentProvidersUnavailableError(
+        `OpenAI is unavailable and the Anthropic secret could not be read: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    if (!anthropicApiKey) {
+      throw new AgentProvidersUnavailableError('OpenAI is unavailable and the Anthropic API key is empty');
+    }
+
+    const fallbackModel = FALLBACK_AGENT_MODEL;
+    const claudeInvocation = buildClaudeExecInvocation({ model: fallbackModel, prompt });
+    const fallbackEnv = {
+      ...process.env,
+      ANTHROPIC_API_KEY: anthropicApiKey,
+      DISABLE_AUTOUPDATER: '1',
+    };
+    let fallbackRun: RunResult;
+    try {
+      fallbackRun = await runClaude(claudeInvocation.args, claudeInvocation.stdin, dir, fallbackEnv);
+    } catch (error) {
+      throw new AgentProvidersUnavailableError(
+        `OpenAI is unavailable and Claude Code could not start: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    const { stdout, stderr, code, timedOut } = fallbackRun;
     if (timedOut) throw new AgentTimeoutError(JOB_TIMEOUT_MS / 1000);
-    // Non-zero exit isn't necessarily fatal — surface the transcript; the caller decides based
-    // on whether the working tree changed.
-    const finalMessage = (await readFinalMessage()) ?? (stderr.trim() || undefined);
-    const reason = finalMessage?.slice(0, 500);
-    console.log(`[agent] codex exit ${code} (model=${model}, effort=${effort})`);
-    return { transcript: `${stdout}\n${stderr}`.trim(), exitCode: code, reason, finalMessage };
+    const parsed = parseClaudeOutput(stdout, stderr);
+    const exitCode = parsed.isError && code === 0 ? 1 : code;
+    const fallbackTranscript = `${stdout}\n${stderr}`.trim();
+    if (exitCode !== 0 && isProviderUnavailableOutput(`${fallbackTranscript}\n${parsed.finalMessage ?? ''}`)) {
+      throw new AgentProvidersUnavailableError('OpenAI and Anthropic are both temporarily unavailable');
+    }
+    console.log(`[agent] claude exit ${exitCode} (model=${fallbackModel}; OpenAI fallback)`);
+    return {
+      transcript: [
+        `OpenAI unavailable; routed to Anthropic: ${primaryFailure.slice(0, 500)}`,
+        primaryTranscript ? `--- OpenAI transcript tail ---\n${primaryTranscript.slice(-4000)}` : undefined,
+        `--- Anthropic fallback ---\n${fallbackTranscript}`,
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+      exitCode,
+      provider: 'anthropic',
+      reason: parsed.finalMessage?.slice(0, 500),
+      finalMessage: parsed.finalMessage,
+    };
   } finally {
     await rm(outDir, { recursive: true, force: true });
   }
