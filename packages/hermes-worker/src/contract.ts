@@ -68,6 +68,21 @@ export function validatePrBody(body: string): BodyValidation {
   return { ok: missing.length === 0, missing };
 }
 
+/** True only when review feedback explicitly asks Hermes to change live PR metadata. */
+export function feedbackRequestsPrBodyUpdate(feedback?: string): boolean {
+  if (!feedback) return false;
+  return /\b(?:PR|pull request)\s+(?:body|description)\b|\blive merge record\b|\boutcome report\b/i.test(feedback);
+}
+
+/** Extract a complete six-section outcome report from an agent's final response. */
+export function extractOutcomeReport(text?: string): string | undefined {
+  if (!text) return undefined;
+  const start = text.search(/^##\s+Root cause\b/im);
+  if (start < 0) return undefined;
+  const report = text.slice(start).trim();
+  return validatePrBody(report).ok ? report : undefined;
+}
+
 /** Prompt asking the agent to (re)produce the outcome report with the missing sections. */
 export function buildReportRepairPrompt(missing: string[], contract?: string): string {
   return [

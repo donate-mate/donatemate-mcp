@@ -443,6 +443,99 @@ export async function openPullRequest(
   }
 }
 
+export const HERMES_OUTCOME_REPORT_START = '<!-- hermes-outcome-report:start -->';
+export const HERMES_OUTCOME_REPORT_END = '<!-- hermes-outcome-report:end -->';
+
+/**
+ * Replace the outcome-report portion of a Hermes PR body while preserving its task provenance,
+ * validation summary, and review notes. New markers make every later metadata-only repair
+ * deterministic; the heading/boundary fallback upgrades bodies created before markers existed.
+ */
+export function replacePullRequestOutcomeReport(body: string, report: string): string {
+  const cleanReport = report.trim();
+  if (!cleanReport) throw new Error('cannot update a PR body with an empty outcome report');
+  const block = `${HERMES_OUTCOME_REPORT_START}\n${cleanReport}\n${HERMES_OUTCOME_REPORT_END}`;
+
+  const markerStart = body.indexOf(HERMES_OUTCOME_REPORT_START);
+  const markerEnd = body.indexOf(HERMES_OUTCOME_REPORT_END, Math.max(0, markerStart));
+  if (markerStart >= 0 && markerEnd >= markerStart) {
+    return `${body.slice(0, markerStart).trimEnd()}\n\n${block}\n\n${body
+      .slice(markerEnd + HERMES_OUTCOME_REPORT_END.length)
+      .trimStart()}`.trim();
+  }
+
+  const rootMatch = /^##\s+Root cause\b/im.exec(body);
+  if (rootMatch) {
+    const reportStart = rootMatch.index;
+    const deferredMatch = /^##\s+Deferred\b/im.exec(body.slice(reportStart));
+    if (deferredMatch) {
+      const deferredStart = reportStart + deferredMatch.index;
+      const boundaryMatch = /\n---\s*(?:\n|$)/.exec(body.slice(deferredStart));
+      const reportEnd = boundaryMatch ? deferredStart + boundaryMatch.index : body.length;
+      return `${body.slice(0, reportStart).trimEnd()}\n\n${block}\n\n${body.slice(reportEnd).trimStart()}`.trim();
+    }
+  }
+
+  const gateBoundary = /\n---\s*\n\s*\*\*Pre-commit gate:/i.exec(body);
+  const insertionPoint = gateBoundary?.index ?? body.length;
+  return `${body.slice(0, insertionPoint).trimEnd()}\n\n${block}\n\n${body.slice(insertionPoint).trimStart()}`.trim();
+}
+
+export async function updatePullRequestOutcomeReport(
+  octokit: Octokit,
+  repo: string,
+  prNumber: number,
+  report: string
+): Promise<void> {
+  const { owner, name } = splitRepo(repo);
+  const current = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber });
+  const body = replacePullRequestOutcomeReport(String(current.data.body ?? ''), report);
+  await octokit.pulls.update({ owner, repo: name, pull_number: prNumber, body });
+}
+
+/** Requeue human reviewers after a metadata-only fix, which does not produce a new commit event. */
+export async function requestReReviewFromChangeRequesters(
+  octokit: Octokit,
+  repo: string,
+  prNumber: number
+): Promise<string[]> {
+  try {
+    const { owner, name } = splitRepo(repo);
+    const pr = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber });
+    const alreadyPending = new Set(
+      (pr.data.requested_reviewers ?? []).map((reviewer) =>
+        String((reviewer as { login?: string }).login ?? '').toLowerCase()
+      )
+    );
+    const reviews = await octokit.paginate(octokit.pulls.listReviews, {
+      owner,
+      repo: name,
+      pull_number: prNumber,
+      per_page: 100,
+    });
+    const latest = new Map<string, string>();
+    for (const review of reviews) {
+      const login = review.user?.login;
+      const state = String(review.state ?? '').toUpperCase();
+      if (!login || review.user?.type === 'Bot' || state === 'COMMENTED') continue;
+      latest.set(login, state);
+    }
+    const reviewers = [...latest.entries()]
+      .filter(([login, state]) => state === 'CHANGES_REQUESTED' && !alreadyPending.has(login.toLowerCase()))
+      .map(([login]) => login);
+    if (reviewers.length) {
+      await octokit.pulls.requestReviewers({ owner, repo: name, pull_number: prNumber, reviewers });
+    }
+    return reviewers;
+  } catch (err) {
+    console.warn(
+      `[github] failed to re-request review on ${repo}#${prNumber}:`,
+      err instanceof Error ? err.message : String(err)
+    );
+    return [];
+  }
+}
+
 /**
  * Post a comment on a pull request (PR comments are issue comments) so the fix Hermes just
  * pushed is visible on the PR itself, not only in Jira/Slack. Best-effort — never throws into
