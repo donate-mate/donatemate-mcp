@@ -7,6 +7,7 @@ import {
   HERMES_OUTCOME_REPORT_START,
   replacePullRequestOutcomeReport,
   requestReReviewFromChangeRequesters,
+  waitForPullRequestBodyPropagation,
 } from './github.js';
 
 const report = (rootCause: string) => `## Root cause
@@ -102,5 +103,32 @@ describe('metadata-only PR review follow-ups', () => {
     expect(octokit.pulls.requestReviewers).toHaveBeenCalledWith(
       expect.objectContaining({ reviewers: ['reviewer'] })
     );
+  });
+
+  it('waits for the updated body to be readable twice before allowing re-review', async () => {
+    const expectedBody = replacePullRequestOutcomeReport(
+      'Task provenance.',
+      report('Corrected cause.')
+    );
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { body: 'Task provenance.' } })
+      .mockResolvedValueOnce({ data: { body: expectedBody } })
+      .mockResolvedValueOnce({ data: { body: expectedBody } });
+    const octokit = { pulls: { get } };
+
+    await expect(
+      waitForPullRequestBodyPropagation(
+        octokit as any,
+        'donate-mate/donatemate',
+        1049,
+        expectedBody,
+        { attempts: 3, initialDelayMs: 0, pollDelayMs: 0, stableDelayMs: 0, sleep }
+      )
+    ).resolves.toBeUndefined();
+
+    expect(get).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenCalledTimes(3);
   });
 });
