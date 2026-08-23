@@ -766,11 +766,6 @@ async function processJob(jobId: string): Promise<void> {
           );
           replied = replies.posted + replies.alreadyPresent;
         }
-        const reRequested = await requestReReviewFromChangeRequesters(
-          octokit,
-          job.repo,
-          job.prNumber
-        );
         await updateJob(jobId, 'done', { prUrl: job.prUrl, transcriptUri, headSha });
         await markPrWatchWaiting(job.repo, job.prNumber, headSha);
         await commentOnPullRequest(
@@ -780,9 +775,7 @@ async function processJob(jobId: string): Promise<void> {
           [
             `🤖 **Hermes** verified that the latest feedback is already addressed on current head \`${headSha.slice(0, 7)}\`; no additional source-code change was required.`,
             replied ? `Acknowledged ${replied} addressed inline review thread(s).` : undefined,
-            reRequested.length
-              ? `Re-requested review from ${reRequested.map((login) => `@${login}`).join(', ')}.`
-              : undefined,
+            'Exact-head CI is running; the PR monitor will re-request review after required checks pass.',
           ]
             .filter(Boolean)
             .join('\n\n')
