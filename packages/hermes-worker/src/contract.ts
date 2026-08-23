@@ -74,6 +74,19 @@ export function feedbackRequestsPrBodyUpdate(feedback?: string): boolean {
   return /\b(?:PR|pull request)\s+(?:body|description)\b|\blive merge record\b|\boutcome report\b/i.test(feedback);
 }
 
+/**
+ * A follow-up can legitimately be a no-op when auto-update or another accepted commit already
+ * applied the requested fix before this worker cloned the branch. Require an explicit affirmative
+ * claim so an agent that merely failed to edit cannot silently close the feedback loop.
+ */
+export function followupReportsFeedbackAlreadyAddressed(message?: string): boolean {
+  if (!message) return false;
+  return [
+    /\bno\s+(?:file|source|code|repository|working[- ]tree)\s+(?:edits?|changes?)\s+(?:are|were|is|was)\s+(?:needed|required|necessary)\b/i,
+    /\b(?:feedback|finding|issue|requested change)\s+(?:(?:is|was)\s+already|has\s+(?:already\s+been|been\s+already))\s+(?:addressed|fixed|resolved|corrected)\b/i,
+  ].some((pattern) => pattern.test(message));
+}
+
 /** Extract a complete six-section outcome report from an agent's final response. */
 export function extractOutcomeReport(text?: string): string | undefined {
   if (!text) return undefined;

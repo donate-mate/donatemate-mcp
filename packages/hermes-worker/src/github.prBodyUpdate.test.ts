@@ -1,7 +1,12 @@
 process.env.AWS_REGION ??= 'us-east-2';
 
 import { describe, expect, it, vi } from 'vitest';
-import { extractOutcomeReport, feedbackRequestsPrBodyUpdate, validatePrBody } from './contract.js';
+import {
+  extractOutcomeReport,
+  feedbackRequestsPrBodyUpdate,
+  followupReportsFeedbackAlreadyAddressed,
+  validatePrBody,
+} from './contract.js';
 import {
   HERMES_OUTCOME_REPORT_END,
   HERMES_OUTCOME_REPORT_START,
@@ -39,6 +44,24 @@ describe('metadata-only PR review follow-ups', () => {
     expect(feedbackRequestsPrBodyUpdate('Update the PR body to match the actual diff.')).toBe(true);
     expect(feedbackRequestsPrBodyUpdate('The live merge record is stale.')).toBe(true);
     expect(feedbackRequestsPrBodyUpdate('Fix the failing repository test.')).toBe(false);
+  });
+
+  it('only accepts explicit already-addressed no-op follow-ups', () => {
+    expect(
+      followupReportsFeedbackAlreadyAddressed(
+        'No file edits were needed in this checkout; the reviewed fixture is already corrected.'
+      )
+    ).toBe(true);
+    expect(
+      followupReportsFeedbackAlreadyAddressed(
+        'The requested change has already been addressed on the current branch.'
+      )
+    ).toBe(true);
+    expect(
+      followupReportsFeedbackAlreadyAddressed(
+        'I could not determine the correct fix. No changes were made.'
+      )
+    ).toBe(false);
   });
 
   it('extracts a complete outcome report from a backward-compatible final message', () => {
