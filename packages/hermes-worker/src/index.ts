@@ -31,14 +31,25 @@ import {
   commitLocal,
   pushBranch,
   openPullRequest,
+  updatePullRequestOutcomeReport,
+  requestReReviewFromChangeRequesters,
   ensurePullRequestLabels,
   prepareMergeConflictResolution,
+  ConcurrentBranchUpdateError,
   type MergeConflictPreparation,
 } from './github.js';
 import { AgentProvidersUnavailableError, ContainerRestartRequiredError, runAgent } from './agent.js';
 import { installWorkspace } from './workspace.js';
 import { runGate, gateSummary, type GateResult } from './gate.js';
-import { loadContract, contractPromptBlock, validatePrBody, buildReportRepairPrompt, loadReport } from './contract.js';
+import {
+  loadContract,
+  contractPromptBlock,
+  validatePrBody,
+  buildReportRepairPrompt,
+  loadReport,
+  feedbackRequestsPrBodyUpdate,
+  extractOutcomeReport,
+} from './contract.js';
 import { runPreopenReview, buildReviewFixPrompt, reviewSummary } from './review.js';
 import { reviewLearningPromptBlock } from './reviewLearning.js';
 import { putMetric } from './metrics.js';
@@ -269,6 +280,9 @@ async function commitAndPushWithPrecommitRepair(input: {
       await commitAndPush(input.dir, input.branch, input.message);
       return transcriptUri;
     } catch (err) {
+      // Preserve branch-race classification so processJob can retain/requeue the durable job.
+      // Wrapping this as a generic pre-commit error would recreate the To Do regression.
+      if (err instanceof ConcurrentBranchUpdateError) throw err;
       const failure = errorText(err);
       if (attempt >= PRECOMMIT_REPAIR_ATTEMPTS || !looksLikePrecommitFailure(failure)) {
         throw new Error(compactText(failure, 8000));
@@ -619,9 +633,14 @@ async function processJob(jobId: string): Promise<void> {
       );
     }
     const stagingDbBlock = stagingDatabasePromptBlock(job.type, issueKey ?? undefined);
-    // WS3.3 — ask for the six-section outcome report up front (initial PRs only) to avoid an extra round.
+    // WS3.3 — initial PRs always need an outcome report. A follow-up needs one only when review
+    // explicitly asks for live PR-body metadata; the harness applies it without requiring a fake
+    // source-code edit or allowing the agent to invoke GitHub directly.
+    const prBodyUpdateRequested = isPrFollowup && feedbackRequestsPrBodyUpdate(job.feedbackSummary);
     const reportInstruction = isPrFollowup
-      ? ''
+      ? prBodyUpdateRequested
+        ? '\n\n--- PR DESCRIPTION UPDATE ---\nThe review feedback explicitly requires an update to the live PR body. Write the complete replacement outcome report to HERMES_REPORT.md at the repository root, with a level-2 Markdown heading for EACH section: Root cause, Evidence, Verification, Blast radius, Data repair, Deferred. The harness will validate the file, remove it from the working tree, and update the existing PR through GitHub. Do not invent a code edit when metadata is the only requested change.'
+        : ''
       : '\n\n--- OUTCOME REPORT ---\nWhen the change is complete, ALSO write an outcome report to a file named HERMES_REPORT.md at the repo root, with a level-2 Markdown heading for EACH section: Root cause, Evidence, Verification, Blast radius, Data repair, Deferred. The harness reads this into the PR description. Do not commit or push it.';
     const agentPrompt =
       [
@@ -665,7 +684,66 @@ async function processJob(jobId: string): Promise<void> {
     let transcript = agentRun.transcript;
     let transcriptUri = await storeTranscript(jobId, transcript);
 
+    // A metadata-only review must not look like an empty implementation. Prefer the explicit file
+    // contract, but accept a validated six-section final response for backward compatibility with
+    // agents that correctly wrote the report in their final message instead.
+    const followupReportFile = prBodyUpdateRequested ? await loadReport(dir) : undefined;
+    let followupOutcomeReport =
+      followupReportFile && validatePrBody(followupReportFile).ok
+        ? followupReportFile
+        : prBodyUpdateRequested
+          ? extractOutcomeReport(agentRun.finalMessage)
+          : undefined;
+    if (prBodyUpdateRequested && !followupOutcomeReport) {
+      const candidate = followupReportFile ?? agentRun.finalMessage ?? '';
+      const repair = await runAgent(dir, buildReportRepairPrompt(validatePrBody(candidate).missing, contract));
+      transcript += `\n--- PR-description report repair round ---\n${repair.transcript || `(exit ${repair.exitCode})`}`;
+      transcriptUri = await storeTranscript(jobId, transcript);
+      const repairedFile = await loadReport(dir);
+      followupOutcomeReport =
+        repairedFile && validatePrBody(repairedFile).ok
+          ? repairedFile
+          : extractOutcomeReport(repair.finalMessage);
+    }
+    if (isPrFollowup) {
+      await rmFile(joinPath(dir, 'HERMES_REPORT.md')).catch(() => {});
+    }
+    if (prBodyUpdateRequested && !followupOutcomeReport) {
+      throw new Error('review requested a PR-description update, but the agent did not produce a valid six-section outcome report');
+    }
+
     if (!(await hasChanges(dir, baseSha))) {
+      if (isPrFollowup && followupOutcomeReport && job.prNumber && job.prUrl) {
+        octokit = (await getInstallationAuth(job.repo)).octokit;
+        await updatePullRequestOutcomeReport(octokit, job.repo, job.prNumber, followupOutcomeReport);
+        const reRequested = await requestReReviewFromChangeRequesters(octokit, job.repo, job.prNumber);
+        const headSha = await getHeadSha(dir);
+        await updateJob(jobId, 'done', { prUrl: job.prUrl, transcriptUri, headSha });
+        await markPrWatchWaiting(job.repo, job.prNumber, headSha);
+        await commentOnPullRequest(
+          octokit,
+          job.repo,
+          job.prNumber,
+          [
+            '🤖 **Hermes** updated the live PR outcome report to address the latest review feedback. No source-code change was required.',
+            reRequested.length ? `Re-requested review from ${reRequested.map((login) => `@${login}`).join(', ')}.` : undefined,
+          ]
+            .filter(Boolean)
+            .join('\n\n')
+        );
+        await notify(job, `:white_check_mark: Hermes updated the PR description for ${job.prUrl}.`);
+        if (ticket) {
+          await commentOnIssue(
+            ticket,
+            `✅ I updated the live PR description to address the latest review feedback: ${job.prUrl}\n\nNo source-code change was required.`
+          );
+          await transitionIssue(ticket, COLUMN.codeReview);
+          await markFlowRunning(ticket, { prUrl: job.prUrl, lastFixJobId: jobId });
+        }
+        console.log(`[${jobId}] metadata-only follow-up completed → ${job.prUrl}`);
+        return;
+      }
+
       const why = reason ? ` (${reason})` : '';
       await updateJob(jobId, 'failed', { error: `agent produced no changes${why}`, transcriptUri });
       await notify(job, `:warning: Hermes job \`${jobId}\` finished but made no changes${why}.`);
@@ -708,6 +786,10 @@ async function processJob(jobId: string): Promise<void> {
       // Installation tokens expire after roughly one hour. Validation and review-repair rounds can
       // legitimately exceed that, so never reuse the client minted before clone for final API writes.
       octokit = (await getInstallationAuth(job.repo)).octokit;
+      if (followupOutcomeReport) {
+        await updatePullRequestOutcomeReport(octokit, job.repo, job.prNumber, followupOutcomeReport);
+        console.log(`[${jobId}] updated the live PR outcome report requested by review feedback`);
+      }
       // Apply any labels the agent explicitly requested via a `HERMES-APPLY-LABEL: <label>` line in
       // its final message (e.g. `skip-openapi-sync` when it determines the change is a pure refactor
       // with no API-contract change). Best-effort.
@@ -846,6 +928,19 @@ async function processJob(jobId: string): Promise<void> {
     console.log(`[${jobId}] done → ${pr.url}`);
   } catch (err) {
     const msg = errorText(err);
+    if (err instanceof ConcurrentBranchUpdateError) {
+      // GitHub's auto-update workflow (or another follow-up) advanced this PR branch while the
+      // agent was working. Preserve the durable job and its attempt budget; loop() will replace the
+      // current SQS receipt with a short delayed retry against the newest branch head.
+      console.warn(`[${jobId}] concurrent PR branch update; preserving job for retry: ${msg}`);
+      await bestEffortFailureReport(jobId, 'preserve concurrent-branch job', () =>
+        updateJob(jobId, 'queued', {
+          phase: `PR branch advanced concurrently; automatic retry in ${err.retryAfterSeconds}s`,
+        })
+      );
+      await putMetric('HermesConcurrentBranchRetries', 1, { type: job.type }).catch(() => {});
+      throw err;
+    }
     if (err instanceof AgentProvidersUnavailableError) {
       console.warn(`[${jobId}] coding providers unavailable; preserving job for retry: ${msg}`);
       const compactError = compactText(msg, 2000);
@@ -1017,6 +1112,26 @@ async function loop(): Promise<void> {
               'failed to hand off job from draining worker; retaining original message:',
               requeueError
             );
+          }
+          continue;
+        }
+        if (err instanceof ConcurrentBranchUpdateError) {
+          // A fresh delayed message avoids consuming the queue's DLQ receive budget. The same job
+          // id is retained, so PR-monitor fix attempts are not charged for infrastructure races.
+          try {
+            await sqs.send(
+              new SendMessageCommand({
+                QueueUrl: QUEUE,
+                MessageBody: m.Body || '{}',
+                DelaySeconds: err.retryAfterSeconds,
+              })
+            );
+            stopVisibilityHeartbeat();
+            await sqs.send(new DeleteMessageCommand({ QueueUrl: QUEUE, ReceiptHandle: m.ReceiptHandle! }));
+            console.warn(`job rescheduled in ${err.retryAfterSeconds}s after a concurrent PR branch update`);
+          } catch (requeueError) {
+            // Retain the original receipt if send-then-delete cannot complete atomically.
+            console.error('failed to reschedule concurrent-branch job; retaining original message:', requeueError);
           }
           continue;
         }

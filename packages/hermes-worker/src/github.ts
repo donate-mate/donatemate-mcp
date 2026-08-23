@@ -117,6 +117,87 @@ function sanitizeGitAuthError(err: any): any {
   return err;
 }
 
+function gitCommandErrorText(err: unknown): string {
+  if (!err || typeof err !== 'object') return String(err);
+  const commandError = err as { message?: unknown; stdout?: unknown; stderr?: unknown };
+  return [commandError.message, commandError.stdout, commandError.stderr]
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n');
+}
+
+/** Git's stable rejection variants when another writer advanced the remote branch. */
+export function isNonFastForwardPushError(err: unknown): boolean {
+  return /non-fast-forward|\[rejected\].*fetch first|tip of your current branch is behind|remote contains work that you do not have locally/i.test(
+    gitCommandErrorText(err)
+  );
+}
+
+/**
+ * A PR branch changed too many times, or could not be merged safely, while a follow-up was running.
+ * The worker treats this as transient infrastructure concurrency: it retries the same durable job
+ * from the newest branch head instead of failing the job or moving its Jira issue back to To Do.
+ */
+export class ConcurrentBranchUpdateError extends Error {
+  readonly retryAfterSeconds: number;
+
+  constructor(message: string, retryAfterSeconds = 15) {
+    super(message);
+    this.name = 'ConcurrentBranchUpdateError';
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+export interface RemoteBranchReconciliation {
+  localSha: string;
+  remoteSha: string;
+  output: string;
+}
+
+/**
+ * Fetch and merge the exact current PR-branch head into Hermes' completed local change.
+ *
+ * The resulting push remains a normal fast-forward; this deliberately never force-pushes. If the
+ * two changes conflict, abort the merge so the local commit remains intact and ask the durable job
+ * loop to restart from the current remote head.
+ */
+export async function reconcileRemoteBranchUpdate(
+  dir: string,
+  branch: string
+): Promise<RemoteBranchReconciliation> {
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  await exec(
+    'git',
+    ['-C', dir, 'fetch', '--no-tags', 'origin', `+refs/heads/${branch}:${remoteRef}`],
+    { maxBuffer: 4 * 1024 * 1024 }
+  );
+  const [{ stdout: localShaOut }, { stdout: remoteShaOut }] = await Promise.all([
+    exec('git', ['-C', dir, 'rev-parse', 'HEAD']),
+    exec('git', ['-C', dir, 'rev-parse', remoteRef]),
+  ]);
+  const localSha = localShaOut.trim();
+  const remoteSha = remoteShaOut.trim();
+
+  try {
+    const { stdout, stderr } = await exec('git', ['-C', dir, 'merge', '--no-edit', remoteRef], {
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    await assertNoUnmergedFiles(dir);
+    await assertNoConflictMarkers(dir);
+    return { localSha, remoteSha, output: `${stdout}${stderr}`.trim() };
+  } catch (err) {
+    const conflicts = await listUnmergedFiles(dir).catch(() => []);
+    if (conflicts.length || /\bCONFLICT \(|Automatic merge failed|fix conflicts/i.test(gitCommandErrorText(err))) {
+      await exec('git', ['-C', dir, 'merge', '--abort']).catch(() => {});
+      throw new ConcurrentBranchUpdateError(
+        `PR branch ${branch} advanced from ${localSha.slice(0, 7)} to ${remoteSha.slice(0, 7)} while Hermes was working, and automatic reconciliation conflicted${
+          conflicts.length ? ` in ${conflicts.slice(0, 20).join(', ')}` : ''
+        }. Retrying the same job from the latest remote head.`
+      );
+    }
+    throw err;
+  }
+}
+
 async function repoFromOrigin(dir: string): Promise<string> {
   const { stdout } = await exec('git', ['-C', dir, 'remote', 'get-url', 'origin']);
   const origin = stdout.trim();
@@ -246,21 +327,38 @@ export async function commitAndPush(dir: string, branch: string, message: string
   );
   if (staged) await exec('git', ['-C', dir, 'commit', '-m', message]);
 
-  // Push with retry: a freshly-minted scoped installation token can transiently 404
-  // ("Repository not found") from GitHub propagation lag — the clone path already retries this,
-  // but push did not, so a one-off blip failed the whole job. Re-mint the token each attempt.
+  // Follow-up jobs share their branch with GitHub's `auto-update` label workflow. That workflow can
+  // merge main after this job clones but before it pushes. Reconcile bounded remote advances with a
+  // normal merge + fast-forward push; never blind-force and never discard either writer's changes.
   let repo = await refreshOriginToken(dir);
+  let transientFailures = 0;
+  let branchReconciliations = 0;
   try {
-    for (let attempt = 1; attempt <= 4; attempt++) {
+    for (;;) {
       try {
         await exec('git', ['-C', dir, 'push', 'origin', branch]);
-        break;
+        return;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (isNonFastForwardPushError(err)) {
+          if (branchReconciliations >= 3) {
+            throw new ConcurrentBranchUpdateError(
+              `PR branch ${branch} kept advancing while Hermes was pushing (${branchReconciliations} automatic reconciliations attempted). Retrying the same job from the latest remote head.`
+            );
+          }
+          branchReconciliations += 1;
+          console.warn(
+            `[push] remote branch ${branch} advanced; reconciling ${branchReconciliations}/3 before retrying`
+          );
+          await reconcileRemoteBranchUpdate(dir, branch);
+          continue;
+        }
+
         const transient = /not found|could not resolve|timed out|connection|tls|ssl|remote end hung up|rpc failed/i.test(msg);
-        if (!transient || attempt === 4) throw sanitizeGitAuthError(err);
-        console.warn(`[push] attempt ${attempt} failed (${msg.split('\n')[0]}); retrying…`);
-        await new Promise((r) => setTimeout(r, 1500 * attempt));
+        transientFailures += 1;
+        if (!transient || transientFailures >= 4) throw sanitizeGitAuthError(err);
+        console.warn(`[push] transient attempt ${transientFailures} failed (${msg.split('\n')[0]}); retrying…`);
+        await new Promise((r) => setTimeout(r, 1500 * transientFailures));
         repo = await refreshOriginToken(dir); // fresh token for the retry
       }
     }
@@ -342,6 +440,99 @@ export async function openPullRequest(
       .catch(() => undefined);
     if (existing) return { number: existing.number, url: existing.html_url };
     throw err;
+  }
+}
+
+export const HERMES_OUTCOME_REPORT_START = '<!-- hermes-outcome-report:start -->';
+export const HERMES_OUTCOME_REPORT_END = '<!-- hermes-outcome-report:end -->';
+
+/**
+ * Replace the outcome-report portion of a Hermes PR body while preserving its task provenance,
+ * validation summary, and review notes. New markers make every later metadata-only repair
+ * deterministic; the heading/boundary fallback upgrades bodies created before markers existed.
+ */
+export function replacePullRequestOutcomeReport(body: string, report: string): string {
+  const cleanReport = report.trim();
+  if (!cleanReport) throw new Error('cannot update a PR body with an empty outcome report');
+  const block = `${HERMES_OUTCOME_REPORT_START}\n${cleanReport}\n${HERMES_OUTCOME_REPORT_END}`;
+
+  const markerStart = body.indexOf(HERMES_OUTCOME_REPORT_START);
+  const markerEnd = body.indexOf(HERMES_OUTCOME_REPORT_END, Math.max(0, markerStart));
+  if (markerStart >= 0 && markerEnd >= markerStart) {
+    return `${body.slice(0, markerStart).trimEnd()}\n\n${block}\n\n${body
+      .slice(markerEnd + HERMES_OUTCOME_REPORT_END.length)
+      .trimStart()}`.trim();
+  }
+
+  const rootMatch = /^##\s+Root cause\b/im.exec(body);
+  if (rootMatch) {
+    const reportStart = rootMatch.index;
+    const deferredMatch = /^##\s+Deferred\b/im.exec(body.slice(reportStart));
+    if (deferredMatch) {
+      const deferredStart = reportStart + deferredMatch.index;
+      const boundaryMatch = /\n---\s*(?:\n|$)/.exec(body.slice(deferredStart));
+      const reportEnd = boundaryMatch ? deferredStart + boundaryMatch.index : body.length;
+      return `${body.slice(0, reportStart).trimEnd()}\n\n${block}\n\n${body.slice(reportEnd).trimStart()}`.trim();
+    }
+  }
+
+  const gateBoundary = /\n---\s*\n\s*\*\*Pre-commit gate:/i.exec(body);
+  const insertionPoint = gateBoundary?.index ?? body.length;
+  return `${body.slice(0, insertionPoint).trimEnd()}\n\n${block}\n\n${body.slice(insertionPoint).trimStart()}`.trim();
+}
+
+export async function updatePullRequestOutcomeReport(
+  octokit: Octokit,
+  repo: string,
+  prNumber: number,
+  report: string
+): Promise<void> {
+  const { owner, name } = splitRepo(repo);
+  const current = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber });
+  const body = replacePullRequestOutcomeReport(String(current.data.body ?? ''), report);
+  await octokit.pulls.update({ owner, repo: name, pull_number: prNumber, body });
+}
+
+/** Requeue human reviewers after a metadata-only fix, which does not produce a new commit event. */
+export async function requestReReviewFromChangeRequesters(
+  octokit: Octokit,
+  repo: string,
+  prNumber: number
+): Promise<string[]> {
+  try {
+    const { owner, name } = splitRepo(repo);
+    const pr = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber });
+    const alreadyPending = new Set(
+      (pr.data.requested_reviewers ?? []).map((reviewer) =>
+        String((reviewer as { login?: string }).login ?? '').toLowerCase()
+      )
+    );
+    const reviews = await octokit.paginate(octokit.pulls.listReviews, {
+      owner,
+      repo: name,
+      pull_number: prNumber,
+      per_page: 100,
+    });
+    const latest = new Map<string, string>();
+    for (const review of reviews) {
+      const login = review.user?.login;
+      const state = String(review.state ?? '').toUpperCase();
+      if (!login || review.user?.type === 'Bot' || state === 'COMMENTED') continue;
+      latest.set(login, state);
+    }
+    const reviewers = [...latest.entries()]
+      .filter(([login, state]) => state === 'CHANGES_REQUESTED' && !alreadyPending.has(login.toLowerCase()))
+      .map(([login]) => login);
+    if (reviewers.length) {
+      await octokit.pulls.requestReviewers({ owner, repo: name, pull_number: prNumber, reviewers });
+    }
+    return reviewers;
+  } catch (err) {
+    console.warn(
+      `[github] failed to re-request review on ${repo}#${prNumber}:`,
+      err instanceof Error ? err.message : String(err)
+    );
+    return [];
   }
 }
 
