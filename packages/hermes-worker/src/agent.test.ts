@@ -3,8 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  AgentProvidersUnavailableError,
   buildClaudeExecInvocation,
   buildCodexExecInvocation,
+  isProviderBillingOutput,
   isProviderUnavailableOutput,
   parseClaudeOutput,
   runProcessWithTimeout,
@@ -94,5 +96,37 @@ describe('Anthropic provider failover', () => {
     'API Error: 529 overloaded_error',
   ])('classifies provider capacity failures: %s', (message) => {
     expect(isProviderUnavailableOutput(message)).toBe(true);
+  });
+
+  it.each([
+    'credit_balance_exhausted',
+    'You have no credits remaining.',
+    'insufficient_quota',
+    'billing_hard_limit_reached',
+    'Your credit balance is too low',
+    'Payment required: purchase more credits',
+    "You've hit your usage limit",
+    'Monthly spending limit has been reached',
+  ])('classifies provider billing failures separately: %s', (message) => {
+    expect(isProviderBillingOutput(message)).toBe(true);
+  });
+
+  it.each(['rate_limit_exceeded', 'API Error: 529 overloaded_error', 'service unavailable', 'invalid_api_key'])(
+    'does not mislabel non-billing provider failures: %s',
+    (message) => {
+      expect(isProviderBillingOutput(message)).toBe(false);
+    }
+  );
+
+  it('carries billing metadata and a bounded retry delay into the queue loop', () => {
+    const error = new AgentProvidersUnavailableError('providers unavailable', {
+      category: 'billing',
+      billingProviders: ['openai', 'openai', 'anthropic'],
+      retryAfterSeconds: 75,
+    });
+
+    expect(error.category).toBe('billing');
+    expect(error.billingProviders).toEqual(['openai', 'anthropic']);
+    expect(error.retryAfterSeconds).toBe(75);
   });
 });

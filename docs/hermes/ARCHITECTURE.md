@@ -298,6 +298,11 @@ routed to the independently funded **Claude Code CLI**. Key facts as-coded:
 - **Failover**: Claude Code uses `FALLBACK_AGENT_MODEL` (default `claude-sonnet-5`) and
   `SECRET_ANTHROPIC`. If both providers are unavailable, the SQS message is replaced by a delayed
   retry instead of consuming its DLQ receive budget or marking the job failed.
+- **Billing recovery**: exhausted-credit, quota, and spend-limit responses are tracked separately
+  from transient outages. Hermes preserves the exact job, adds the searchable
+  `hermes-provider-billing-blocked` label and a one-time Jira explanation, and retries every five
+  minutes. The first successful provider request resumes the job, removes the label, and posts a
+  recovery update without requiring reassignment or another `/go` comment.
 - **Sandbox**: the ephemeral Fargate container *is* the sandbox, so Codex runs with
   `--dangerously-bypass-approvals-and-sandbox`, `--ephemeral`, and `--skip-git-repo-check`.
 - **Working dir**: `-C <clonedir>`. The agent's final message is captured to a `-o last.txt` file
