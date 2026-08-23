@@ -48,6 +48,7 @@ import {
   buildReportRepairPrompt,
   loadReport,
   feedbackRequestsPrBodyUpdate,
+  followupReportsFeedbackAlreadyAddressed,
   extractOutcomeReport,
 } from './contract.js';
 import { runPreopenReview, buildReviewFixPrompt, reviewSummary } from './review.js';
@@ -741,6 +742,61 @@ async function processJob(jobId: string): Promise<void> {
           await markFlowRunning(ticket, { prUrl: job.prUrl, lastFixJobId: jobId });
         }
         console.log(`[${jobId}] metadata-only follow-up completed → ${job.prUrl}`);
+        return;
+      }
+
+      const noChangeExplanation = `${agentRun.finalMessage ?? ''}\n${reason ?? ''}`;
+      if (
+        isPrFollowup &&
+        exitCode === 0 &&
+        job.prNumber &&
+        job.prUrl &&
+        followupReportsFeedbackAlreadyAddressed(noChangeExplanation)
+      ) {
+        octokit = (await getInstallationAuth(job.repo)).octokit;
+        const headSha = await getHeadSha(dir);
+        let replied = 0;
+        if (job.reviewReplyTargets?.length) {
+          const replies = await replyToAddressedReviewComments(
+            octokit,
+            job.repo,
+            job.prNumber,
+            job.reviewReplyTargets,
+            headSha
+          );
+          replied = replies.posted + replies.alreadyPresent;
+        }
+        const reRequested = await requestReReviewFromChangeRequesters(
+          octokit,
+          job.repo,
+          job.prNumber
+        );
+        await updateJob(jobId, 'done', { prUrl: job.prUrl, transcriptUri, headSha });
+        await markPrWatchWaiting(job.repo, job.prNumber, headSha);
+        await commentOnPullRequest(
+          octokit,
+          job.repo,
+          job.prNumber,
+          [
+            `🤖 **Hermes** verified that the latest feedback is already addressed on current head \`${headSha.slice(0, 7)}\`; no additional source-code change was required.`,
+            replied ? `Acknowledged ${replied} addressed inline review thread(s).` : undefined,
+            reRequested.length
+              ? `Re-requested review from ${reRequested.map((login) => `@${login}`).join(', ')}.`
+              : undefined,
+          ]
+            .filter(Boolean)
+            .join('\n\n')
+        );
+        await notify(job, `:white_check_mark: Hermes verified the feedback was already addressed on ${job.prUrl}.`);
+        if (ticket) {
+          await commentOnIssue(
+            ticket,
+            `✅ I verified the latest PR feedback is already addressed on current head \`${headSha.slice(0, 7)}\`: ${job.prUrl}\n\nNo additional source-code change was required; the PR is back in Code Review.`
+          );
+          await transitionIssue(ticket, COLUMN.codeReview);
+          await markFlowRunning(ticket, { prUrl: job.prUrl, lastFixJobId: jobId });
+        }
+        console.log(`[${jobId}] already-addressed no-op follow-up completed → ${job.prUrl}`);
         return;
       }
 
