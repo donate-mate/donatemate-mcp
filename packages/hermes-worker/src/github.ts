@@ -117,6 +117,87 @@ function sanitizeGitAuthError(err: any): any {
   return err;
 }
 
+function gitCommandErrorText(err: unknown): string {
+  if (!err || typeof err !== 'object') return String(err);
+  const commandError = err as { message?: unknown; stdout?: unknown; stderr?: unknown };
+  return [commandError.message, commandError.stdout, commandError.stderr]
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n');
+}
+
+/** Git's stable rejection variants when another writer advanced the remote branch. */
+export function isNonFastForwardPushError(err: unknown): boolean {
+  return /non-fast-forward|\[rejected\].*fetch first|tip of your current branch is behind|remote contains work that you do not have locally/i.test(
+    gitCommandErrorText(err)
+  );
+}
+
+/**
+ * A PR branch changed too many times, or could not be merged safely, while a follow-up was running.
+ * The worker treats this as transient infrastructure concurrency: it retries the same durable job
+ * from the newest branch head instead of failing the job or moving its Jira issue back to To Do.
+ */
+export class ConcurrentBranchUpdateError extends Error {
+  readonly retryAfterSeconds: number;
+
+  constructor(message: string, retryAfterSeconds = 15) {
+    super(message);
+    this.name = 'ConcurrentBranchUpdateError';
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+export interface RemoteBranchReconciliation {
+  localSha: string;
+  remoteSha: string;
+  output: string;
+}
+
+/**
+ * Fetch and merge the exact current PR-branch head into Hermes' completed local change.
+ *
+ * The resulting push remains a normal fast-forward; this deliberately never force-pushes. If the
+ * two changes conflict, abort the merge so the local commit remains intact and ask the durable job
+ * loop to restart from the current remote head.
+ */
+export async function reconcileRemoteBranchUpdate(
+  dir: string,
+  branch: string
+): Promise<RemoteBranchReconciliation> {
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  await exec(
+    'git',
+    ['-C', dir, 'fetch', '--no-tags', 'origin', `+refs/heads/${branch}:${remoteRef}`],
+    { maxBuffer: 4 * 1024 * 1024 }
+  );
+  const [{ stdout: localShaOut }, { stdout: remoteShaOut }] = await Promise.all([
+    exec('git', ['-C', dir, 'rev-parse', 'HEAD']),
+    exec('git', ['-C', dir, 'rev-parse', remoteRef]),
+  ]);
+  const localSha = localShaOut.trim();
+  const remoteSha = remoteShaOut.trim();
+
+  try {
+    const { stdout, stderr } = await exec('git', ['-C', dir, 'merge', '--no-edit', remoteRef], {
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    await assertNoUnmergedFiles(dir);
+    await assertNoConflictMarkers(dir);
+    return { localSha, remoteSha, output: `${stdout}${stderr}`.trim() };
+  } catch (err) {
+    const conflicts = await listUnmergedFiles(dir).catch(() => []);
+    if (conflicts.length || /\bCONFLICT \(|Automatic merge failed|fix conflicts/i.test(gitCommandErrorText(err))) {
+      await exec('git', ['-C', dir, 'merge', '--abort']).catch(() => {});
+      throw new ConcurrentBranchUpdateError(
+        `PR branch ${branch} advanced from ${localSha.slice(0, 7)} to ${remoteSha.slice(0, 7)} while Hermes was working, and automatic reconciliation conflicted${
+          conflicts.length ? ` in ${conflicts.slice(0, 20).join(', ')}` : ''
+        }. Retrying the same job from the latest remote head.`
+      );
+    }
+    throw err;
+  }
+}
+
 async function repoFromOrigin(dir: string): Promise<string> {
   const { stdout } = await exec('git', ['-C', dir, 'remote', 'get-url', 'origin']);
   const origin = stdout.trim();
@@ -246,21 +327,38 @@ export async function commitAndPush(dir: string, branch: string, message: string
   );
   if (staged) await exec('git', ['-C', dir, 'commit', '-m', message]);
 
-  // Push with retry: a freshly-minted scoped installation token can transiently 404
-  // ("Repository not found") from GitHub propagation lag — the clone path already retries this,
-  // but push did not, so a one-off blip failed the whole job. Re-mint the token each attempt.
+  // Follow-up jobs share their branch with GitHub's `auto-update` label workflow. That workflow can
+  // merge main after this job clones but before it pushes. Reconcile bounded remote advances with a
+  // normal merge + fast-forward push; never blind-force and never discard either writer's changes.
   let repo = await refreshOriginToken(dir);
+  let transientFailures = 0;
+  let branchReconciliations = 0;
   try {
-    for (let attempt = 1; attempt <= 4; attempt++) {
+    for (;;) {
       try {
         await exec('git', ['-C', dir, 'push', 'origin', branch]);
-        break;
+        return;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (isNonFastForwardPushError(err)) {
+          if (branchReconciliations >= 3) {
+            throw new ConcurrentBranchUpdateError(
+              `PR branch ${branch} kept advancing while Hermes was pushing (${branchReconciliations} automatic reconciliations attempted). Retrying the same job from the latest remote head.`
+            );
+          }
+          branchReconciliations += 1;
+          console.warn(
+            `[push] remote branch ${branch} advanced; reconciling ${branchReconciliations}/3 before retrying`
+          );
+          await reconcileRemoteBranchUpdate(dir, branch);
+          continue;
+        }
+
         const transient = /not found|could not resolve|timed out|connection|tls|ssl|remote end hung up|rpc failed/i.test(msg);
-        if (!transient || attempt === 4) throw sanitizeGitAuthError(err);
-        console.warn(`[push] attempt ${attempt} failed (${msg.split('\n')[0]}); retrying…`);
-        await new Promise((r) => setTimeout(r, 1500 * attempt));
+        transientFailures += 1;
+        if (!transient || transientFailures >= 4) throw sanitizeGitAuthError(err);
+        console.warn(`[push] transient attempt ${transientFailures} failed (${msg.split('\n')[0]}); retrying…`);
+        await new Promise((r) => setTimeout(r, 1500 * transientFailures));
         repo = await refreshOriginToken(dir); // fresh token for the retry
       }
     }

@@ -33,6 +33,7 @@ import {
   openPullRequest,
   ensurePullRequestLabels,
   prepareMergeConflictResolution,
+  ConcurrentBranchUpdateError,
   type MergeConflictPreparation,
 } from './github.js';
 import { AgentProvidersUnavailableError, ContainerRestartRequiredError, runAgent } from './agent.js';
@@ -269,6 +270,9 @@ async function commitAndPushWithPrecommitRepair(input: {
       await commitAndPush(input.dir, input.branch, input.message);
       return transcriptUri;
     } catch (err) {
+      // Preserve branch-race classification so processJob can retain/requeue the durable job.
+      // Wrapping this as a generic pre-commit error would recreate the To Do regression.
+      if (err instanceof ConcurrentBranchUpdateError) throw err;
       const failure = errorText(err);
       if (attempt >= PRECOMMIT_REPAIR_ATTEMPTS || !looksLikePrecommitFailure(failure)) {
         throw new Error(compactText(failure, 8000));
@@ -846,6 +850,19 @@ async function processJob(jobId: string): Promise<void> {
     console.log(`[${jobId}] done → ${pr.url}`);
   } catch (err) {
     const msg = errorText(err);
+    if (err instanceof ConcurrentBranchUpdateError) {
+      // GitHub's auto-update workflow (or another follow-up) advanced this PR branch while the
+      // agent was working. Preserve the durable job and its attempt budget; loop() will replace the
+      // current SQS receipt with a short delayed retry against the newest branch head.
+      console.warn(`[${jobId}] concurrent PR branch update; preserving job for retry: ${msg}`);
+      await bestEffortFailureReport(jobId, 'preserve concurrent-branch job', () =>
+        updateJob(jobId, 'queued', {
+          phase: `PR branch advanced concurrently; automatic retry in ${err.retryAfterSeconds}s`,
+        })
+      );
+      await putMetric('HermesConcurrentBranchRetries', 1, { type: job.type }).catch(() => {});
+      throw err;
+    }
     if (err instanceof AgentProvidersUnavailableError) {
       console.warn(`[${jobId}] coding providers unavailable; preserving job for retry: ${msg}`);
       const compactError = compactText(msg, 2000);
@@ -1017,6 +1034,26 @@ async function loop(): Promise<void> {
               'failed to hand off job from draining worker; retaining original message:',
               requeueError
             );
+          }
+          continue;
+        }
+        if (err instanceof ConcurrentBranchUpdateError) {
+          // A fresh delayed message avoids consuming the queue's DLQ receive budget. The same job
+          // id is retained, so PR-monitor fix attempts are not charged for infrastructure races.
+          try {
+            await sqs.send(
+              new SendMessageCommand({
+                QueueUrl: QUEUE,
+                MessageBody: m.Body || '{}',
+                DelaySeconds: err.retryAfterSeconds,
+              })
+            );
+            stopVisibilityHeartbeat();
+            await sqs.send(new DeleteMessageCommand({ QueueUrl: QUEUE, ReceiptHandle: m.ReceiptHandle! }));
+            console.warn(`job rescheduled in ${err.retryAfterSeconds}s after a concurrent PR branch update`);
+          } catch (requeueError) {
+            // Retain the original receipt if send-then-delete cannot complete atomically.
+            console.error('failed to reschedule concurrent-branch job; retaining original message:', requeueError);
           }
           continue;
         }
