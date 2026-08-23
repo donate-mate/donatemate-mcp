@@ -241,15 +241,43 @@ function issueContainsText(issue: { fields?: any }, needle: string): boolean {
   return JSON.stringify(issue.fields?.description ?? '').toLowerCase().includes(needle);
 }
 
-async function addLabels(issueKey: string, labels: string[]): Promise<void> {
+export async function addIssueLabels(issueKey: string, labels: string[]): Promise<boolean> {
   const uniqueLabels = [...new Set(labels.map((label) => label.trim()).filter(Boolean))];
-  if (!uniqueLabels.length) return;
-  const res = await jiraRequest(`/rest/api/3/issue/${encodeURIComponent(issueKey)}`, {
-    method: 'PUT',
-    body: JSON.stringify({ update: { labels: uniqueLabels.map((label) => ({ add: label })) } }),
-  });
-  if (res && !res.ok) {
-    console.warn(`[jira] add labels to ${issueKey} failed: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
+  if (!uniqueLabels.length) return true;
+  try {
+    const res = await jiraRequest(`/rest/api/3/issue/${encodeURIComponent(issueKey)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ update: { labels: uniqueLabels.map((label) => ({ add: label })) } }),
+    });
+    if (!res) return false;
+    if (!res.ok) {
+      console.warn(`[jira] add labels to ${issueKey} failed: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[jira] add labels to ${issueKey} errored: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+export async function removeIssueLabels(issueKey: string, labels: string[]): Promise<boolean> {
+  const uniqueLabels = [...new Set(labels.map((label) => label.trim()).filter(Boolean))];
+  if (!uniqueLabels.length) return true;
+  try {
+    const res = await jiraRequest(`/rest/api/3/issue/${encodeURIComponent(issueKey)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ update: { labels: uniqueLabels.map((label) => ({ remove: label })) } }),
+    });
+    if (!res) return false;
+    if (!res.ok) {
+      console.warn(`[jira] remove labels from ${issueKey} failed: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[jira] remove labels from ${issueKey} errored: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
   }
 }
 
@@ -305,7 +333,7 @@ export async function createLinkedDefect(input: {
     return null;
   });
   if (existingKey) {
-    await addLabels(existingKey, [dedupeLabel]);
+    await addIssueLabels(existingKey, [dedupeLabel]);
     await linkIssues(input.sourceIssueKey, existingKey);
     return existingKey;
   }

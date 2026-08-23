@@ -403,6 +403,9 @@ export class HermesStack extends cdk.Stack {
         AGENT_MODEL: 'gpt-5.5', // coding model (pinned)
         FALLBACK_AGENT_MODEL: 'claude-sonnet-5',
         OPENAI_CIRCUIT_BREAKER_SECONDS: '900',
+        // Billing incidents are durable/visible in Jira and retry more quickly than generic
+        // outages so topping up a provider restarts preserved work without manual intervention.
+        PROVIDER_BILLING_RETRY_SECONDS: '300',
         SECRET_JIRA: secJira.secretName,
         SECRET_JIRA_BOT: secJiraBot.secretName, // progress comments + column moves as Hermes
         SECRET_SLACK: secSlack.secretName, // worker posts PR links back to the Slack thread

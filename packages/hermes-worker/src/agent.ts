@@ -17,8 +17,15 @@ const AGENT_MODEL = process.env.AGENT_MODEL || 'gpt-5.5';
 const FALLBACK_AGENT_MODEL = process.env.FALLBACK_AGENT_MODEL || 'claude-sonnet-5';
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_SECONDS ?? 2400) * 1000;
 const OPENAI_CIRCUIT_BREAKER_MS = Number(process.env.OPENAI_CIRCUIT_BREAKER_SECONDS ?? 900) * 1000;
+const configuredBillingRetrySeconds = Number(
+  process.env.PROVIDER_BILLING_RETRY_SECONDS ?? 300
+);
+const PROVIDER_BILLING_RETRY_SECONDS = Number.isFinite(configuredBillingRetrySeconds)
+  ? Math.max(1, Math.min(900, Math.round(configuredBillingRetrySeconds)))
+  : 300;
 const OUTPUT_CAP = 16 * 1024 * 1024;
 let openAiUnavailableUntil = 0;
+let openAiUnavailableCategory: ProviderFailureCategory = 'unavailable';
 
 // WS3.1 — reasoning effort. Codex takes `-c model_reasoning_effort=<minimal|low|medium|high>`.
 // Default is env-configurable ("medium") for implementation jobs; the pre-open review session
@@ -51,7 +58,7 @@ export interface AgentResult {
   transcript: string;
   exitCode: number;
   /** Provider that produced the final result. */
-  provider: 'openai' | 'anthropic';
+  provider: AgentProvider;
   /** The agent's final message, truncated for Slack/Jira display and no-change explanations. */
   reason?: string;
   /** The agent's final message, untruncated — used by the WS4 review session to parse findings JSON. */
@@ -99,26 +106,53 @@ export class InfrastructureCommandTimeoutError extends ContainerRestartRequiredE
 }
 
 /** Both coding providers are unavailable. The queue loop reschedules rather than failing the job. */
+export type AgentProvider = 'openai' | 'anthropic';
+export type ProviderFailureCategory = 'billing' | 'unavailable';
+
 export class AgentProvidersUnavailableError extends Error {
   readonly retryAfterSeconds: number;
+  readonly category: ProviderFailureCategory;
+  readonly billingProviders: AgentProvider[];
 
-  constructor(message: string, retryAfterSeconds = 900) {
+  constructor(
+    message: string,
+    options: {
+      retryAfterSeconds?: number;
+      category?: ProviderFailureCategory;
+      billingProviders?: AgentProvider[];
+    } = {}
+  ) {
     super(message);
     this.name = 'AgentProvidersUnavailableError';
+    this.category = options.category ?? 'unavailable';
+    this.billingProviders = [...new Set(options.billingProviders ?? [])];
+    const configuredRetry =
+      options.retryAfterSeconds ??
+      (this.category === 'billing' ? PROVIDER_BILLING_RETRY_SECONDS : 900);
+    const retryAfterSeconds = Number.isFinite(configuredRetry) ? configuredRetry : 900;
     this.retryAfterSeconds = Math.max(1, Math.min(900, Math.round(retryAfterSeconds)));
   }
 }
 
-const PROVIDER_UNAVAILABLE_PATTERNS = [
+const PROVIDER_BILLING_PATTERNS = [
   /credit_balance_exhausted/i,
   /insufficient_quota/i,
-  /billing_hard_limit_reached/i,
+  /billing_hard_limit(?:_reached)?/i,
+  /no credits remaining/i,
+  /credit balance (?:is )?too low/i,
+  /(?:add|purchase) (?:more )?credits/i,
+  /payment required/i,
+  /exceeded (?:your|the) current quota/i,
+  /(?:reached|hit|exceeded) (?:your|the) (?:usage|spend(?:ing)?) limit/i,
+  /(?:usage|spend(?:ing)?) limit (?:has been )?(?:reached|exceeded)/i,
+];
+
+const PROVIDER_UNAVAILABLE_PATTERNS = [
+  ...PROVIDER_BILLING_PATTERNS,
   /invalid_api_key/i,
   /authentication_error/i,
   /incorrect api key/i,
   /api key not configured/i,
-  /no credits remaining/i,
-  /exceeded (?:your|the) current quota/i,
   /rate[_ -]?limit(?:ed|_exceeded)?/i,
   /too many requests/i,
   /overloaded_error/i,
@@ -128,9 +162,25 @@ const PROVIDER_UNAVAILABLE_PATTERNS = [
   /(?:status|api error)\s*:?[ ]*5(?:00|02|03|04|29)\b/i,
 ];
 
+/** Billing/quota failures need a durable Jira flag; transient availability failures do not. */
+export function isProviderBillingOutput(text: string): boolean {
+  return PROVIDER_BILLING_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 /** Provider errors that are safe to route to the independent fallback. */
 export function isProviderUnavailableOutput(text: string): boolean {
   return PROVIDER_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function providersUnavailableError(
+  message: string,
+  billingProviders: AgentProvider[] = []
+): AgentProvidersUnavailableError {
+  const providers = [...new Set(billingProviders)];
+  return new AgentProvidersUnavailableError(message, {
+    category: providers.length ? 'billing' : 'unavailable',
+    billingProviders: providers,
+  });
 }
 
 // Authenticate the Codex CLI with the API key. `codex exec` reads auth from ~/.codex/auth.json,
@@ -414,6 +464,7 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
   try {
     let primaryTranscript = '';
     let primaryFailure = '';
+    let primaryBilling = false;
 
     if (Date.now() >= openAiUnavailableUntil) {
       try {
@@ -432,6 +483,8 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
         const finalMessage = (await readFinalMessage()) ?? (stderr.trim() || undefined);
         console.log(`[agent] codex exit ${code} (model=${model}, effort=${effort})`);
         if (code === 0 || !isProviderUnavailableOutput(`${primaryTranscript}\n${finalMessage ?? ''}`)) {
+          openAiUnavailableUntil = 0;
+          openAiUnavailableCategory = 'unavailable';
           return {
             transcript: primaryTranscript,
             exitCode: code,
@@ -445,26 +498,37 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
         if (error instanceof AgentTimeoutError) throw error;
         primaryFailure = error instanceof Error ? error.message : String(error);
       }
-      openAiUnavailableUntil = Date.now() + OPENAI_CIRCUIT_BREAKER_MS;
+      primaryBilling = isProviderBillingOutput(`${primaryFailure}\n${primaryTranscript}`);
+      openAiUnavailableCategory = primaryBilling ? 'billing' : 'unavailable';
+      openAiUnavailableUntil =
+        Date.now() + (primaryBilling ? PROVIDER_BILLING_RETRY_SECONDS * 1000 : OPENAI_CIRCUIT_BREAKER_MS);
     } else {
       primaryFailure = `OpenAI circuit open until ${new Date(openAiUnavailableUntil).toISOString()}`;
+      primaryBilling = openAiUnavailableCategory === 'billing';
     }
 
     console.warn(`[agent] OpenAI unavailable (${primaryFailure.slice(0, 240)}); falling back to Anthropic`);
     if (!SECRET_ANTHROPIC) {
-      throw new AgentProvidersUnavailableError('OpenAI is unavailable and SECRET_ANTHROPIC is not configured');
+      throw providersUnavailableError(
+        'OpenAI is unavailable and SECRET_ANTHROPIC is not configured',
+        primaryBilling ? ['openai'] : []
+      );
     }
 
     let anthropicApiKey = '';
     try {
       anthropicApiKey = await getSecretString(SECRET_ANTHROPIC);
     } catch (error) {
-      throw new AgentProvidersUnavailableError(
-        `OpenAI is unavailable and the Anthropic secret could not be read: ${error instanceof Error ? error.message : String(error)}`
+      throw providersUnavailableError(
+        `OpenAI is unavailable and the Anthropic secret could not be read: ${error instanceof Error ? error.message : String(error)}`,
+        primaryBilling ? ['openai'] : []
       );
     }
     if (!anthropicApiKey) {
-      throw new AgentProvidersUnavailableError('OpenAI is unavailable and the Anthropic API key is empty');
+      throw providersUnavailableError(
+        'OpenAI is unavailable and the Anthropic API key is empty',
+        primaryBilling ? ['openai'] : []
+      );
     }
 
     const fallbackModel = FALLBACK_AGENT_MODEL;
@@ -478,8 +542,9 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
     try {
       fallbackRun = await runClaude(claudeInvocation.args, claudeInvocation.stdin, dir, fallbackEnv);
     } catch (error) {
-      throw new AgentProvidersUnavailableError(
-        `OpenAI is unavailable and Claude Code could not start: ${error instanceof Error ? error.message : String(error)}`
+      throw providersUnavailableError(
+        `OpenAI is unavailable and Claude Code could not start: ${error instanceof Error ? error.message : String(error)}`,
+        primaryBilling ? ['openai'] : []
       );
     }
     const { stdout, stderr, code, timedOut } = fallbackRun;
@@ -488,7 +553,11 @@ export async function runAgent(dir: string, taskPrompt: string, opts: RunAgentOp
     const exitCode = parsed.isError && code === 0 ? 1 : code;
     const fallbackTranscript = `${stdout}\n${stderr}`.trim();
     if (exitCode !== 0 && isProviderUnavailableOutput(`${fallbackTranscript}\n${parsed.finalMessage ?? ''}`)) {
-      throw new AgentProvidersUnavailableError('OpenAI and Anthropic are both temporarily unavailable');
+      const fallbackBilling = isProviderBillingOutput(`${fallbackTranscript}\n${parsed.finalMessage ?? ''}`);
+      throw providersUnavailableError('OpenAI and Anthropic are both temporarily unavailable', [
+        ...(primaryBilling ? (['openai'] as const) : []),
+        ...(fallbackBilling ? (['anthropic'] as const) : []),
+      ]);
     }
     console.log(`[agent] claude exit ${exitCode} (model=${fallbackModel}; OpenAI fallback)`);
     return {

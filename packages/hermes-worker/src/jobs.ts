@@ -51,6 +51,13 @@ export interface HermesJob {
   reviewReplyTargets?: ReviewReplyTarget[];
   qaPlanUri?: string;
   updatedAt?: string;
+  providerFailureCategory?: 'billing';
+  providerBillingBlockedAt?: string;
+  providerBillingRetryAfterSeconds?: number;
+  providerBillingRetryCount?: number;
+  providerBillingProviders?: string[];
+  providerBillingRecoveredAt?: string;
+  providerBillingRecoveredBy?: string;
 }
 
 export async function getJob(jobId: string): Promise<HermesJob | undefined> {
@@ -85,6 +92,107 @@ export async function updateJob(
       ExpressionAttributeValues: values,
     })
   );
+}
+
+export interface ProviderBillingBlockInput {
+  error: string;
+  retryAfterSeconds: number;
+  providers: string[];
+}
+
+/**
+ * Preserve a billing-blocked job as queued and return true only for the first observation of this
+ * incident. The first-observation signal keeps Jira comments idempotent across delayed retries.
+ */
+export async function markProviderBillingBlocked(
+  jobId: string,
+  input: ProviderBillingBlockInput
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const previous = await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { jobId },
+      UpdateExpression: `SET ${[
+        '#s = :queued',
+        '#u = :updatedAt',
+        '#e = :error',
+        '#phase = :phase',
+        '#category = :category',
+        '#blockedAt = if_not_exists(#blockedAt, :blockedAt)',
+        '#retryAfter = :retryAfter',
+        '#retryCount = if_not_exists(#retryCount, :zero) + :one',
+        '#providers = :providers',
+      ].join(', ')} REMOVE #recoveredAt, #recoveredBy`,
+      ExpressionAttributeNames: {
+        '#s': 'status',
+        '#u': 'updatedAt',
+        '#e': 'error',
+        '#phase': 'phase',
+        '#category': 'providerFailureCategory',
+        '#blockedAt': 'providerBillingBlockedAt',
+        '#retryAfter': 'providerBillingRetryAfterSeconds',
+        '#retryCount': 'providerBillingRetryCount',
+        '#providers': 'providerBillingProviders',
+        '#recoveredAt': 'providerBillingRecoveredAt',
+        '#recoveredBy': 'providerBillingRecoveredBy',
+      },
+      ExpressionAttributeValues: {
+        ':queued': 'queued',
+        ':updatedAt': now,
+        ':error': input.error,
+        ':phase': `model-provider billing blocked; automatic retry in ${input.retryAfterSeconds}s`,
+        ':category': 'billing',
+        ':blockedAt': now,
+        ':retryAfter': input.retryAfterSeconds,
+        ':zero': 0,
+        ':one': 1,
+        ':providers': [...new Set(input.providers)],
+      },
+      ReturnValues: 'UPDATED_OLD',
+    })
+  );
+  return !(previous.Attributes as HermesJob | undefined)?.providerBillingBlockedAt;
+}
+
+/** Clear the active billing incident once a real agent request succeeds. */
+export async function markProviderBillingRecovered(jobId: string, provider: string): Promise<boolean> {
+  const now = new Date().toISOString();
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { jobId },
+        UpdateExpression: `SET ${[
+          '#u = :updatedAt',
+          '#recoveredAt = :recoveredAt',
+          '#recoveredBy = :provider',
+        ].join(', ')} REMOVE #blockedAt, #category, #retryAfter, #retryCount, #providers, #e, #phase`,
+        ConditionExpression: 'attribute_exists(#blockedAt)',
+        ExpressionAttributeNames: {
+          '#u': 'updatedAt',
+          '#e': 'error',
+          '#phase': 'phase',
+          '#category': 'providerFailureCategory',
+          '#blockedAt': 'providerBillingBlockedAt',
+          '#retryAfter': 'providerBillingRetryAfterSeconds',
+          '#retryCount': 'providerBillingRetryCount',
+          '#providers': 'providerBillingProviders',
+          '#recoveredAt': 'providerBillingRecoveredAt',
+          '#recoveredBy': 'providerBillingRecoveredBy',
+        },
+        ExpressionAttributeValues: {
+          ':updatedAt': now,
+          ':recoveredAt': now,
+          ':provider': provider,
+        },
+      })
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
 }
 
 export async function touchJob(jobId: string): Promise<void> {

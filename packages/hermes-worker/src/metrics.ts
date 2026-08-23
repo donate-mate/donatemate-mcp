@@ -15,6 +15,8 @@
  *   HermesGateFailShipped — 1 when a PR opened WITH unresolved gate failures (fail-open)
  *   HermesAgentProviderFallback — jobs completed through the secondary coding provider
  *   HermesProviderUnavailable  — jobs preserved because neither coding provider was available
+ *   HermesProviderBillingBlocked — first observation of a durable model-provider billing incident
+ *   HermesProviderBillingRecovered — preserved job resumed after provider billing recovered
  *
  * Best-effort: metric publishing never throws into the job pipeline.
  */
@@ -32,7 +34,9 @@ export type HermesMetric =
   | 'HermesInstallSeconds'
   | 'HermesGateFailShipped'
   | 'HermesAgentProviderFallback'
-  | 'HermesProviderUnavailable';
+  | 'HermesProviderUnavailable'
+  | 'HermesProviderBillingBlocked'
+  | 'HermesProviderBillingRecovered';
 
 /**
  * Publish one metric datum. `repo` and `type` (fe/be) are attached as dimensions so the dashboard

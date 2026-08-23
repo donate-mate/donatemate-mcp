@@ -44,6 +44,8 @@ import { reviewLearningPromptBlock } from './reviewLearning.js';
 import { putMetric } from './metrics.js';
 import {
   getJob,
+  markProviderBillingBlocked,
+  markProviderBillingRecovered,
   updateJob,
   touchJob,
   storeTranscript,
@@ -59,10 +61,22 @@ import {
   TaskProtectionUnavailableError,
 } from './taskprotection.js';
 import { findIssueKey, fetchIssueContext } from './jira.js';
-import { commentOnIssue, transitionIssue, COLUMN, jiraIssueKey } from './jiraBot.js';
+import {
+  addIssueLabels,
+  commentOnIssue,
+  removeIssueLabels,
+  transitionIssue,
+  COLUMN,
+  jiraIssueKey,
+} from './jiraBot.js';
 import { processQaProofJob } from './qaRunner.js';
 import { processDeploymentVerificationJob } from './deployVerifier.js';
 import { stagingDatabasePromptBlock } from './stagingDatabase.js';
+import {
+  PROVIDER_BILLING_BLOCKED_LABEL,
+  providerBillingBlockedComment,
+  providerBillingRecoveredComment,
+} from './providerBilling.js';
 
 const sqs = new SQSClient({});
 const QUEUE = process.env.JOBS_QUEUE_URL!;
@@ -621,6 +635,28 @@ async function processJob(jobId: string): Promise<void> {
       reportInstruction;
 
     const agentRun = await runAgent(dir, agentPrompt);
+    if (job.providerBillingBlockedAt) {
+      const recovered = await bestEffortFailureReport(jobId, 'record model-provider billing recovery', () =>
+        markProviderBillingRecovered(jobId, agentRun.provider)
+      );
+      if (recovered && ticket) {
+        await bestEffortFailureReport(jobId, 'remove Jira provider-billing flag', () =>
+          removeIssueLabels(ticket, [PROVIDER_BILLING_BLOCKED_LABEL])
+        );
+        await bestEffortFailureReport(jobId, 'comment on Jira provider-billing recovery', () =>
+          commentOnIssue(ticket, providerBillingRecoveredComment({ jobId, provider: agentRun.provider }))
+        );
+      }
+      if (recovered) {
+        await putMetric('HermesProviderBillingRecovered', 1, { type: job.type }).catch(() => {});
+        await bestEffortFailureReport(jobId, 'notify provider-billing recovery', () =>
+          notify(
+            job,
+            `:arrow_forward: Hermes job \`${jobId}\` resumed automatically through ${agentRun.provider === 'openai' ? 'OpenAI' : 'Anthropic'} after the model-provider billing block cleared.`
+          )
+        );
+      }
+    }
     if (agentRun.provider === 'anthropic') {
       await putMetric('HermesAgentProviderFallback', 1, { type: job.type }).catch(() => {});
     }
@@ -812,18 +848,62 @@ async function processJob(jobId: string): Promise<void> {
     const msg = errorText(err);
     if (err instanceof AgentProvidersUnavailableError) {
       console.warn(`[${jobId}] coding providers unavailable; preserving job for retry: ${msg}`);
-      await bestEffortFailureReport(jobId, 'pause job for provider recovery', () =>
-        updateJob(jobId, 'queued', {
-          error: compactText(msg, 2000),
-          phase: `provider unavailable; retrying in ${err.retryAfterSeconds}s`,
-        })
-      );
-      await bestEffortFailureReport(jobId, 'notify provider pause', () =>
-        notify(
-          job,
-          `:pause_button: Hermes job \`${jobId}\` is preserved while coding providers recover; retrying automatically in ${err.retryAfterSeconds}s.`
-        )
-      );
+      const compactError = compactText(msg, 2000);
+      let firstBillingBlock: boolean | undefined;
+      if (err.category === 'billing') {
+        firstBillingBlock = await bestEffortFailureReport(jobId, 'record model-provider billing block', () =>
+          markProviderBillingBlocked(jobId, {
+            error: compactError,
+            retryAfterSeconds: err.retryAfterSeconds,
+            providers: err.billingProviders,
+          })
+        );
+        if (firstBillingBlock === undefined) {
+          await bestEffortFailureReport(jobId, 'fallback provider-billing job preservation', () =>
+            updateJob(jobId, 'queued', {
+              error: compactError,
+              phase: `model-provider billing blocked; retrying in ${err.retryAfterSeconds}s`,
+            })
+          );
+        }
+        if (ticket) {
+          await bestEffortFailureReport(jobId, 'add Jira provider-billing flag', () =>
+            addIssueLabels(ticket, [PROVIDER_BILLING_BLOCKED_LABEL])
+          );
+          if (firstBillingBlock) {
+            await bestEffortFailureReport(jobId, 'comment on Jira provider-billing block', () =>
+              commentOnIssue(
+                ticket,
+                providerBillingBlockedComment({
+                  jobId,
+                  providers: err.billingProviders,
+                  retryAfterSeconds: err.retryAfterSeconds,
+                })
+              )
+            );
+          }
+        }
+        if (firstBillingBlock) {
+          await putMetric('HermesProviderBillingBlocked', 1, { type: job.type }).catch(() => {});
+        }
+      } else {
+        await bestEffortFailureReport(jobId, 'pause job for provider recovery', () =>
+          updateJob(jobId, 'queued', {
+            error: compactError,
+            phase: `provider unavailable; retrying in ${err.retryAfterSeconds}s`,
+          })
+        );
+      }
+      if (err.category !== 'billing' || firstBillingBlock !== false) {
+        await bestEffortFailureReport(jobId, 'notify provider pause', () =>
+          notify(
+            job,
+            err.category === 'billing'
+              ? `:credit_card: Hermes job \`${jobId}\` is preserved during a model-provider billing block; retrying automatically in ${err.retryAfterSeconds}s.`
+              : `:pause_button: Hermes job \`${jobId}\` is preserved while coding providers recover; retrying automatically in ${err.retryAfterSeconds}s.`
+          )
+        );
+      }
       await putMetric('HermesProviderUnavailable', 1, { type: job.type }).catch(() => {});
       throw err;
     }
