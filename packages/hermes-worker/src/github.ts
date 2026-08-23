@@ -446,6 +446,63 @@ export async function openPullRequest(
 export const HERMES_OUTCOME_REPORT_START = '<!-- hermes-outcome-report:start -->';
 export const HERMES_OUTCOME_REPORT_END = '<!-- hermes-outcome-report:end -->';
 
+const PR_BODY_PROPAGATION_INITIAL_DELAY_MS = 2_000;
+const PR_BODY_PROPAGATION_POLL_DELAY_MS = 1_000;
+const PR_BODY_PROPAGATION_STABLE_DELAY_MS = 1_000;
+const PR_BODY_PROPAGATION_ATTEMPTS = 5;
+
+type PullRequestBodyPropagationOptions = {
+  attempts?: number;
+  initialDelayMs?: number;
+  pollDelayMs?: number;
+  stableDelayMs?: number;
+  sleep?: (delayMs: number) => Promise<void>;
+};
+
+const sleep = (delayMs: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, delayMs));
+
+/**
+ * GitHub can acknowledge a PR-body PATCH before a subsequent review-request webhook contains the
+ * new body. Wait until two reads, separated by a short settling interval, return the exact body so
+ * an automated reviewer cannot evaluate the stale merge record we just replaced.
+ */
+export async function waitForPullRequestBodyPropagation(
+  octokit: Octokit,
+  repo: string,
+  prNumber: number,
+  expectedBody: string,
+  options: PullRequestBodyPropagationOptions = {}
+): Promise<void> {
+  const { owner, name } = splitRepo(repo);
+  const attempts = options.attempts ?? PR_BODY_PROPAGATION_ATTEMPTS;
+  const wait = options.sleep ?? sleep;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await wait(
+      attempt === 0
+        ? (options.initialDelayMs ?? PR_BODY_PROPAGATION_INITIAL_DELAY_MS)
+        : (options.pollDelayMs ?? PR_BODY_PROPAGATION_POLL_DELAY_MS)
+    );
+    try {
+      const observed = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber });
+      if (String(observed.data.body ?? '') !== expectedBody) continue;
+
+      await wait(options.stableDelayMs ?? PR_BODY_PROPAGATION_STABLE_DELAY_MS);
+      const stable = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber });
+      if (String(stable.data.body ?? '') === expectedBody) return;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  const detail = lastError instanceof Error ? ` Last GitHub error: ${lastError.message}` : '';
+  throw new Error(
+    `GitHub did not expose the updated body for ${repo}#${prNumber} after ${attempts} checks.${detail}`
+  );
+}
+
 /**
  * Replace the outcome-report portion of a Hermes PR body while preserving its task provenance,
  * validation summary, and review notes. New markers make every later metadata-only repair
@@ -491,6 +548,7 @@ export async function updatePullRequestOutcomeReport(
   const current = await octokit.pulls.get({ owner, repo: name, pull_number: prNumber });
   const body = replacePullRequestOutcomeReport(String(current.data.body ?? ''), report);
   await octokit.pulls.update({ owner, repo: name, pull_number: prNumber, body });
+  await waitForPullRequestBodyPropagation(octokit, repo, prNumber, body);
 }
 
 /** Requeue human reviewers after a metadata-only fix, which does not produce a new commit event. */
