@@ -11,7 +11,7 @@
  *   cleanup   - Remove expired keys
  *
  * Usage:
- *   npx ts-node manage-api-keys.ts create --env staging --user admin --name "Claude Code" --days 90
+ *   npx ts-node manage-api-keys.ts create --env staging --user hermes --name "Hermes MCP key" --display-name "Hermes" --actor-type service --client-name "Hermes Worker" --days 90
  *   npx ts-node manage-api-keys.ts list --env staging
  *   npx ts-node manage-api-keys.ts rotate --env staging --prefix dm_TT9sL
  *   npx ts-node manage-api-keys.ts revoke --env staging --prefix dm_TT9sL
@@ -50,6 +50,11 @@ interface Options {
   env: 'staging' | 'production';
   userId?: string;
   name?: string;
+  displayName?: string;
+  actorType?: 'human' | 'service';
+  clientName?: string;
+  email?: string;
+  jiraAccountId?: string;
   days?: number;
   prefix?: string;
 }
@@ -73,6 +78,21 @@ function parseArgs(): Options {
       case '--name':
         options.name = args[++i];
         break;
+      case '--display-name':
+        options.displayName = args[++i];
+        break;
+      case '--actor-type':
+        options.actorType = args[++i] as 'human' | 'service';
+        break;
+      case '--client-name':
+        options.clientName = args[++i];
+        break;
+      case '--email':
+        options.email = args[++i];
+        break;
+      case '--jira-account-id':
+        options.jiraAccountId = args[++i];
+        break;
       case '--days':
         options.days = parseInt(args[++i], 10);
         break;
@@ -90,8 +110,13 @@ function getTableName(env: string): string {
 }
 
 async function createKey(options: Options): Promise<void> {
-  if (!options.userId || !options.name) {
-    console.error('Error: --user and --name are required for create command');
+  if (
+    !options.userId ||
+    !options.name ||
+    !options.displayName ||
+    (options.actorType !== 'human' && options.actorType !== 'service')
+  ) {
+    console.error('Error: --user, --name, --display-name, and --actor-type (human or service) are required for create command');
     process.exit(1);
   }
 
@@ -111,7 +136,11 @@ async function createKey(options: Options): Promise<void> {
         keyPrefix: { S: keyPrefix },
         userId: { S: options.userId },
         name: { S: options.name },
-        email: { S: `${options.userId}@donatemate.com` },
+        displayName: { S: options.displayName },
+        actorType: { S: options.actorType },
+        clientName: { S: options.clientName || options.name },
+        email: { S: options.email || `${options.userId}@donatemate.com` },
+        ...(options.jiraAccountId ? { jiraAccountId: { S: options.jiraAccountId } } : {}),
         createdAt: { S: now.toISOString() },
         expiresAt: { N: String(expiresAt) },
         revoked: { BOOL: false },
@@ -129,6 +158,8 @@ async function createKey(options: Options): Promise<void> {
   console.log(`Key ID: ${keyPrefix}...`);
   console.log(`User: ${options.userId}`);
   console.log(`Name: ${options.name}`);
+  console.log(`Actor: ${options.displayName} (${options.actorType})`);
+  console.log(`Client: ${options.clientName || options.name}`);
   console.log(`Expires: ${expiresDate.toISOString()}`);
   console.log('='.repeat(60));
 
@@ -151,7 +182,7 @@ async function listKeys(options: Options): Promise<void> {
   const result = await client.send(
     new ScanCommand({
       TableName: tableName,
-      ProjectionExpression: 'keyPrefix, userId, #n, createdAt, expiresAt, revoked, #s',
+      ProjectionExpression: 'keyPrefix, userId, #n, displayName, actorType, clientName, createdAt, expiresAt, revoked, #s',
       ExpressionAttributeNames: {
         '#n': 'name',
         '#s': 'status',
@@ -165,15 +196,17 @@ async function listKeys(options: Options): Promise<void> {
   }
 
   console.log('\nAPI Keys:\n');
-  console.log('Prefix      | User           | Name                 | Status    | Expires');
-  console.log('-'.repeat(85));
+  console.log('Prefix      | User           | Actor                | Type     | Client               | Status    | Expires');
+  console.log('-'.repeat(125));
 
   const now = Math.floor(Date.now() / 1000);
 
   for (const item of result.Items) {
     const prefix = item.keyPrefix?.S || '???';
     const user = (item.userId?.S || 'unknown').padEnd(14);
-    const name = (item.name?.S || 'unnamed').substring(0, 20).padEnd(20);
+    const actor = (item.displayName?.S || 'UNVERIFIED').substring(0, 20).padEnd(20);
+    const actorType = (item.actorType?.S || 'missing').substring(0, 8).padEnd(8);
+    const clientName = (item.clientName?.S || item.name?.S || 'unknown').substring(0, 20).padEnd(20);
     const expiresAt = parseInt(item.expiresAt?.N || '0', 10);
     const isRevoked = item.revoked?.BOOL || false;
     const status = item.status?.S || 'active';
@@ -191,7 +224,7 @@ async function listKeys(options: Options): Promise<void> {
 
     const expiresDate = new Date(expiresAt * 1000).toISOString().split('T')[0];
 
-    console.log(`${prefix}... | ${user} | ${name} | ${statusDisplay} | ${expiresDate}`);
+    console.log(`${prefix}... | ${user} | ${actor} | ${actorType} | ${clientName} | ${statusDisplay} | ${expiresDate}`);
   }
 
   console.log(`\nTotal: ${result.Items.length} keys`);
@@ -225,6 +258,16 @@ async function rotateKey(options: Options): Promise<void> {
   const oldKey = queryResult.Items[0];
   const userId = oldKey.userId?.S || 'unknown';
   const name = oldKey.name?.S || 'rotated';
+  const displayName = oldKey.displayName?.S || '';
+  const actorType = oldKey.actorType?.S;
+  const clientName = oldKey.clientName?.S || name;
+  const email = oldKey.email?.S || `${userId}@donatemate.com`;
+  const jiraAccountId = oldKey.jiraAccountId?.S;
+
+  if (!displayName || (actorType !== 'human' && actorType !== 'service')) {
+    console.error(`Error: Key ${options.prefix} has no verified actor identity. Add displayName and actorType before rotating it.`);
+    process.exit(1);
+  }
 
   // Mark old key as deprecated (still works for 7 days)
   const deprecationExpiry = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
@@ -261,7 +304,11 @@ async function rotateKey(options: Options): Promise<void> {
         keyPrefix: { S: newKeyPrefix },
         userId: { S: userId },
         name: { S: `${name} (rotated)` },
-        email: { S: `${userId}@donatemate.com` },
+        displayName: { S: displayName },
+        actorType: { S: actorType },
+        clientName: { S: clientName },
+        email: { S: email },
+        ...(jiraAccountId ? { jiraAccountId: { S: jiraAccountId } } : {}),
         createdAt: { S: now.toISOString() },
         expiresAt: { N: String(expiresAt) },
         revoked: { BOOL: false },
@@ -373,6 +420,11 @@ Commands:
   create    Create a new API key
             --user USER_ID    User ID (required)
             --name NAME       Key name (required)
+            --display-name NAME  Visible verified actor name (required)
+            --actor-type TYPE Human or service (required)
+            --client-name NAME  Executing MCP client (defaults to key name)
+            --email EMAIL       Canonical actor email
+            --jira-account-id ID  Optional Jira account mapping
             --days DAYS       Expiration days (default: 90)
 
   list      List all API keys
@@ -389,7 +441,7 @@ Global Options:
   --env staging|production    Environment (default: staging)
 
 Examples:
-  npx ts-node manage-api-keys.ts create --env staging --user admin --name "Claude Code" --days 90
+  npx ts-node manage-api-keys.ts create --env staging --user hermes --name "Hermes MCP key" --display-name "Hermes" --actor-type service --client-name "Hermes Worker" --days 90
   npx ts-node manage-api-keys.ts list --env staging
   npx ts-node manage-api-keys.ts rotate --env staging --prefix dm_TT9sL
   npx ts-node manage-api-keys.ts revoke --env staging --prefix dm_TT9sL

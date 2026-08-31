@@ -34,6 +34,16 @@ import type {
   APIGatewayProxyEventV2,
   APIGatewayProxyResultV2,
 } from 'aws-lambda';
+import {
+  buildAttributedJiraComment,
+  buildAttributedJiraIssuePayload,
+  createMcpPrincipal,
+  displayNameFromEmail,
+  hashJiraContent,
+  requireJiraActor,
+  type McpActorType,
+  type McpPrincipal,
+} from './jiraAttribution.js';
 
 const dynamoClient = new DynamoDBClient({});
 const ssmClient = new SSMClient({});
@@ -934,6 +944,20 @@ interface AuthResult {
   email: string;
   keyHash: string;
   authMethod: 'api-key' | 'oauth';
+  principal: McpPrincipal | null;
+}
+
+interface OAuthUserProfile {
+  email: string;
+  displayName: string;
+  expiresAt: number;
+}
+
+const oauthUserProfileCache = new Map<string, OAuthUserProfile>();
+const OAUTH_PROFILE_CACHE_TTL_MS = 15 * 60 * 1000;
+
+function apiKeyActorType(value: string | undefined): McpActorType | undefined {
+  return value === 'human' || value === 'service' ? value : undefined;
 }
 
 // OAuth rate limit: 2000 requests per hour (higher for authenticated users via browser)
@@ -997,11 +1021,27 @@ async function validateApiKey(apiKey: string): Promise<AuthResult | null> {
     return null;
   }
 
+  const userId = result.Item.userId?.S?.trim() || '';
+  const email = result.Item.email?.S?.trim() || '';
+  const keyName = result.Item.name?.S?.trim() || '';
+  const actorType = apiKeyActorType(result.Item.actorType?.S);
+  const displayName = result.Item.displayName?.S?.trim() || '';
+  const clientName = result.Item.clientName?.S?.trim() || keyName;
+  const jiraAccountId = result.Item.jiraAccountId?.S?.trim() || undefined;
+
   return {
-    userId: result.Item.userId?.S || 'unknown',
-    email: result.Item.email?.S || result.Item.name?.S || 'api-key-user',
+    userId: userId || 'unknown',
+    email: email || 'api-key-user',
     keyHash,
     authMethod: 'api-key',
+    principal: createMcpPrincipal({
+      principalId: userId,
+      displayName,
+      actorType,
+      clientName,
+      authMethod: 'api-key',
+      jiraAccountId,
+    }),
   };
 }
 
@@ -1095,6 +1135,7 @@ function rsaPublicKeyPem(n: string, e: string): string {
 interface JwtPayload {
   sub: string;
   email?: string;
+  name?: string;
   aud?: string | string[];
   client_id?: string; // Cognito access tokens use client_id instead of aud
   iss: string;
@@ -1102,6 +1143,71 @@ interface JwtPayload {
   iat: number;
   token_use?: string;
   'custom:mcp_access'?: string;
+  'custom:jira_account_id'?: string;
+}
+
+async function resolveOAuthUserProfile(
+  token: string,
+  payload: JwtPayload
+): Promise<OAuthUserProfile | null> {
+  const cached = oauthUserProfileCache.get(payload.sub);
+  if (cached && cached.expiresAt > Date.now()) return cached;
+
+  let email = payload.email?.trim() || '';
+  let displayName = payload.name?.trim() || '';
+
+  if (!email) {
+    const oauthDomain = process.env.OAUTH_DOMAIN;
+    const region = process.env.AWS_REGION || 'us-east-2';
+    if (!oauthDomain) {
+      console.warn('OAuth actor lookup unavailable: OAUTH_DOMAIN not configured', { sub: payload.sub });
+      return null;
+    }
+
+    try {
+      const response = await fetch(
+        `https://${oauthDomain}.auth.${region}.amazoncognito.com/oauth2/userInfo`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/json',
+          },
+        }
+      );
+      if (!response.ok) {
+        console.warn('OAuth actor lookup failed', { sub: payload.sub, status: response.status });
+        return null;
+      }
+
+      const userInfo = await response.json() as { sub?: string; email?: string; name?: string };
+      if (userInfo.sub !== payload.sub) {
+        console.warn('OAuth actor lookup returned the wrong subject', {
+          expected: payload.sub,
+          actual: userInfo.sub,
+        });
+        return null;
+      }
+      email = userInfo.email?.trim() || '';
+      displayName = userInfo.name?.trim() || '';
+    } catch (error) {
+      console.warn('OAuth actor lookup error', {
+        sub: payload.sub,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      return null;
+    }
+  }
+
+  displayName = displayName || displayNameFromEmail(email);
+  if (!email || !displayName) return null;
+
+  const profile = {
+    email,
+    displayName,
+    expiresAt: Date.now() + OAUTH_PROFILE_CACHE_TTL_MS,
+  };
+  oauthUserProfileCache.set(payload.sub, profile);
+  return profile;
 }
 
 async function validateOAuthToken(token: string): Promise<AuthResult | null> {
@@ -1193,13 +1299,26 @@ async function validateOAuthToken(token: string): Promise<AuthResult | null> {
       return null;
     }
 
-    console.info('OAuth token validated', { sub: payload.sub, email: payload.email });
+    const profile = await resolveOAuthUserProfile(token, payload);
+    console.info('OAuth token validated', {
+      sub: payload.sub,
+      email: profile?.email || 'unresolved',
+      actorResolved: Boolean(profile),
+    });
 
     return {
       userId: payload.sub,
-      email: payload.email || 'oauth-user',
+      email: profile?.email || 'oauth-user',
       keyHash: `oauth:${payload.sub}`, // Use sub as identifier for rate limiting
       authMethod: 'oauth',
+      principal: createMcpPrincipal({
+        principalId: payload.sub,
+        displayName: profile?.displayName,
+        actorType: 'human',
+        clientName: 'Claude MCP',
+        authMethod: 'oauth',
+        jiraAccountId: payload['custom:jira_account_id'],
+      }),
     };
   } catch (error) {
     console.error('OAuth token validation error', { error });
@@ -2206,7 +2325,7 @@ async function handleToolsList(): Promise<unknown> {
     },
     {
       name: 'dm_jira_create_issue',
-      description: 'Create a new Jira issue. Description may be plain text (auto-wrapped to ADF) or an ADF object.',
+      description: 'Create a new Jira issue. Description may be plain text (auto-wrapped to ADF) or an ADF object. The server always adds verified MCP initiator, executor, and audit attribution.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2241,7 +2360,7 @@ async function handleToolsList(): Promise<unknown> {
     },
     {
       name: 'dm_jira_add_comment',
-      description: 'Add a comment to an issue. Body may be plain text (auto-wrapped to ADF) or an ADF object.',
+      description: 'Add a comment to an issue. Body may be plain text (auto-wrapped to ADF) or an ADF object. The server always adds verified MCP initiator, executor, and audit attribution.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2669,6 +2788,11 @@ const designTokens: Record<string, unknown> = {
 
 interface FlatToken { path: string; value: unknown; type?: string; }
 
+interface McpExecutionContext {
+  principal: McpPrincipal | null;
+  requestId: string;
+}
+
 function flattenTokens(obj: Record<string, unknown>, prefix = ''): FlatToken[] {
   const result: FlatToken[] = [];
   for (const [key, value] of Object.entries(obj)) {
@@ -2683,7 +2807,10 @@ function flattenTokens(obj: Record<string, unknown>, prefix = ''): FlatToken[] {
   return result;
 }
 
-async function handleToolsCall(params: Record<string, unknown>): Promise<unknown> {
+async function handleToolsCall(
+  params: Record<string, unknown>,
+  executionContext: McpExecutionContext
+): Promise<unknown> {
   const { name, arguments: args } = params as { name: string; arguments?: Record<string, unknown> };
   const startTime = Date.now();
 
@@ -3021,23 +3148,48 @@ async function handleToolsCall(params: Record<string, unknown>): Promise<unknown
       const labels = args?.labels as string[] | undefined;
       const priority = args?.priority as string | undefined;
       const parentKey = args?.parentKey as string | undefined;
+      const actor = requireJiraActor(executionContext.principal, executionContext.requestId);
 
       const fields: Record<string, unknown> = {
         project: { key: projectKey },
         summary,
         issuetype: { name: issueType },
       };
-      if (description !== undefined) fields.description = toAdf(description);
       if (assigneeAccountId) fields.assignee = { accountId: assigneeAccountId };
       if (labels) fields.labels = labels;
       if (priority) fields.priority = { name: priority };
       if (parentKey) fields.parent = { key: parentKey };
+      if (actor.jiraAccountId) fields.reporter = { accountId: actor.jiraAccountId };
 
-      const created = await jiraRequest<any>('POST', '/issue', { fields });
+      const created = await jiraRequest<any>(
+        'POST',
+        '/issue',
+        buildAttributedJiraIssuePayload(
+          fields,
+          description === undefined ? undefined : toAdf(description),
+          actor
+        )
+      );
       const creds = await getJiraCredentials();
+      console.info('[audit] Jira issue created through MCP', {
+        auditId: actor.auditId,
+        issueId: created.id,
+        issueKey: created.key,
+        principalId: actor.principalId,
+        displayName: actor.displayName,
+        actorType: actor.actorType,
+        clientName: actor.clientName,
+        authMethod: actor.authMethod,
+        contentHash: hashJiraContent({ summary, description }),
+      });
       result = { content: [{ type: 'text', text: JSON.stringify({
         key: created.key,
         id: created.id,
+        attribution: {
+          initiator: actor.displayName,
+          executor: actor.clientName,
+          auditId: actor.auditId,
+        },
         url: `${creds.host}/browse/${created.key}`,
       }, null, 2) }] };
       break;
@@ -3067,14 +3219,34 @@ async function handleToolsCall(params: Record<string, unknown>): Promise<unknown
 
     case 'dm_jira_add_comment': {
       const issueKey = args?.issueKey as string;
-      const body = toAdf(args?.body);
-      const comment = await jiraRequest<any>('POST', `/issue/${encodeURIComponent(issueKey)}/comment`, { body });
+      const actor = requireJiraActor(executionContext.principal, executionContext.requestId);
+      const comment = await jiraRequest<any>(
+        'POST',
+        `/issue/${encodeURIComponent(issueKey)}/comment`,
+        buildAttributedJiraComment(toAdf(args?.body), actor)
+      );
       const creds = await getJiraCredentials();
+      console.info('[audit] Jira comment created through MCP', {
+        auditId: actor.auditId,
+        commentId: comment.id,
+        issueKey,
+        principalId: actor.principalId,
+        displayName: actor.displayName,
+        actorType: actor.actorType,
+        clientName: actor.clientName,
+        authMethod: actor.authMethod,
+        contentHash: hashJiraContent(args?.body),
+      });
       result = { content: [{ type: 'text', text: JSON.stringify({
         id: comment.id,
         issueKey,
         author: comment.author?.displayName,
         created: comment.created,
+        attribution: {
+          initiator: actor.displayName,
+          executor: actor.clientName,
+          auditId: actor.auditId,
+        },
         url: `${creds.host}/browse/${issueKey}?focusedCommentId=${comment.id}`,
       }, null, 2) }] };
       break;
@@ -3097,6 +3269,7 @@ async function handleToolsCall(params: Record<string, unknown>): Promise<unknown
       const issueKey = args?.issueKey as string;
       let transitionId = args?.transitionId as string | undefined;
       const transitionName = args?.transitionName as string | undefined;
+      let commentActor: ReturnType<typeof requireJiraActor> | undefined;
 
       if (!transitionId && transitionName) {
         const data = await jiraRequest<any>('GET', `/issue/${encodeURIComponent(issueKey)}/transitions`);
@@ -3111,14 +3284,39 @@ async function handleToolsCall(params: Record<string, unknown>): Promise<unknown
 
       const payload: Record<string, unknown> = { transition: { id: transitionId } };
       if (args?.comment !== undefined) {
-        payload.update = { comment: [{ add: { body: toAdf(args.comment) } }] };
+        commentActor = requireJiraActor(executionContext.principal, executionContext.requestId);
+        payload.update = {
+          comment: [{
+            add: buildAttributedJiraComment(toAdf(args.comment), commentActor),
+          }],
+        };
       }
 
       await jiraRequest<void>('POST', `/issue/${encodeURIComponent(issueKey)}/transitions`, payload);
       const creds = await getJiraCredentials();
+      if (commentActor) {
+        console.info('[audit] Jira transition comment created through MCP', {
+          auditId: commentActor.auditId,
+          issueKey,
+          transitionId,
+          principalId: commentActor.principalId,
+          displayName: commentActor.displayName,
+          actorType: commentActor.actorType,
+          clientName: commentActor.clientName,
+          authMethod: commentActor.authMethod,
+          contentHash: hashJiraContent(args?.comment),
+        });
+      }
       result = { content: [{ type: 'text', text: JSON.stringify({
         key: issueKey,
         transitionId,
+        ...(commentActor ? {
+          commentAttribution: {
+            initiator: commentActor.displayName,
+            executor: commentActor.clientName,
+            auditId: commentActor.auditId,
+          },
+        } : {}),
         url: `${creds.host}/browse/${issueKey}`,
       }, null, 2) }] };
       break;
@@ -3799,13 +3997,16 @@ async function handleToolsCall(params: Record<string, unknown>): Promise<unknown
   }
 }
 
-async function processMessage(request: McpRequest): Promise<McpResponse> {
+async function processMessage(
+  request: McpRequest,
+  executionContext: McpExecutionContext
+): Promise<McpResponse> {
   try {
     let result: unknown;
     switch (request.method) {
       case 'initialize': result = await handleInitialize(); break;
       case 'tools/list': result = await handleToolsList(); break;
-      case 'tools/call': result = await handleToolsCall(request.params || {}); break;
+      case 'tools/call': result = await handleToolsCall(request.params || {}, executionContext); break;
       case 'ping': result = {}; break;
       default:
         return { jsonrpc: '2.0', id: request.id, error: { code: -32601, message: `Method not found: ${request.method}` } };
@@ -4093,7 +4294,10 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
           };
         }
 
-        const response = await processMessage(body as McpRequest);
+        const response = await processMessage(body as McpRequest, {
+          principal: authResult.principal,
+          requestId: event.requestContext.requestId,
+        });
 
         // Response headers - include session ID for initialize responses
         const responseHeaders: Record<string, string> = { ...baseHeaders, 'Content-Type': 'application/json' };
