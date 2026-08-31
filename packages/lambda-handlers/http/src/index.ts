@@ -45,6 +45,7 @@ import {
   type McpActorType,
   type McpPrincipal,
 } from './jiraAttribution.js';
+import { buildJiraIssueLinkRequest } from './jiraIssueLinks.js';
 
 const dynamoClient = new DynamoDBClient({});
 const ssmClient = new SSMClient({});
@@ -2372,6 +2373,25 @@ async function handleToolsList(): Promise<unknown> {
       },
     },
     {
+      name: 'dm_jira_link_issues',
+      description: 'Create a directional Jira relationship. The source issue is the outward side and the target issue is the inward side; for example, source DM-4349 with linkType "Blocks" and target DM-2398 means "DM-4349 blocks DM-2398". Safe to retry because Jira does not create duplicate links. Optional comments receive verified MCP attribution.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sourceIssueKey: { type: 'string', description: 'Preferred: issue on the outward/from side of the relationship, e.g. "DM-4349"' },
+          targetIssueKey: { type: 'string', description: 'Preferred: issue on the inward/to side of the relationship, e.g. "DM-2398"' },
+          outwardIssueKey: { type: 'string', description: 'Legacy alias for sourceIssueKey' },
+          inwardIssueKey: { type: 'string', description: 'Legacy alias for targetIssueKey' },
+          linkType: { type: 'string', description: 'Jira issue-link type name, e.g. "Blocks", "Duplicate", or "Relates". Default: "Blocks"' },
+          comment: { description: 'Optional comment added to the source issue after linking. May be plain text or ADF and always receives verified MCP attribution.' },
+        },
+        anyOf: [
+          { required: ['sourceIssueKey', 'targetIssueKey'] },
+          { required: ['outwardIssueKey', 'inwardIssueKey'] },
+        ],
+      },
+    },
+    {
       name: 'dm_jira_list_transitions',
       description: 'List the workflow transitions currently available on an issue. Use this to find the transitionId before calling dm_jira_transition_issue.',
       inputSchema: {
@@ -3249,6 +3269,56 @@ async function handleToolsCall(
           auditId: actor.auditId,
         },
         url: `${creds.host}/browse/${issueKey}?focusedCommentId=${comment.id}`,
+      }, null, 2) }] };
+      break;
+    }
+
+    case 'dm_jira_link_issues': {
+      const actor = requireJiraActor(executionContext.principal, executionContext.requestId);
+      const { sourceIssueKey, targetIssueKey, linkType, payload } =
+        buildJiraIssueLinkRequest(args || {});
+
+      await jiraRequest<void>('POST', '/issueLink', payload);
+
+      let createdComment: { id?: string } | undefined;
+      if (args?.comment !== undefined) {
+        createdComment = await jiraRequest<{ id?: string }>(
+          'POST',
+          `/issue/${encodeURIComponent(sourceIssueKey)}/comment`,
+          buildAttributedJiraComment(toAdf(args.comment), actor)
+        );
+        if (!createdComment.id) {
+          throw new Error('Jira issues were linked, but Jira did not confirm creation of the requested comment');
+        }
+      }
+
+      const creds = await getJiraCredentials();
+      console.info('[audit] Jira issues linked through MCP', {
+        auditId: actor.auditId,
+        sourceIssueKey,
+        targetIssueKey,
+        linkType,
+        commentId: createdComment?.id,
+        principalId: actor.principalId,
+        displayName: actor.displayName,
+        actorType: actor.actorType,
+        clientName: actor.clientName,
+        authMethod: actor.authMethod,
+        contentHash: hashJiraContent({ sourceIssueKey, targetIssueKey, linkType, comment: args?.comment }),
+      });
+      result = { content: [{ type: 'text', text: JSON.stringify({
+        sourceIssueKey,
+        targetIssueKey,
+        linkType,
+        relationship: `${sourceIssueKey} ${linkType} ${targetIssueKey}`,
+        ...(createdComment?.id ? { commentId: createdComment.id } : {}),
+        attribution: {
+          initiator: actor.displayName,
+          executor: actor.clientName,
+          auditId: actor.auditId,
+        },
+        sourceUrl: `${creds.host}/browse/${sourceIssueKey}`,
+        targetUrl: `${creds.host}/browse/${targetIssueKey}`,
       }, null, 2) }] };
       break;
     }
