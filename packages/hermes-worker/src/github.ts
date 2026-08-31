@@ -756,6 +756,18 @@ export interface WorkflowRunSummary {
   createdAt?: string | null;
 }
 
+function summarizeWorkflowRun(run: any): WorkflowRunSummary {
+  return {
+    id: run.id,
+    name: run.name,
+    status: run.status,
+    conclusion: run.conclusion,
+    htmlUrl: run.html_url,
+    headSha: run.head_sha,
+    createdAt: run.created_at,
+  };
+}
+
 export async function fetchWorkflowRunLogs(token: string, repo: string, runId: number): Promise<string> {
   const { owner, name } = splitRepo(repo);
   const headers = { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' };
@@ -811,15 +823,47 @@ export async function latestWorkflowRunForCommit(
   const runs = (res.data.workflow_runs ?? []) as any[];
   const match = runs.find((run) => run.head_sha === headSha);
   if (!match) return null;
-  return {
-    id: match.id,
-    name: match.name,
-    status: match.status,
-    conclusion: match.conclusion,
-    htmlUrl: match.html_url,
-    headSha: match.head_sha,
-    createdAt: match.created_at,
-  };
+  return summarizeWorkflowRun(match);
+}
+
+export async function latestSupersedingWorkflowRunForCommit(
+  octokit: Octokit,
+  repo: string,
+  workflowId: string,
+  headSha: string,
+  branch: string,
+  createdAfter?: string | null
+): Promise<WorkflowRunSummary | null> {
+  const { owner, name } = splitRepo(repo);
+  const res = await octokit.request('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs', {
+    owner,
+    repo: name,
+    workflow_id: workflowId,
+    branch,
+    per_page: 25,
+  });
+  const createdAfterTime = createdAfter ? Date.parse(createdAfter) : 0;
+  const candidates = ((res.data.workflow_runs ?? []) as any[]).filter((run) => {
+    if (!run.head_sha || run.head_sha === headSha) return false;
+    if (!createdAfterTime) return true;
+    return Date.parse(run.created_at ?? '') >= createdAfterTime;
+  });
+
+  for (const candidate of candidates) {
+    try {
+      const comparison = await octokit.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
+        owner,
+        repo: name,
+        basehead: `${headSha}...${candidate.head_sha}`,
+      });
+      if (comparison.data.status === 'ahead' || comparison.data.status === 'identical') {
+        return summarizeWorkflowRun(candidate);
+      }
+    } catch (err: any) {
+      if (err?.status !== 404 && err?.status !== 422) throw err;
+    }
+  }
+  return null;
 }
 
 function workflowCheckHints(workflowId: string): string[] {
@@ -887,9 +931,13 @@ export async function waitForWorkflowRunConclusion(input: {
   branch?: string;
   timeoutSeconds: number;
   pollSeconds: number;
+  followSupersedingRuns?: boolean;
+  supersedingRunGraceSeconds?: number;
 }): Promise<WorkflowRunSummary> {
   const started = Date.now();
   let last: WorkflowRunSummary | null = null;
+  let lastCancelledRunId: number | null = null;
+  let cancelledObservedAt = 0;
   while (Date.now() - started < input.timeoutSeconds * 1000) {
     try {
       last = await latestWorkflowRunForCommit(input.octokit, input.repo, input.workflowId, input.headSha, input.branch);
@@ -899,7 +947,40 @@ export async function waitForWorkflowRunConclusion(input: {
     if (!last) {
       last = await latestCheckRunForCommit(input.octokit, input.repo, input.workflowId, input.headSha);
     }
-    if (last?.status === 'completed') return last;
+    if (last?.status === 'completed') {
+      if (last.conclusion !== 'cancelled' || !input.followSupersedingRuns || !input.branch) {
+        return last;
+      }
+
+      const exactCancelledRun = last;
+      const supersedingRun = await latestSupersedingWorkflowRunForCommit(
+        input.octokit,
+        input.repo,
+        input.workflowId,
+        input.headSha,
+        input.branch,
+        exactCancelledRun.createdAt
+      );
+      last = supersedingRun ?? exactCancelledRun;
+
+      if (last.status === 'completed' && last.conclusion !== 'cancelled') {
+        return last;
+      }
+
+      if (last.status === 'completed' && last.conclusion === 'cancelled') {
+        if (lastCancelledRunId !== last.id) {
+          lastCancelledRunId = last.id;
+          cancelledObservedAt = Date.now();
+        }
+        const graceSeconds = input.supersedingRunGraceSeconds ?? 300;
+        if (Date.now() - cancelledObservedAt >= graceSeconds * 1000) {
+          return last;
+        }
+      } else {
+        lastCancelledRunId = null;
+        cancelledObservedAt = 0;
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, input.pollSeconds * 1000));
   }
   throw new Error(
