@@ -161,6 +161,22 @@ export function buildAttributedJiraComment(
   };
 }
 
+export function buildAttributedJiraTransitionCommentPlan(
+  transitionId: string,
+  body: unknown,
+  actor: JiraActorContext
+): {
+  transitionPayload: Record<string, unknown>;
+  commentPayload: Record<string, unknown>;
+} {
+  return {
+    // Keep the transition and comment as separate Jira requests. Some Jira
+    // workflows acknowledge an embedded comment but silently omit it.
+    transitionPayload: { transition: { id: transitionId } },
+    commentPayload: buildAttributedJiraComment(body, actor),
+  };
+}
+
 function normalizeAdfDocument(input: unknown): AdfDocument {
   if (input === undefined || input === null) {
     return { type: 'doc', version: 1, content: [] };

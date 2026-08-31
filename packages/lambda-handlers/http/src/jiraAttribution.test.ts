@@ -4,6 +4,7 @@ import {
   appendJiraAttribution,
   buildAttributedJiraComment,
   buildAttributedJiraIssuePayload,
+  buildAttributedJiraTransitionCommentPlan,
   buildJiraAttribution,
   createMcpPrincipal,
   displayNameFromEmail,
@@ -84,6 +85,19 @@ describe('Jira MCP attribution', () => {
     });
     expect(JSON.stringify(issuePayload)).toContain('Created through DonateMate MCP');
     expect(JSON.stringify(commentPayload)).toContain('Submitted through DonateMate MCP');
+  });
+
+  it('keeps transition comments in a separately verifiable Jira request', () => {
+    const actor = requireJiraActor(principal, 'request-transition', '2026-08-31T12:00:00.000Z');
+    const body = { type: 'doc', version: 1, content: [] };
+    const plan = buildAttributedJiraTransitionCommentPlan('21', body, actor);
+
+    expect(plan.transitionPayload).toEqual({ transition: { id: '21' } });
+    expect(plan.transitionPayload).not.toHaveProperty('update.comment');
+    expect(plan.commentPayload).toMatchObject({
+      properties: [{ key: JIRA_ATTRIBUTION_PROPERTY_KEY }],
+    });
+    expect(JSON.stringify(plan.commentPayload)).toContain('Submitted through DonateMate MCP');
   });
 
   it('fails closed when authentication did not resolve a verified actor', () => {

@@ -37,6 +37,7 @@ import type {
 import {
   buildAttributedJiraComment,
   buildAttributedJiraIssuePayload,
+  buildAttributedJiraTransitionCommentPlan,
   createMcpPrincipal,
   displayNameFromEmail,
   hashJiraContent,
@@ -3270,6 +3271,8 @@ async function handleToolsCall(
       let transitionId = args?.transitionId as string | undefined;
       const transitionName = args?.transitionName as string | undefined;
       let commentActor: ReturnType<typeof requireJiraActor> | undefined;
+      let attributedComment: Record<string, unknown> | undefined;
+      let createdComment: { id?: string } | undefined;
 
       if (!transitionId && transitionName) {
         const data = await jiraRequest<any>('GET', `/issue/${encodeURIComponent(issueKey)}/transitions`);
@@ -3282,21 +3285,37 @@ async function handleToolsCall(
       }
       if (!transitionId) throw new Error('transitionId or transitionName is required');
 
-      const payload: Record<string, unknown> = { transition: { id: transitionId } };
+      let payload: Record<string, unknown> = { transition: { id: transitionId } };
       if (args?.comment !== undefined) {
         commentActor = requireJiraActor(executionContext.principal, executionContext.requestId);
-        payload.update = {
-          comment: [{
-            add: buildAttributedJiraComment(toAdf(args.comment), commentActor),
-          }],
-        };
+        const plan = buildAttributedJiraTransitionCommentPlan(
+          transitionId,
+          toAdf(args.comment),
+          commentActor
+        );
+        payload = plan.transitionPayload;
+        attributedComment = plan.commentPayload;
       }
 
       await jiraRequest<void>('POST', `/issue/${encodeURIComponent(issueKey)}/transitions`, payload);
+      // Jira can acknowledge transition-embedded comments without persisting them on
+      // some workflows. Use the dedicated comment endpoint after a successful
+      // transition so we can verify creation from the returned comment ID.
+      if (commentActor && attributedComment) {
+        createdComment = await jiraRequest<{ id?: string }>(
+          'POST',
+          `/issue/${encodeURIComponent(issueKey)}/comment`,
+          attributedComment
+        );
+        if (!createdComment.id) {
+          throw new Error('Jira transition succeeded, but Jira did not confirm creation of the requested comment');
+        }
+      }
       const creds = await getJiraCredentials();
-      if (commentActor) {
+      if (commentActor && createdComment) {
         console.info('[audit] Jira transition comment created through MCP', {
           auditId: commentActor.auditId,
+          commentId: createdComment.id,
           issueKey,
           transitionId,
           principalId: commentActor.principalId,
@@ -3310,7 +3329,8 @@ async function handleToolsCall(
       result = { content: [{ type: 'text', text: JSON.stringify({
         key: issueKey,
         transitionId,
-        ...(commentActor ? {
+        ...(commentActor && createdComment ? {
+          commentId: createdComment.id,
           commentAttribution: {
             initiator: commentActor.displayName,
             executor: commentActor.clientName,
