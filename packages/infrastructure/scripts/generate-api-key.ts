@@ -13,10 +13,15 @@
  *   --env staging|production  Environment (default: staging)
  *   --user USER_ID            User ID to associate with the key
  *   --name NAME               Name/description for the key
+ *   --display-name NAME       Visible verified actor name
+ *   --actor-type TYPE         human or service
+ *   --client-name NAME        Executing MCP client (defaults to --name)
+ *   --email EMAIL             Canonical actor email
+ *   --jira-account-id ID      Optional Jira account mapping
  *   --days DAYS               Days until expiration (default: 90)
  *
  * Example:
- *   npx ts-node generate-api-key.ts --env staging --user admin --name "Claude Code" --days 90
+ *   npx ts-node generate-api-key.ts --env staging --user hermes --name "Hermes MCP key" --display-name "Hermes" --actor-type service --client-name "Hermes Worker" --days 90
  */
 
 import { DynamoDBClient, PutItemCommand } from '@aws-sdk/client-dynamodb';
@@ -32,6 +37,11 @@ interface Options {
   env: 'staging' | 'production';
   userId: string;
   name: string;
+  displayName: string;
+  actorType: 'human' | 'service' | '';
+  clientName: string;
+  email: string;
+  jiraAccountId: string;
   days: number;
 }
 
@@ -39,8 +49,13 @@ function parseArgs(): Options {
   const args = process.argv.slice(2);
   const options: Options = {
     env: 'staging',
-    userId: 'admin',
-    name: 'API Key',
+    userId: '',
+    name: '',
+    displayName: '',
+    actorType: '',
+    clientName: '',
+    email: '',
+    jiraAccountId: '',
     days: 90,
   };
 
@@ -54,6 +69,21 @@ function parseArgs(): Options {
         break;
       case '--name':
         options.name = args[++i];
+        break;
+      case '--display-name':
+        options.displayName = args[++i];
+        break;
+      case '--actor-type':
+        options.actorType = args[++i] as 'human' | 'service';
+        break;
+      case '--client-name':
+        options.clientName = args[++i];
+        break;
+      case '--email':
+        options.email = args[++i];
+        break;
+      case '--jira-account-id':
+        options.jiraAccountId = args[++i];
         break;
       case '--days':
         options.days = parseInt(args[++i], 10);
@@ -77,6 +107,14 @@ function generateApiKey(): string {
 
 async function main() {
   const options = parseArgs();
+  if (
+    !options.userId ||
+    !options.name ||
+    !options.displayName ||
+    (options.actorType !== 'human' && options.actorType !== 'service')
+  ) {
+    throw new Error('--user, --name, --display-name, and --actor-type (human or service) are required');
+  }
   const tableName = `donatemate-${options.env}-mcp-api-keys-v2`;
 
   console.log('Generating API key...');
@@ -84,6 +122,8 @@ async function main() {
   console.log(`  Table: ${tableName}`);
   console.log(`  User ID: ${options.userId}`);
   console.log(`  Name: ${options.name}`);
+  console.log(`  Actor: ${options.displayName} (${options.actorType})`);
+  console.log(`  Client: ${options.clientName || options.name}`);
   console.log(`  Valid for: ${options.days} days`);
 
   const apiKey = generateApiKey();
@@ -103,7 +143,11 @@ async function main() {
         keyPrefix: { S: keyPrefix },   // First 8 chars for identification
         userId: { S: options.userId },
         name: { S: options.name },
-        email: { S: `${options.userId}@donatemate.com` },
+        displayName: { S: options.displayName },
+        actorType: { S: options.actorType },
+        clientName: { S: options.clientName || options.name },
+        email: { S: options.email || `${options.userId}@donatemate.com` },
+        ...(options.jiraAccountId ? { jiraAccountId: { S: options.jiraAccountId } } : {}),
         createdAt: { S: now.toISOString() },
         expiresAt: { N: String(expiresAt) },
         revoked: { BOOL: false },

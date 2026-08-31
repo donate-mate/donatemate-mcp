@@ -27,6 +27,19 @@ import type {
 
 const dynamoClient = new DynamoDBClient({});
 const API_KEY_PREFIX = 'dm_';
+type ActorType = 'human' | 'service';
+
+interface CreateKeyBody {
+  userId: string;
+  name: string;
+  displayName: string;
+  actorType: ActorType;
+  clientName?: string;
+  email?: string;
+  jiraAccountId?: string;
+  days?: number;
+  rateLimit?: number;
+}
 
 // Root admin user IDs that can manage API keys
 const ROOT_ADMIN_EMAILS = [
@@ -116,7 +129,7 @@ async function listKeys(): Promise<APIGatewayProxyResultV2> {
   const result = await dynamoClient.send(
     new ScanCommand({
       TableName: tableName,
-      ProjectionExpression: 'keyPrefix, userId, #n, createdAt, expiresAt, revoked, #s, rateLimit',
+      ProjectionExpression: 'keyPrefix, userId, #n, displayName, actorType, clientName, email, jiraAccountId, createdAt, expiresAt, revoked, #s, rateLimit',
       ExpressionAttributeNames: {
         '#n': 'name',
         '#s': 'status',
@@ -145,6 +158,11 @@ async function listKeys(): Promise<APIGatewayProxyResultV2> {
       keyPrefix: item.keyPrefix?.S || '',
       userId: item.userId?.S || '',
       name: item.name?.S || '',
+      displayName: item.displayName?.S || '',
+      actorType: item.actorType?.S || '',
+      clientName: item.clientName?.S || '',
+      email: item.email?.S || '',
+      jiraAccountId: item.jiraAccountId?.S || '',
       createdAt: item.createdAt?.S || '',
       expiresAt: new Date(expiresAt * 1000).toISOString(),
       status: computedStatus,
@@ -155,14 +173,16 @@ async function listKeys(): Promise<APIGatewayProxyResultV2> {
   return response(200, { keys });
 }
 
-async function createKey(body: { userId: string; name: string; days?: number; rateLimit?: number }): Promise<APIGatewayProxyResultV2> {
+async function createKey(body: CreateKeyBody): Promise<APIGatewayProxyResultV2> {
   const tableName = process.env.API_KEYS_TABLE_NAME;
   if (!tableName) {
     return response(500, { error: 'API_KEYS_TABLE_NAME not configured' });
   }
 
-  if (!body.userId || !body.name) {
-    return response(400, { error: 'userId and name are required' });
+  if (!body.userId || !body.name || !body.displayName || !['human', 'service'].includes(body.actorType)) {
+    return response(400, {
+      error: 'userId, name, displayName, and actorType (human or service) are required',
+    });
   }
 
   const apiKey = generateApiKey();
@@ -180,7 +200,11 @@ async function createKey(body: { userId: string; name: string; days?: number; ra
         keyPrefix: { S: keyPrefix },
         userId: { S: body.userId },
         name: { S: body.name },
-        email: { S: `${body.userId}@donatemate.com` },
+        displayName: { S: body.displayName },
+        actorType: { S: body.actorType },
+        clientName: { S: body.clientName || body.name },
+        email: { S: body.email || `${body.userId}@donatemate.com` },
+        ...(body.jiraAccountId ? { jiraAccountId: { S: body.jiraAccountId } } : {}),
         createdAt: { S: now.toISOString() },
         expiresAt: { N: String(expiresAt) },
         revoked: { BOOL: false },
@@ -195,6 +219,9 @@ async function createKey(body: { userId: string; name: string; days?: number; ra
     keyPrefix,
     userId: body.userId,
     name: body.name,
+    displayName: body.displayName,
+    actorType: body.actorType,
+    clientName: body.clientName || body.name,
     expiresAt: new Date(expiresAt * 1000).toISOString(),
   });
 }
@@ -224,7 +251,18 @@ async function rotateKey(keyPrefix: string, days?: number): Promise<APIGatewayPr
   const oldKey = queryResult.Items[0];
   const userId = oldKey.userId?.S || 'unknown';
   const name = oldKey.name?.S || 'rotated';
+  const displayName = oldKey.displayName?.S || '';
+  const actorType = oldKey.actorType?.S || '';
+  const clientName = oldKey.clientName?.S || name;
+  const email = oldKey.email?.S || `${userId}@donatemate.com`;
+  const jiraAccountId = oldKey.jiraAccountId?.S;
   const rateLimit = parseInt(oldKey.rateLimit?.N || '1000', 10);
+
+  if (!displayName || !['human', 'service'].includes(actorType)) {
+    return response(409, {
+      error: `Key ${keyPrefix} has no verified actor identity. Add displayName and actorType before rotating it.`,
+    });
+  }
 
   // Mark old key as deprecated (still works for 7 days)
   const deprecationExpiry = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
@@ -258,7 +296,11 @@ async function rotateKey(keyPrefix: string, days?: number): Promise<APIGatewayPr
         keyPrefix: { S: newKeyPrefix },
         userId: { S: userId },
         name: { S: `${name} (rotated)` },
-        email: { S: `${userId}@donatemate.com` },
+        displayName: { S: displayName },
+        actorType: { S: actorType },
+        clientName: { S: clientName },
+        email: { S: email },
+        ...(jiraAccountId ? { jiraAccountId: { S: jiraAccountId } } : {}),
         createdAt: { S: now.toISOString() },
         expiresAt: { N: String(expiresAt) },
         revoked: { BOOL: false },

@@ -58,7 +58,7 @@ export class McpStack extends cdk.Stack {
   public readonly httpApi: HttpApi;
   public readonly connectionsTable: dynamodb.Table;
   public readonly apiKeysTable: dynamodb.Table;
-  public readonly figmaResponseBucket: s3.Bucket;
+  public readonly figmaResponseBucket: s3.IBucket;
   public readonly oauthUserPool: cognito.UserPool;
 
   constructor(scope: Construct, id: string, props: McpStackProps) {
@@ -106,16 +106,22 @@ export class McpStack extends cdk.Stack {
 
     // Oversized Figma plugin responses cannot fit in an API Gateway WebSocket
     // frame. The relay writes them here and the HTTP handler retrieves them.
-    this.figmaResponseBucket = new s3.Bucket(this, 'FigmaResponseBucket', {
-      encryption: s3.BucketEncryption.S3_MANAGED,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      enforceSSL: true,
-      lifecycleRules: [{ expiration: cdk.Duration.days(1) }],
-      removalPolicy: environment === 'production'
-        ? cdk.RemovalPolicy.RETAIN
-        : cdk.RemovalPolicy.DESTROY,
-      autoDeleteObjects: environment !== 'production',
-    });
+    // The staging Figma relay already writes to this fixed-name bucket. Import
+    // it so MCP deployments cannot silently point the HTTP handler at a second
+    // bucket and break plugin-routed Figma responses.
+    this.figmaResponseBucket = environment === 'staging'
+      ? s3.Bucket.fromBucketName(
+          this,
+          'FigmaResponseBucket',
+          'donatemate-staging-figma-responses'
+        )
+      : new s3.Bucket(this, 'FigmaResponseBucket', {
+          encryption: s3.BucketEncryption.S3_MANAGED,
+          blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+          enforceSSL: true,
+          lifecycleRules: [{ expiration: cdk.Duration.days(1) }],
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
+        });
 
     // ========================================================================
     // DynamoDB Table for API Keys (long-lived auth tokens)
