@@ -38,7 +38,12 @@ import {
   ConcurrentBranchUpdateError,
   type MergeConflictPreparation,
 } from './github.js';
-import { AgentProvidersUnavailableError, ContainerRestartRequiredError, runAgent } from './agent.js';
+import {
+  AgentProvidersUnavailableError,
+  ContainerRestartRequiredError,
+  getAgentRuntimeConfiguration,
+  runAgent,
+} from './agent.js';
 import { installWorkspace } from './workspace.js';
 import { runGate, gateSummary, type GateResult } from './gate.js';
 import {
@@ -1112,7 +1117,11 @@ async function processJob(jobId: string): Promise<void> {
 }
 
 async function loop(): Promise<void> {
-  console.log(`hermes-worker (${WORKER_TYPE}) polling ${QUEUE}`);
+  const agentConfig = getAgentRuntimeConfiguration();
+  console.log(
+    `hermes-worker (${WORKER_TYPE}) polling ${QUEUE} ` +
+      `(agent_model=${agentConfig.model}, agent_reasoning_effort=${agentConfig.reasoningEffort})`
+  );
   for (;;) {
     const res = await sqs.send(
       new ReceiveMessageCommand({
