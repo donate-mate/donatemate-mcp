@@ -294,7 +294,7 @@ routed to the independently funded **Claude Code CLI**. Key facts as-coded:
 
 - **Auth**: `codex exec` reads `~/.codex/auth.json`, *not* `OPENAI_API_KEY`. The harness first runs
   `codex login --with-api-key`, piping the OpenAI key (from `SECRET_OPENAI`) via stdin.
-- **Model**: pinned via `AGENT_MODEL` (default `gpt-5.5`) passed as `--model`.
+- **Model**: pinned via `AGENT_MODEL` (default `gpt-5.6-sol`) passed as `--model`.
 - **Failover**: Claude Code uses `FALLBACK_AGENT_MODEL` (default `claude-sonnet-5`) and
   `SECRET_ANTHROPIC`. If both providers are unavailable, the SQS message is replaced by a delayed
   retry instead of consuming its DLQ receive budget or marking the job failed.
@@ -422,7 +422,8 @@ EventBridge, ECS, X-Ray, and specific Synthetics S3 buckets) for backend defect 
 | `WORKER_TYPE` | `fe` |
 | `JOBS_TABLE`, `JOBS_QUEUE_URL`, `ARTIFACTS_BUCKET` | data-plane handles |
 | `SECRET_GITHUB_APP`, `SECRET_OPENAI`, `SECRET_ANTHROPIC`, `SECRET_JIRA`, `SECRET_JIRA_BOT`, `SECRET_SLACK`, `SECRET_DM_MCP` | secret names |
-| `AGENT_MODEL` | `gpt-5.5` (coding model) |
+| `AGENT_MODEL` | `gpt-5.6-sol` (Sol coding model) |
+| `AGENT_REASONING_EFFORT` | `medium` |
 | `FALLBACK_AGENT_MODEL` | `claude-sonnet-5` |
 | `OPENAI_CIRCUIT_BREAKER_SECONDS` | `900` |
 | `MCP_ENDPOINT` | `https://mcp.donate-mate.com/mcp` |
@@ -470,7 +471,7 @@ sequenceDiagram
     participant DDB as DynamoDB
     participant SQS as SQS
     participant W as Worker
-    participant Codex as Codex CLI (gpt-5.5)
+    participant Codex as Codex CLI (gpt-5.6-sol, medium)
     participant GH as GitHub
 
     Dev->>Jira: Assign ticket to Hermes
@@ -551,7 +552,8 @@ The MCP server also exposes Hermes tools (`dm_hermes_create_pr`, `dm_hermes_job_
 the control plane's `/dispatch` and `/jobs/:id` endpoints.
 
 **Coding providers** — OpenAI remains primary for the **Codex CLI** worker
-(`AGENT_MODEL=gpt-5.5`) and planning/chat (`CONVERSE_MODEL=gpt-5.6-terra`). Anthropic is a separate
+(`AGENT_MODEL=gpt-5.6-sol`, `AGENT_REASONING_EFFORT=medium`) and planning/chat
+(`CONVERSE_MODEL=gpt-5.6-terra`). Anthropic is a separate
 funded failure domain for Claude Code (`FALLBACK_AGENT_MODEL=claude-sonnet-5`) and planning/chat
 (`FALLBACK_CONVERSE_MODEL=claude-sonnet-5`). Provider-capacity failures open a 15-minute local
 circuit so subsequent calls fail over immediately.

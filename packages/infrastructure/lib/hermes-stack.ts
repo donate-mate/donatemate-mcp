@@ -400,7 +400,7 @@ export class HermesStack extends cdk.Stack {
         SECRET_GITHUB_APP: secGithub.secretName,
         SECRET_OPENAI: secOpenai.secretName, // coding engine (Codex CLI) auth
         SECRET_ANTHROPIC: secAnthropic.secretName, // Claude Code failover auth
-        AGENT_MODEL: 'gpt-5.5', // coding model (pinned)
+        AGENT_MODEL: 'gpt-5.6-sol', // Sol coding model (pinned)
         FALLBACK_AGENT_MODEL: 'claude-sonnet-5',
         OPENAI_CIRCUIT_BREAKER_SECONDS: '900',
         // Billing incidents are durable/visible in Jira and retry more quickly than generic
@@ -418,7 +418,7 @@ export class HermesStack extends cdk.Stack {
         TASK_PROTECTION_EXPIRES_MINUTES: '165',
         TASK_PROTECTION_RENEW_SECONDS: '600',
         // --- Hermes PR-process enhancements (WS1–WS4), all env-tunable with safe fallbacks ---
-        AGENT_REASONING_EFFORT: 'medium', // WS3.1 Codex model_reasoning_effort for implementation jobs
+        AGENT_REASONING_EFFORT: 'medium', // Sol implementation jobs use medium reasoning
         PREOPEN_REVIEW_ENABLED: 'true', // WS4 pre-open adversarial review stage
         PREOPEN_REVIEW_EFFORT: 'high', // WS4 review runs at high reasoning effort
         GATE_MAX_RETRIES: '3', // WS2 pre-commit gate repair rounds before fail-open

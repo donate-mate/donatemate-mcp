@@ -4,8 +4,11 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   AgentProvidersUnavailableError,
+  DEFAULT_AGENT_MODEL,
+  DEFAULT_AGENT_REASONING_EFFORT,
   buildClaudeExecInvocation,
   buildCodexExecInvocation,
+  getAgentRuntimeConfiguration,
   isProviderBillingOutput,
   isProviderUnavailableOutput,
   parseClaudeOutput,
@@ -13,13 +16,33 @@ import {
 } from './agent.js';
 
 describe('buildCodexExecInvocation', () => {
+  it('pins Hermes implementation runs to Sol with medium reasoning', () => {
+    expect(DEFAULT_AGENT_MODEL).toBe('gpt-5.6-sol');
+    expect(DEFAULT_AGENT_REASONING_EFFORT).toBe('medium');
+
+    const invocation = buildCodexExecInvocation({
+      dir: '/tmp/repo',
+      lastMsgFile: '/tmp/last.txt',
+      model: DEFAULT_AGENT_MODEL,
+      effort: DEFAULT_AGENT_REASONING_EFFORT,
+      prompt: 'implement the ticket',
+    });
+
+    expect(invocation.args).toContain('gpt-5.6-sol');
+    expect(invocation.args).toContain('model_reasoning_effort=medium');
+    expect(getAgentRuntimeConfiguration()).toEqual({
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'medium',
+    });
+  });
+
   it('streams prompts larger than the OS argv limit through stdin', () => {
     const prompt = `Review this diff:\n${'x'.repeat(3 * 1024 * 1024)}`;
 
     const invocation = buildCodexExecInvocation({
       dir: '/tmp/repo',
       lastMsgFile: '/tmp/last.txt',
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
       effort: 'high',
       prompt,
     });

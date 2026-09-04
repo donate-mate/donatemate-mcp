@@ -13,7 +13,10 @@ import { getSecretJson, getSecretString } from './secrets.js';
 
 const SECRET_OPENAI = process.env.SECRET_OPENAI!;
 const SECRET_ANTHROPIC = process.env.SECRET_ANTHROPIC;
-const AGENT_MODEL = process.env.AGENT_MODEL || 'gpt-5.5';
+export const DEFAULT_AGENT_MODEL = 'gpt-5.6-sol';
+export const DEFAULT_AGENT_REASONING_EFFORT = 'medium';
+
+const AGENT_MODEL = process.env.AGENT_MODEL || DEFAULT_AGENT_MODEL;
 const FALLBACK_AGENT_MODEL = process.env.FALLBACK_AGENT_MODEL || 'claude-sonnet-5';
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_SECONDS ?? 2400) * 1000;
 const OPENAI_CIRCUIT_BREAKER_MS = Number(process.env.OPENAI_CIRCUIT_BREAKER_SECONDS ?? 900) * 1000;
@@ -31,7 +34,8 @@ let openAiUnavailableCategory: ProviderFailureCategory = 'unavailable';
 // Default is env-configurable ("medium") for implementation jobs; the pre-open review session
 // (WS4) passes "high" per call. Previously NO flag was passed, so Codex ran at its own default.
 const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high']);
-const DEFAULT_REASONING_EFFORT = normalizeEffort(process.env.AGENT_REASONING_EFFORT) ?? 'medium';
+const DEFAULT_REASONING_EFFORT =
+  normalizeEffort(process.env.AGENT_REASONING_EFFORT) ?? DEFAULT_AGENT_REASONING_EFFORT;
 
 function normalizeEffort(value: string | undefined): string | undefined {
   if (!value) return undefined;
@@ -39,6 +43,13 @@ function normalizeEffort(value: string | undefined): string | undefined {
   // Historic value "none" maps to Codex's lowest tier.
   const mapped = v === 'none' ? 'minimal' : v;
   return VALID_EFFORTS.has(mapped) ? mapped : undefined;
+}
+
+export function getAgentRuntimeConfiguration(): { model: string; reasoningEffort: string } {
+  return {
+    model: AGENT_MODEL,
+    reasoningEffort: DEFAULT_REASONING_EFFORT,
+  };
 }
 
 export interface RunAgentOptions {
