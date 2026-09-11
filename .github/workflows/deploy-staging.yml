@@ -51,8 +51,8 @@ jobs:
         run: npm run type-check --workspaces --if-present
         continue-on-error: true
 
-      - name: Verify Jira MCP attribution enforcement
-        run: npx vitest run packages/lambda-handlers/http/src/jiraAttribution.test.ts packages/lambda-handlers/http/src/jiraIssueLinks.test.ts --pool=forks --poolOptions.forks.singleFork=true
+      - name: Verify Jira MCP write enforcement
+        run: npx vitest run packages/lambda-handlers/http/src/jiraAttribution.test.ts packages/lambda-handlers/http/src/jiraIssueLinks.test.ts packages/lambda-handlers/http/src/jiraIssuePlanning.test.ts --pool=forks --poolOptions.forks.singleFork=true
 
       - name: CDK Bootstrap (if needed)
         working-directory: packages/infrastructure
