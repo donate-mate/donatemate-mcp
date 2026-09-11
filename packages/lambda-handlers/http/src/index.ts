@@ -46,6 +46,14 @@ import {
   type McpPrincipal,
 } from './jiraAttribution.js';
 import { buildJiraIssueLinkRequest } from './jiraIssueLinks.js';
+import {
+  JIRA_CREATE_PLANNING_PROPERTIES,
+  JIRA_CREATE_PLANNING_REQUIREMENTS,
+  JIRA_PLANNING_PROPERTY_KEY,
+  buildJiraIssuePlanningAudit,
+  buildJiraIssuePlanningPlan,
+  validateSubtaskEpicInheritance,
+} from './jiraIssuePlanning.js';
 
 const dynamoClient = new DynamoDBClient({});
 const ssmClient = new SSMClient({});
@@ -2327,7 +2335,7 @@ async function handleToolsList(): Promise<unknown> {
     },
     {
       name: 'dm_jira_create_issue',
-      description: 'Create a new Jira issue. Description may be plain text (auto-wrapped to ADF) or an ADF object. The server always adds verified MCP initiator, executor, and audit attribution.',
+      description: 'Create a new Jira issue. Every issue must have sprintId and epicKey. A value may be omitted only when the user explicitly requested no sprint or no epic; set the matching omit flag and preserve that instruction in its reason. Missing planning values fail closed. Description may be plain text (auto-wrapped to ADF) or an ADF object. The server adds verified attribution and an auditable planning record.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2338,9 +2346,11 @@ async function handleToolsList(): Promise<unknown> {
           assigneeAccountId: { type: 'string', description: 'Optional accountId to assign on creation' },
           labels: { type: 'array', items: { type: 'string' }, description: 'Optional labels' },
           priority: { type: 'string', description: 'Optional priority name, e.g. "Medium"' },
-          parentKey: { type: 'string', description: 'Parent issue key (for subtasks / epic children)' },
+          parentKey: { type: 'string', description: 'Immediate parent for a Subtask. On other non-Epic issue types, accepted as a legacy alias for epicKey.' },
+          ...JIRA_CREATE_PLANNING_PROPERTIES,
         },
         required: ['projectKey', 'summary'],
+        allOf: JIRA_CREATE_PLANNING_REQUIREMENTS,
       },
     },
     {
@@ -3168,28 +3178,41 @@ async function handleToolsCall(
       const assigneeAccountId = args?.assigneeAccountId as string | undefined;
       const labels = args?.labels as string[] | undefined;
       const priority = args?.priority as string | undefined;
-      const parentKey = args?.parentKey as string | undefined;
       const actor = requireJiraActor(executionContext.principal, executionContext.requestId);
+      const planning = buildJiraIssuePlanningPlan(args || {}, issueType);
+
+      if (planning.subtaskParentKey) {
+        const parentIssue = await jiraRequest<any>(
+          'GET',
+          `/issue/${encodeURIComponent(planning.subtaskParentKey)}?fields=parent`
+        );
+        validateSubtaskEpicInheritance(planning, parentIssue);
+      }
 
       const fields: Record<string, unknown> = {
         project: { key: projectKey },
         summary,
         issuetype: { name: issueType },
+        ...planning.fields,
       };
       if (assigneeAccountId) fields.assignee = { accountId: assigneeAccountId };
       if (labels) fields.labels = labels;
       if (priority) fields.priority = { name: priority };
-      if (parentKey) fields.parent = { key: parentKey };
       if (actor.jiraAccountId) fields.reporter = { accountId: actor.jiraAccountId };
+
+      const createPayload = buildAttributedJiraIssuePayload(
+        fields,
+        description === undefined ? undefined : toAdf(description),
+        actor
+      );
+      const properties = createPayload.properties as Array<{ key: string; value: unknown }>;
+      const planningAudit = buildJiraIssuePlanningAudit(planning, actor.auditId);
+      properties.push({ key: JIRA_PLANNING_PROPERTY_KEY, value: planningAudit });
 
       const created = await jiraRequest<any>(
         'POST',
         '/issue',
-        buildAttributedJiraIssuePayload(
-          fields,
-          description === undefined ? undefined : toAdf(description),
-          actor
-        )
+        createPayload
       );
       const creds = await getJiraCredentials();
       console.info('[audit] Jira issue created through MCP', {
@@ -3201,7 +3224,8 @@ async function handleToolsCall(
         actorType: actor.actorType,
         clientName: actor.clientName,
         authMethod: actor.authMethod,
-        contentHash: hashJiraContent({ summary, description }),
+        planning: planningAudit,
+        contentHash: hashJiraContent({ summary, description, planning: planningAudit }),
       });
       result = { content: [{ type: 'text', text: JSON.stringify({
         key: created.key,
@@ -3211,6 +3235,7 @@ async function handleToolsCall(
           executor: actor.clientName,
           auditId: actor.auditId,
         },
+        planning: planningAudit,
         url: `${creds.host}/browse/${created.key}`,
       }, null, 2) }] };
       break;
