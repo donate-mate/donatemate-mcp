@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'packages/figma-relay/**'
+      - 'packages/figma-plugin/**'
       - '.github/workflows/deploy-figma-relay.yml'
   workflow_dispatch:
 
@@ -18,7 +19,6 @@ permissions:
 
 env:
   AWS_REGION: us-east-2
-  DEPLOY_BUCKET: donatemate-staging-figma-responses
 
 jobs:
   deploy:
@@ -53,13 +53,17 @@ jobs:
         run: |
           npm run build --workspace @donatemate/figma-relay
           npm run bundle --workspace @donatemate/figma-relay
+          npm run build --workspace @donatemate/figma-plugin
 
       - name: Package relay
         run: |
           package_root="$RUNNER_TEMP/figma-relay"
-          mkdir -p "$package_root/dist" "$package_root/scripts"
+          mkdir -p "$package_root/dist" "$package_root/scripts" "$package_root/plugin/dist"
           cp packages/figma-relay/dist/index.cjs "$package_root/dist/index.cjs"
           cp packages/figma-relay/scripts/*.ps1 "$package_root/scripts/"
+          cp packages/figma-plugin/manifest.json "$package_root/plugin/manifest.json"
+          cp packages/figma-plugin/dist/code.js "$package_root/plugin/dist/code.js"
+          cp packages/figma-plugin/dist/ui.html "$package_root/plugin/dist/ui.html"
           (cd "$package_root" && zip -q -r "$RUNNER_TEMP/figma-relay.zip" .)
           echo "DEPLOY_ARCHIVE=$RUNNER_TEMP/figma-relay.zip" >> "$GITHUB_ENV"
 

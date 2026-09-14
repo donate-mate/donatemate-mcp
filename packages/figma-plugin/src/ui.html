@@ -286,8 +286,10 @@
     let ws = null;
     let messageCount = 0;
     let reconnectAttempts = 0;
-    const maxReconnectAttempts = 5;
-    const reconnectDelay = 2000;
+    let reconnectTimer = null;
+    let manuallyDisconnected = false;
+    const reconnectBaseDelay = 2000;
+    const reconnectMaxDelay = 30000;
 
     const statusDot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
@@ -324,12 +326,20 @@
     }
 
     function connect() {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
       const url = serverUrlInput.value.trim();
       if (!url) {
         log('Please enter a valid server URL', 'error');
         return;
       }
 
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       setStatus('connecting');
       log(`Connecting to ${url}...`);
 
@@ -340,6 +350,7 @@
           setStatus('connected');
           log('Connected to bridge server', 'success');
           reconnectAttempts = 0;
+          manuallyDisconnected = false;
 
           // Send initial handshake
           ws.send(JSON.stringify({
@@ -364,14 +375,21 @@
         };
 
         ws.onclose = () => {
+          ws = null;
           setStatus('disconnected');
           log('Disconnected from bridge server');
 
-          // Attempt reconnection
-          if (reconnectAttempts < maxReconnectAttempts) {
+          // Keep retrying for as long as the plugin is open. The relay is a
+          // supervised process and can recover long after the old five-attempt
+          // window had elapsed.
+          if (!manuallyDisconnected) {
+            const delay = Math.min(
+              reconnectBaseDelay * (2 ** Math.min(reconnectAttempts, 4)),
+              reconnectMaxDelay
+            );
             reconnectAttempts++;
-            log(`Reconnecting in ${reconnectDelay/1000}s (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`);
-            setTimeout(connect, reconnectDelay);
+            log(`Reconnecting in ${delay/1000}s (attempt ${reconnectAttempts})...`);
+            reconnectTimer = setTimeout(connect, delay);
           }
         };
 
@@ -382,11 +400,18 @@
       } catch (e) {
         setStatus('disconnected');
         log(`Failed to connect: ${e.message}`, 'error');
+        if (!manuallyDisconnected) {
+          reconnectTimer = setTimeout(connect, reconnectBaseDelay);
+        }
       }
     }
 
     function disconnect() {
-      reconnectAttempts = maxReconnectAttempts; // Prevent auto-reconnect
+      manuallyDisconnected = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       if (ws) {
         ws.close();
         ws = null;
@@ -404,7 +429,11 @@
       }
     };
 
-    connectBtn.addEventListener('click', connect);
+    connectBtn.addEventListener('click', () => {
+      manuallyDisconnected = false;
+      reconnectAttempts = 0;
+      connect();
+    });
     disconnectBtn.addEventListener('click', disconnect);
     clearLogBtn.addEventListener('click', () => {
       logContainer.innerHTML = '';

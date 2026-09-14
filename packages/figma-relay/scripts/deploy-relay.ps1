@@ -10,8 +10,10 @@ Set-StrictMode -Version Latest
 $taskName = "FigmaRelay"
 $sourceBundle = Join-Path $PackageRoot "dist\index.cjs"
 $sourceScripts = Join-Path $PackageRoot "scripts"
+$sourcePlugin = Join-Path $PackageRoot "plugin"
 $targetBundle = Join-Path $RelayDirectory "dist\index.cjs"
 $targetScripts = Join-Path $RelayDirectory "scripts"
+$targetPlugin = Join-Path $RelayDirectory "plugin"
 
 if (-not (Test-Path $sourceBundle)) {
     throw "Deployment bundle not found: $sourceBundle"
@@ -43,11 +45,20 @@ if (Test-Path (Join-Path $targetScripts "start-relay.ps1")) {
 if (Test-Path (Join-Path $targetScripts "install-relay-task.ps1")) {
     Copy-Item (Join-Path $targetScripts "install-relay-task.ps1") $backupDirectory -Force
 }
+if (Test-Path $targetPlugin) {
+    Copy-Item $targetPlugin (Join-Path $backupDirectory "plugin") -Recurse -Force
+}
 
 Copy-Item $sourceBundle $targetBundle -Force
 Copy-Item (Join-Path $sourceScripts "start-relay.ps1") $targetScripts -Force
 Copy-Item (Join-Path $sourceScripts "install-relay-task.ps1") $targetScripts -Force
 Copy-Item (Join-Path $sourceScripts "deploy-relay.ps1") $targetScripts -Force
+if (Test-Path (Join-Path $sourcePlugin "manifest.json")) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $targetPlugin "dist") | Out-Null
+    Copy-Item (Join-Path $sourcePlugin "manifest.json") $targetPlugin -Force
+    Copy-Item (Join-Path $sourcePlugin "dist\code.js") (Join-Path $targetPlugin "dist") -Force
+    Copy-Item (Join-Path $sourcePlugin "dist\ui.html") (Join-Path $targetPlugin "dist") -Force
+}
 
 try {
     & (Join-Path $targetScripts "install-relay-task.ps1") -RelayDirectory $RelayDirectory -Start
@@ -74,6 +85,9 @@ try {
     }
     if (Test-Path (Join-Path $backupDirectory "install-relay-task.ps1")) {
         Copy-Item (Join-Path $backupDirectory "install-relay-task.ps1") $targetScripts -Force
+    }
+    if (Test-Path (Join-Path $backupDirectory "plugin")) {
+        Copy-Item (Join-Path $backupDirectory "plugin\*") $targetPlugin -Recurse -Force
     }
     & (Join-Path $targetScripts "install-relay-task.ps1") -RelayDirectory $RelayDirectory -Start
     throw
