@@ -18,7 +18,6 @@ permissions:
 
 env:
   AWS_REGION: us-east-2
-  DEPLOY_BUCKET: donatemate-staging-figma-responses
 
 jobs:
   deploy:

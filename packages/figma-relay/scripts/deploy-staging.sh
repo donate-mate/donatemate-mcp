@@ -4,7 +4,8 @@ set -euo pipefail
 : "${DEPLOY_ARCHIVE:?DEPLOY_ARCHIVE must point to the relay deployment zip}"
 
 aws_region="${AWS_REGION:-us-east-2}"
-deploy_bucket="${DEPLOY_BUCKET:-donatemate-staging-figma-responses}"
+aws_account_id="$(aws sts get-caller-identity --query Account --output text)"
+deploy_bucket="${DEPLOY_BUCKET:-donatemate-build-artifacts-${aws_account_id}}"
 deploy_revision="${GITHUB_SHA:-manual-$(date +%s)}"
 artifact_key="relay-deployments/${deploy_revision}/figma-relay.zip"
 instance_id="$(aws ssm get-parameter \
