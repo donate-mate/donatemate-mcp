@@ -40,6 +40,9 @@ jobs:
       - name: Verify Jira MCP write enforcement
         run: npx vitest run packages/lambda-handlers/http/src/jiraAttribution.test.ts packages/lambda-handlers/http/src/jiraIssueLinks.test.ts packages/lambda-handlers/http/src/jiraIssuePlanning.test.ts --pool=forks --poolOptions.forks.singleFork=true
 
+      - name: Figma relay regression tests
+        run: npm test --workspace @donatemate/figma-relay
+
       - name: Hermes regression tests
         run: |
           npx vitest run \

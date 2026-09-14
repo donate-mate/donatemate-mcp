@@ -9,17 +9,30 @@ This guide covers setting up the Figma relay agent on the AWS Windows VM.
 
 ## VM Details
 
-- **Instance ID**: `i-0890ee403d8c729f5`
-- **Public IP**: `18.222.164.239`
 - **Region**: `us-east-2`
 - **OS**: Windows Server 2022
+
+The instance can be replaced, so resolve its current ID and address instead of
+copying a previously documented value:
+
+```bash
+INSTANCE_ID=$(aws ssm get-parameter \
+  --name /donatemate/staging/figma-vm/instance-id \
+  --region us-east-2 \
+  --query Parameter.Value \
+  --output text)
+aws ec2 describe-instances \
+  --instance-ids "$INSTANCE_ID" \
+  --region us-east-2 \
+  --query 'Reservations[0].Instances[0].{State:State.Name,PublicIp:PublicIpAddress}'
+```
 
 ## Step 1: Get Windows Administrator Password
 
 ```bash
 # Get the password using AWS CLI (requires the EC2 key pair)
 aws ec2 get-password-data \
-  --instance-id i-0890ee403d8c729f5 \
+  --instance-id "$INSTANCE_ID" \
   --priv-launch-key /path/to/your-key.pem \
   --region us-east-2
 ```
@@ -33,7 +46,7 @@ Or via AWS Console:
 ## Step 2: Connect via RDP
 
 1. Open Remote Desktop Connection
-2. Computer: `18.222.164.239`
+2. Computer: the current `PublicIp` returned above
 3. Username: `Administrator`
 4. Password: (from Step 1)
 
@@ -51,6 +64,14 @@ Or via AWS Console:
 3. The plugin should now appear in your plugins list
 
 ## Step 5: Deploy Relay Agent Code
+
+Merges to `main` that change `packages/figma-relay/**` run the **Deploy Figma
+Relay to Staging** workflow. It builds a self-contained bundle, deploys it over
+SSM, installs the supervised scheduled task, and calls `dm_figma_list_files` as
+an end-to-end smoke test.
+
+Use the workflow dispatch action for a safe redeploy of the current version.
+The manual options below are intended only for recovery.
 
 Copy the relay agent files to the VM. You can use:
 
@@ -97,8 +118,8 @@ cd C:\figma-relay
 ```
 
 The script will:
-1. Fetch the WebSocket endpoint from SSM
-2. Connect to AWS API Gateway
+1. Fetch the WebSocket endpoint, relay API key, Figma token, and team ID from SSM
+2. Connect to AWS API Gateway and keep the connection alive
 3. Start a local WebSocket server on port 3055 for the Figma plugin
 
 ## Step 7: Run the Figma Plugin
@@ -123,12 +144,11 @@ Once everything is running, you should see in the relay console:
 - Ensure the EC2 instance has the correct IAM role attached
 - Check that the SSM parameter exists: `/donatemate/staging/mcp/websocket-endpoint`
 
-### "AUTH_TOKEN environment variable not set"
-Set the token before running:
-```powershell
-$env:AUTH_TOKEN = (aws ssm get-parameter --name "/donatemate/staging/figma-relay/auth-token" --with-decryption --query "Parameter.Value" --output text)
-.\scripts\start-relay.ps1
-```
+### Token or configuration errors
+
+The startup script reads all required values from SSM. Rotate the Figma token at
+`/donatemate/staging/figma/access-token`, then restart the `FigmaRelay` task. Do
+not put tokens directly in the task definition or log.
 
 ### Plugin not connecting
 - Ensure Figma Desktop is running
@@ -140,21 +160,22 @@ $env:AUTH_TOKEN = (aws ssm get-parameter --name "/donatemate/staging/figma-relay
 - Verify the auth token is valid and not expired
 - Check CloudWatch logs for the Lambda handler
 
-## Auto-Start on Boot (Optional)
+## Supervised Auto-Start
 
-Create a scheduled task to start the relay on boot:
+Install the scheduled task through the checked-in helper:
 
 ```powershell
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File C:\figma-relay\scripts\start-relay.ps1"
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount
-Register-ScheduledTask -TaskName "FigmaRelay" -Action $action -Trigger $trigger -Principal $principal
+C:\figma-relay\scripts\install-relay-task.ps1 -Start
 ```
+
+The task has no execution-time cutoff and retries a failed relay every minute.
 
 ## SSM Parameters Reference
 
 | Parameter | Description |
 |-----------|-------------|
 | `/donatemate/staging/mcp/websocket-endpoint` | WebSocket API Gateway URL |
-| `/donatemate/staging/figma-relay/auth-token` | Cognito JWT for relay auth |
+| `/donatemate/staging/figma-relay/api-key` | Long-lived API key for relay authentication |
+| `/donatemate/staging/figma/access-token` | Granular Figma PAT with `folders:read` and required file scopes |
+| `/donatemate/staging/figma/team-id` | Team used for folder/file discovery |
 | `/donatemate/staging/figma-vm/instance-id` | EC2 instance ID |
