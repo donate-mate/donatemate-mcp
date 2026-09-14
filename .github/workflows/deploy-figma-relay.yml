@@ -1,0 +1,91 @@
+name: Deploy Figma Relay to Staging
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/figma-relay/**'
+      - '.github/workflows/deploy-figma-relay.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: figma-relay-staging
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  DEPLOY_BUCKET: donatemate-staging-figma-responses
+
+jobs:
+  deploy:
+    name: Build, deploy, and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Figma-Relay-Deploy
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test relay
+        run: npm test --workspace @donatemate/figma-relay
+
+      - name: Build self-contained relay
+        run: |
+          npm run build --workspace @donatemate/figma-relay
+          npm run bundle --workspace @donatemate/figma-relay
+
+      - name: Package relay
+        run: |
+          package_root="$RUNNER_TEMP/figma-relay"
+          mkdir -p "$package_root/dist" "$package_root/scripts"
+          cp packages/figma-relay/dist/index.cjs "$package_root/dist/index.cjs"
+          cp packages/figma-relay/scripts/*.ps1 "$package_root/scripts/"
+          (cd "$package_root" && zip -q -r "$RUNNER_TEMP/figma-relay.zip" .)
+          echo "DEPLOY_ARCHIVE=$RUNNER_TEMP/figma-relay.zip" >> "$GITHUB_ENV"
+
+      - name: Deploy through SSM
+        run: bash packages/figma-relay/scripts/deploy-staging.sh
+
+      - name: Smoke test MCP-to-relay file discovery
+        run: |
+          set -euo pipefail
+          mcp_token="$(aws ssm get-parameter \
+            --name /donatemate/staging/moltbot/mcp-api-key \
+            --with-decryption \
+            --region "$AWS_REGION" \
+            --query Parameter.Value \
+            --output text)"
+          response="$(curl --fail-with-body --silent --show-error --max-time 30 \
+            -H "Authorization: Bearer $mcp_token" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            --data '{"jsonrpc":"2.0","id":"figma-relay-deploy-smoke","method":"tools/call","params":{"name":"dm_figma_list_files","arguments":{"refresh":true}}}' \
+            https://mcp.donate-mate.com/mcp)"
+          jq -e '
+            .error == null and
+            .result.isError != true and
+            (.result.content | type == "array")
+          ' <<<"$response" >/dev/null
+          text_result="$(jq -r '.result.content[] | select(.type == "text") | .text' <<<"$response")"
+          jq -e '.total > 0 and (.files | length) == .total' <<<"$text_result" >/dev/null
+          jq -n --argjson total "$(jq '.total' <<<"$text_result")" '{relaySmokeTest:"passed",files:$total}'

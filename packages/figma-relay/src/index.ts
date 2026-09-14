@@ -14,6 +14,14 @@ import { execSync, exec } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import {
+  AWS_HEARTBEAT_INTERVAL_MS,
+  AWS_REGISTRATION_REFRESH_INTERVAL_MS,
+  buildJsonRpcRequest,
+  describeAwsMessage,
+  reconnectDelay,
+} from './awsRelayProtocol.js';
+import { discoverTeamFiles, type FigmaFile } from './figmaFileDiscovery.js';
 
 // Large plugin responses (e.g. exported images) exceed the API Gateway WebSocket 128KB frame
 // limit. When the request carries an S3 target, upload oversized responses to S3 (via the VM
@@ -24,7 +32,6 @@ const OFFLOAD_THRESHOLD_BYTES = 96 * 1024;
 // Configuration
 const AWS_WS_URL = process.env.AWS_WS_URL || '';
 const PLUGIN_PORT = parseInt(process.env.PLUGIN_PORT || '3055', 10);
-const RECONNECT_DELAY = 5000; // 5 seconds
 const TOKEN_REFRESH_INTERVAL = 23 * 60 * 60 * 1000; // 23 hours (tokens last 24h)
 
 // API Key authentication (preferred - no refresh needed)
@@ -43,6 +50,11 @@ const TOKEN_FILE = path.join(process.env.APPDATA || process.env.HOME || '.', 'fi
 let currentAccessToken = process.env.AUTH_TOKEN || '';
 let currentRefreshToken = '';
 let tokenRefreshTimer: NodeJS.Timeout | null = null;
+let awsHeartbeatTimer: NodeJS.Timeout | null = null;
+let awsRegistrationRefreshTimer: NodeJS.Timeout | null = null;
+let awsReconnectTimer: NodeJS.Timeout | null = null;
+let reconnectAttempt = 0;
+let shuttingDown = false;
 
 // State
 let awsConnection: WebSocket | null = null;
@@ -53,14 +65,6 @@ let currentFileKey: string | null = null;
 let currentFileName: string | null = null;
 
 // File cache (refreshed periodically)
-interface FigmaFile {
-  key: string;
-  name: string;
-  thumbnail_url?: string;
-  last_modified: string;
-  project?: string;
-  projectId?: string;
-}
 let fileCache: FigmaFile[] = [];
 let fileCacheExpiry = 0;
 
@@ -70,6 +74,13 @@ let fileCacheExpiry = 0;
 
 const pluginServer = new WebSocketServer({ port: PLUGIN_PORT });
 console.log(`[Relay] Plugin server started on port ${PLUGIN_PORT}`);
+
+pluginServer.on('error', (error) => {
+  console.error('[Relay] Plugin server error:', error);
+  // A relay without its plugin listener cannot serve design tools. Exit with a
+  // failure so the Windows task supervisor can restart it cleanly.
+  process.exit(1);
+});
 
 pluginServer.on('connection', async (ws) => {
   console.log('[Relay] Figma plugin connected');
@@ -256,9 +267,63 @@ async function initializeTokens(): Promise<void> {
 // AWS WebSocket Connection (outbound)
 // ============================================================================
 
+function stopAwsHeartbeat(): void {
+  if (awsHeartbeatTimer) {
+    clearInterval(awsHeartbeatTimer);
+    awsHeartbeatTimer = null;
+  }
+  if (awsRegistrationRefreshTimer) {
+    clearInterval(awsRegistrationRefreshTimer);
+    awsRegistrationRefreshTimer = null;
+  }
+}
+
+function startAwsHeartbeat(socket: WebSocket): void {
+  stopAwsHeartbeat();
+  awsHeartbeatTimer = setInterval(() => {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const heartbeatId = `relay_ping_${Date.now()}`;
+    socket.send(JSON.stringify(buildJsonRpcRequest('ping', heartbeatId)));
+  }, AWS_HEARTBEAT_INTERVAL_MS);
+
+  // The relay lookup in DynamoDB has a 24-hour lease. Renew it while the
+  // socket remains healthy so removing the old 72-hour task limit does not
+  // introduce a new once-per-day outage.
+  awsRegistrationRefreshTimer = setInterval(() => {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const registrationId = `relay_register_${Date.now()}`;
+    socket.send(JSON.stringify(buildJsonRpcRequest(
+      'relay/register',
+      registrationId,
+      { type: 'figma' }
+    )));
+  }, AWS_REGISTRATION_REFRESH_INTERVAL_MS);
+}
+
+function scheduleAwsReconnect(): void {
+  if (shuttingDown || awsReconnectTimer) {
+    return;
+  }
+
+  const delay = reconnectDelay(reconnectAttempt++);
+  console.log(`[Relay] Reconnecting to AWS in ${Math.round(delay / 1_000)} seconds`);
+  awsReconnectTimer = setTimeout(() => {
+    awsReconnectTimer = null;
+    connectToAws();
+  }, delay);
+}
+
 function connectToAws(): void {
   if (!AWS_WS_URL) {
     console.error('[Relay] AWS_WS_URL not configured');
+    return;
+  }
+
+  if (shuttingDown || awsConnection?.readyState === WebSocket.OPEN || awsConnection?.readyState === WebSocket.CONNECTING) {
     return;
   }
 
@@ -269,41 +334,57 @@ function connectToAws(): void {
     : AWS_WS_URL;
 
   console.log('[Relay] Connecting to AWS...', API_KEY ? '(using API key)' : '(using Cognito token)');
-  awsConnection = new WebSocket(url);
+  const socket = new WebSocket(url);
+  awsConnection = socket;
 
-  awsConnection.on('open', () => {
+  socket.on('open', () => {
     console.log('[Relay] Connected to AWS');
+    reconnectAttempt = 0;
+    startAwsHeartbeat(socket);
 
     // Register as Figma relay
-    awsConnection!.send(JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'relay/register',
-      params: { type: 'figma' },
-    }));
+    const registrationId = `relay_register_${Date.now()}`;
+    socket.send(JSON.stringify(buildJsonRpcRequest(
+      'relay/register',
+      registrationId,
+      { type: 'figma' }
+    )));
   });
 
-  awsConnection.on('message', async (data) => {
+  socket.on('message', async (data) => {
     try {
-      const message = JSON.parse(data.toString());
-      console.log('[Relay] Received from AWS:', message.type || message.method);
+      const message = JSON.parse(data.toString()) as Record<string, unknown>;
+      const description = describeAwsMessage(message);
+      // Heartbeat acknowledgements are intentionally quiet to keep the relay log useful.
+      if (description !== 'heartbeat acknowledged') {
+        console.log('[Relay] Received from AWS:', description);
+      }
 
       // Handle Figma tool requests from AWS
       if (message.type === 'FIGMA_TOOL_CALL') {
-        await handleFigmaToolCall(message);
+        await handleFigmaToolCall(message as unknown as Parameters<typeof handleFigmaToolCall>[0]);
       }
     } catch (e) {
       console.error('[Relay] Error processing AWS message:', e);
     }
   });
 
-  awsConnection.on('close', () => {
-    console.log('[Relay] Disconnected from AWS, reconnecting...');
-    awsConnection = null;
-    setTimeout(connectToAws, RECONNECT_DELAY);
+  socket.on('close', (code, reason) => {
+    stopAwsHeartbeat();
+    if (awsConnection === socket) {
+      awsConnection = null;
+    }
+    const reasonText = reason.length > 0 ? ` (${reason.toString()})` : '';
+    console.log(`[Relay] AWS connection closed: ${code}${reasonText}`);
+    scheduleAwsReconnect();
   });
 
-  awsConnection.on('error', (error) => {
+  socket.on('error', (error) => {
     console.error('[Relay] AWS connection error:', error);
+  });
+
+  socket.on('unexpected-response', (_request, response) => {
+    console.error(`[Relay] AWS connection rejected: HTTP ${response.statusCode} ${response.statusMessage || ''}`.trim());
   });
 }
 
@@ -466,40 +547,30 @@ async function handleFigmaToolCall(message: {
 // Figma REST API Functions
 // ============================================================================
 
-async function figmaApiRequest<T>(endpoint: string): Promise<T> {
+async function figmaApiRequest<T>(apiPath: string): Promise<T> {
   if (!FIGMA_ACCESS_TOKEN) {
     throw new Error('FIGMA_ACCESS_TOKEN not configured');
   }
 
-  const response = await fetch(`https://api.figma.com/v1${endpoint}`, {
+  if (!apiPath.startsWith('/v1/') && !apiPath.startsWith('/v2/')) {
+    throw new Error(`Figma API path must include a supported API version: ${apiPath}`);
+  }
+
+  const response = await fetch(`https://api.figma.com${apiPath}`, {
     headers: {
       'X-Figma-Token': FIGMA_ACCESS_TOKEN,
     },
   });
 
   if (!response.ok) {
-    throw new Error(`Figma API error: ${response.status} ${response.statusText}`);
+    const responseBody = await response.text().catch(() => '');
+    const detail = responseBody.replace(/\s+/g, ' ').trim().slice(0, 500);
+    throw new Error(
+      `Figma API error for ${apiPath}: ${response.status} ${response.statusText}${detail ? ` - ${detail}` : ''}`
+    );
   }
 
   return response.json() as Promise<T>;
-}
-
-async function listTeamProjects(): Promise<Array<{ id: string; name: string }>> {
-  if (!FIGMA_TEAM_ID) {
-    throw new Error('FIGMA_TEAM_ID not configured');
-  }
-
-  const data = await figmaApiRequest<{ projects: Array<{ id: string; name: string }> }>(
-    `/teams/${FIGMA_TEAM_ID}/projects`
-  );
-  return data.projects || [];
-}
-
-async function listProjectFiles(projectId: string): Promise<FigmaFile[]> {
-  const data = await figmaApiRequest<{ files: FigmaFile[] }>(
-    `/projects/${projectId}/files`
-  );
-  return data.files || [];
 }
 
 async function getAllFiles(forceRefresh = false): Promise<FigmaFile[]> {
@@ -512,26 +583,12 @@ async function getAllFiles(forceRefresh = false): Promise<FigmaFile[]> {
   const allFiles: FigmaFile[] = [];
 
   try {
-    const projects = await listTeamProjects();
-
-    for (const project of projects) {
-      try {
-        const files = await listProjectFiles(project.id);
-        for (const file of files) {
-          allFiles.push({
-            ...file,
-            project: project.name,
-            projectId: project.id,
-          });
-        }
-      } catch (e) {
-        console.error(`[Relay] Error fetching files for project ${project.name}:`, e);
-      }
-    }
+    const discovery = await discoverTeamFiles(FIGMA_TEAM_ID, figmaApiRequest);
+    allFiles.push(...discovery.files);
 
     fileCache = allFiles;
     fileCacheExpiry = Date.now() + 5 * 60 * 1000; // Cache for 5 minutes
-    console.log(`[Relay] Cached ${allFiles.length} files from ${projects.length} projects`);
+    console.log(`[Relay] Cached ${allFiles.length} files from ${discovery.folderCount} folders`);
   } catch (e) {
     console.error('[Relay] Error refreshing file cache:', e);
     if (fileCache.length > 0) {
@@ -722,13 +779,25 @@ async function main(): Promise<void> {
   connectToAws();
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error('[Relay] Fatal startup error:', error);
+  process.exit(1);
+});
 
 // Keep process alive
-process.on('SIGINT', () => {
-  console.log('[Relay] Shutting down...');
+function shutdown(signal: string): void {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`[Relay] Shutting down (${signal})...`);
   if (tokenRefreshTimer) clearTimeout(tokenRefreshTimer);
+  stopAwsHeartbeat();
+  if (awsReconnectTimer) clearTimeout(awsReconnectTimer);
   pluginServer.close();
-  awsConnection?.close();
+  awsConnection?.close(1000, 'relay shutdown');
   process.exit(0);
-});
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

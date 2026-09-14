@@ -7,16 +7,21 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.cjs",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "test": "vitest run --pool=forks --poolOptions.forks.singleFork=true"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.700.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",
     "@types/ws": "^8.18.1",
+    "esbuild": "^0.21.5",
     "tsx": "^4.19.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^1.0.0"
   }
 }
